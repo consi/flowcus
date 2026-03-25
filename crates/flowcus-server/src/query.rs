@@ -53,6 +53,11 @@ pub struct StructuredQueryRequest {
     /// Pin the time range for paginated queries.
     pub time_start: Option<u64>,
     pub time_end: Option<u64>,
+    /// Pin the column list for paginated queries. When set, the executor
+    /// uses these columns as the base unified list (only appending new ones).
+    /// Prevents columns from disappearing across pages due to background merges.
+    #[serde(default)]
+    pub pinned_columns: Option<Vec<String>>,
 }
 
 /// FQL text query (the original path).
@@ -66,6 +71,9 @@ pub struct FqlQueryRequest {
     /// to `now()`. Prevents the time window from shifting during infinite scroll.
     pub time_start: Option<u64>,
     pub time_end: Option<u64>,
+    /// Pin the column list for paginated queries.
+    #[serde(default)]
+    pub pinned_columns: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +85,8 @@ pub struct QueryResponse {
     pub explain: Vec<serde_json::Value>,
     pub pagination: Pagination,
     pub time_range: TimeRangeBounds,
+    /// Unified schema column list for pinning across pagination requests.
+    pub schema_columns: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -204,6 +214,7 @@ struct ParsedRequest {
     offset: u64,
     limit: u64,
     pinned_time: Option<(u64, u64)>,
+    pinned_columns: Option<Vec<String>>,
 }
 
 /// Parse the incoming request (FQL or structured) into a canonical AST.
@@ -218,6 +229,7 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                 (Some(s), Some(e)) => Some((s, e)),
                 _ => None,
             };
+            let pinned_columns = fql.pinned_columns;
             let cache_key = crate::state::QueryCache::cache_key(&fql.query, offset, limit);
 
             match flowcus_query::parse(&fql.query) {
@@ -230,6 +242,7 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                         offset,
                         limit,
                         pinned_time,
+                        pinned_columns,
                     })
                 }
                 Err(err) => {
@@ -252,6 +265,7 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                 (Some(start), Some(end)) => Some((start, end)),
                 _ => None,
             };
+            let pinned_columns = s.pinned_columns;
 
             // Build the structured query and convert to AST
             let structured = flowcus_query::structured::StructuredQuery {
@@ -284,6 +298,7 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                         offset,
                         limit,
                         pinned_time,
+                        pinned_columns,
                     })
                 }
                 Err(err) => Err((
@@ -335,6 +350,7 @@ async fn execute_query(
         offset: req_offset,
         limit: req_limit,
         pinned_time,
+        pinned_columns,
     } = parsed;
 
     // Combine flush + merge counters for cache invalidation.
@@ -378,6 +394,7 @@ async fn execute_query(
                 has_more: req_offset + req_limit < cached.total,
             },
             time_range: cached.time_range,
+            schema_columns: cached.schema_columns,
         };
         return (
             StatusCode::OK,
@@ -398,13 +415,21 @@ async fn execute_query(
     let query_clone = query.clone();
 
     let storage_cache = state.storage_cache().clone();
+    let part_locks = state.part_locks().clone();
     let exec_result = tokio::task::spawn_blocking(move || {
         let executor = flowcus_storage::executor::QueryExecutor::with_cache(
             Path::new(&storage_dir),
             granule_size,
             storage_cache,
+            part_locks,
         );
-        executor.execute(&query_clone, req_offset, req_limit, pinned_time)
+        executor.execute(
+            &query_clone,
+            req_offset,
+            req_limit,
+            pinned_time,
+            pinned_columns,
+        )
     })
     .await;
 
@@ -444,24 +469,14 @@ async fn execute_query(
                 end: result.time_end,
             };
 
-            let cache_entry = CachedResult {
-                columns: result.columns.clone(),
-                rows: result.rows.clone(),
-                stats: CachedQueryStats {
-                    rows_scanned: result.rows_scanned,
-                    rows_returned,
-                    total_rows: result.total_rows_in_range,
-                    parts_scanned: result.parts_scanned,
-                    parts_skipped: result.parts_skipped,
-                    bytes_read: result.plan.bytes_read,
-                },
-                total,
-                explain: explain.clone(),
-                flush_count: current_flush_count,
-                created_at: Instant::now(),
-                time_range: time_range.clone(),
+            let cached_stats = CachedQueryStats {
+                rows_scanned: result.rows_scanned,
+                rows_returned,
+                total_rows: result.total_rows_in_range,
+                parts_scanned: result.parts_scanned,
+                parts_skipped: result.parts_skipped,
+                bytes_read: result.plan.bytes_read,
             };
-            state.query_cache().put(cache_key, cache_entry);
 
             debug!(
                 rows_scanned = result.rows_scanned,
@@ -473,10 +488,13 @@ async fn execute_query(
                 "Query executed"
             );
 
+            // Build response first (moves rows), then cache it (clones response rows).
+            // This avoids the double-clone: result.rows → response (move),
+            // response.rows → cache (single clone).
             let response = QueryResponse {
                 parsed: parsed_json,
                 columns,
-                rows: result.rows.clone(),
+                rows: result.rows,
                 stats: QueryStats {
                     parse_time_us: u64::try_from(parse_time.as_micros()).unwrap_or(u64::MAX),
                     execution_time_us: u64::try_from(exec_time.as_micros()).unwrap_or(u64::MAX),
@@ -488,15 +506,29 @@ async fn execute_query(
                     bytes_read: result.plan.bytes_read,
                     cached: false,
                 },
-                explain,
+                explain: explain.clone(),
                 pagination: Pagination {
                     offset: req_offset,
                     limit: req_limit,
                     total,
                     has_more: req_offset + req_limit < total,
                 },
-                time_range,
+                time_range: time_range.clone(),
+                schema_columns: result.schema_columns,
             };
+
+            let cache_entry = CachedResult {
+                columns: result.columns,
+                rows: response.rows.clone(),
+                stats: cached_stats,
+                total,
+                explain,
+                flush_count: current_flush_count,
+                created_at: Instant::now(),
+                time_range,
+                schema_columns: response.schema_columns.clone(),
+            };
+            state.query_cache().put(cache_key, cache_entry);
 
             (
                 StatusCode::OK,
@@ -536,6 +568,7 @@ async fn execute_query(
                     has_more: false,
                 },
                 time_range: TimeRangeBounds { start: 0, end: 0 },
+                schema_columns: Vec::new(),
             };
 
             (
@@ -1551,6 +1584,7 @@ async fn stats_histogram(
     let storage_dir = state.storage_dir().to_string();
     let granule_size = state.granule_size();
     let storage_cache = state.storage_cache().clone();
+    let part_locks = state.part_locks().clone();
     let has_filters = !req.filters.is_empty();
 
     // Build a time-range-only query to resolve bounds
@@ -1630,6 +1664,7 @@ async fn stats_histogram(
             Path::new(&storage_dir),
             granule_size,
             storage_cache,
+            part_locks,
         );
 
         let (time_start, time_end) =

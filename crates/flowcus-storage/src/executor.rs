@@ -37,11 +37,15 @@ use crate::table::{PartEntry, Table};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Maximum aggregate matching rows before the query is rejected to prevent OOM.
+const AGG_MAX_MATCHING_ROWS: usize = 10_000_000;
+
 /// The query executor: reads parts from disk and evaluates queries.
 pub struct QueryExecutor {
     table_base: PathBuf,
     granule_size: usize,
     cache: Arc<StorageCache>,
+    part_locks: crate::part_locks::PartLocks,
 }
 
 /// Execution plan with statistics about what happened during the query.
@@ -155,6 +159,9 @@ pub struct QueryResult {
     pub total_rows_in_range: u64,
     pub time_start: u64,
     pub time_end: u64,
+    /// Unified column list across all parts, before SELECT projection.
+    /// Used as `pinned_columns` for subsequent pagination requests.
+    pub schema_columns: Vec<String>,
 }
 
 /// Lightweight histogram built from part metadata only (no column scan).
@@ -1656,14 +1663,21 @@ impl QueryExecutor {
             table_base: storage_dir.join("flows"),
             granule_size,
             cache: Arc::new(StorageCache::default()),
+            part_locks: crate::part_locks::PartLocks::new(),
         }
     }
 
-    pub fn with_cache(storage_dir: &Path, granule_size: usize, cache: Arc<StorageCache>) -> Self {
+    pub fn with_cache(
+        storage_dir: &Path,
+        granule_size: usize,
+        cache: Arc<StorageCache>,
+        part_locks: crate::part_locks::PartLocks,
+    ) -> Self {
         Self {
             table_base: storage_dir.join("flows"),
             granule_size,
             cache,
+            part_locks,
         }
     }
 
@@ -1683,6 +1697,7 @@ impl QueryExecutor {
         offset: u64,
         limit: u64,
         pinned_time: Option<(u64, u64)>,
+        pinned_columns: Option<Vec<String>>,
     ) -> std::io::Result<QueryResult> {
         let mut plan = ExecutionPlan {
             steps: Vec::new(),
@@ -1824,7 +1839,9 @@ impl QueryExecutor {
         // This must happen before processing so that every part's rows use the
         // same column ordering — otherwise rows from parts with different schemas
         // would be misaligned when concatenated.
-        let mut all_schema_columns: Vec<String> = Vec::new();
+        // When pinned_columns is provided (paginated queries), use it as the base
+        // to ensure columns never disappear across pages due to background merges.
+        let mut all_schema_columns: Vec<String> = pinned_columns.unwrap_or_default();
         for pe in &filtered_parts {
             if pe.path.join(".merging").exists() {
                 continue;
@@ -1873,7 +1890,8 @@ impl QueryExecutor {
             return result;
         }
 
-        // Helper: process one part, handling errors inline
+        // Helper: process one part, handling errors inline.
+        // Acquires a read lock so merges can't delete the part while we read it.
         let process_one_part = |part_entry: &PartEntry,
                                 local_plan: &mut ExecutionPlan,
                                 remaining_rows: Option<usize>|
@@ -1885,18 +1903,31 @@ impl QueryExecutor {
                 return Ok(ProcessPartResult::SkippedMerge);
             }
 
-            match self.process_part_columnar(
-                part_entry,
-                &ast_filters,
-                &resolved_filters,
-                &referenced_cols,
-                &filter_col_names,
-                needs_all_columns,
-                is_aggregate,
-                &all_schema_columns,
-                remaining_rows,
-                local_plan,
-            ) {
+            // Acquire read lock — if a merge is deleting this part, skip it.
+            let locked_result = self.part_locks.with_read(&part_entry.path, || {
+                self.process_part_columnar(
+                    part_entry,
+                    &ast_filters,
+                    &resolved_filters,
+                    &referenced_cols,
+                    &filter_col_names,
+                    needs_all_columns,
+                    is_aggregate,
+                    &all_schema_columns,
+                    remaining_rows,
+                    local_plan,
+                )
+            });
+
+            // Lock timeout → merge is deleting this part, skip it
+            let Some(inner_result) = locked_result else {
+                local_plan.steps.push(PlanStep::PartSkippedMerging {
+                    path: part_entry.path.display().to_string(),
+                });
+                return Ok(ProcessPartResult::SkippedMerge);
+            };
+
+            match inner_result {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     let subsumed = filtered_parts.iter().any(|other| {
                         other.generation > part_entry.generation
@@ -2037,6 +2068,19 @@ impl QueryExecutor {
 
             for par in par_results {
                 merge_part_result!(par.result, par.local_plan);
+            }
+
+            // Guard: cap aggregate memory to prevent OOM on huge time ranges.
+            // 10M matching indices ≈ ~120 MB; beyond this is likely a mistake.
+            if agg_matching_indices.len() > AGG_MAX_MATCHING_ROWS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Aggregate query matched {} rows, exceeding limit of {AGG_MAX_MATCHING_ROWS}. \
+                         Narrow the time range or add filters.",
+                        agg_matching_indices.len()
+                    ),
+                ));
             }
         } else {
             // ================================================================
@@ -2202,6 +2246,7 @@ impl QueryExecutor {
             total_rows_in_range,
             time_start,
             time_end,
+            schema_columns: all_schema_columns,
         })
     }
 
@@ -3021,6 +3066,7 @@ impl QueryExecutor {
             total_rows_in_range,
             time_start,
             time_end,
+            schema_columns: all_schema_columns,
         }))
     }
 

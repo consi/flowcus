@@ -276,6 +276,7 @@ impl StorageWriter {
                 bytes += b;
             }
         }
+        self.evict_stale_buffers();
         (flushed, bytes)
     }
 
@@ -302,6 +303,7 @@ impl StorageWriter {
                 bytes += b;
             }
         }
+        self.evict_stale_buffers();
         (flushed, bytes)
     }
 
@@ -338,6 +340,20 @@ impl StorageWriter {
                 0
             }
         }
+    }
+
+    /// Remove buffers for past partition hours that will never receive data again.
+    /// Called after flush to prevent stale empty buffers from accumulating.
+    fn evict_stale_buffers(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let partition_duration_ms = u64::from(self.config.partition_duration_secs) * 1000;
+        let current_partition = now_ms / partition_duration_ms;
+
+        self.buffers
+            .retain(|(_fingerprint, partition_hour), _buf| *partition_hour >= current_partition);
     }
 }
 

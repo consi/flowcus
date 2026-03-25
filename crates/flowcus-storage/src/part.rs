@@ -219,7 +219,17 @@ pub fn write_part(
         metadata.time_max,
         seq,
     );
-    let col_dir = part_dir.join("columns");
+
+    // Write to a staging directory first, then atomic-rename to the final
+    // path. This prevents queries and merges from reading a half-written
+    // part. The `.staging` suffix doesn't match the part name parser, so
+    // list_parts / walk_parts_recursive will never discover it.
+    let staging_dir = part_dir.with_extension("staging");
+    // Clean up any leftover staging dir from a previous crash
+    if staging_dir.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    let col_dir = staging_dir.join("columns");
     std::fs::create_dir_all(&col_dir)?;
 
     // Write column files + marks + bloom filters
@@ -244,17 +254,24 @@ pub fn write_part(
     }
 
     // Write binary metadata header
-    write_meta_bin(&part_dir.join("meta.bin"), metadata)?;
+    write_meta_bin(&staging_dir.join("meta.bin"), metadata)?;
 
     // Column index for query planning (never open .col during planning)
     let index_data: Vec<_> = columns
         .iter()
         .map(|c| (c.def.clone(), c.encoded.clone()))
         .collect();
-    write_column_index(&part_dir.join("column_index.bin"), &index_data)?;
+    write_column_index(&staging_dir.join("column_index.bin"), &index_data)?;
 
     // Schema for merge recovery
-    write_schema_bin(&part_dir.join("schema.bin"), &metadata.schema)?;
+    write_schema_bin(&staging_dir.join("schema.bin"), &metadata.schema)?;
+
+    // Atomic rename: part becomes visible to readers only after all files
+    // are written. Directory rename is atomic on the same filesystem.
+    std::fs::rename(&staging_dir, &part_dir).inspect_err(|_| {
+        // Clean up staging on rename failure
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    })?;
 
     debug!(
         path = %part_dir.display(),

@@ -380,13 +380,14 @@ export function App() {
       .filter((f) => f.field !== 'limit' && f.field && f.op)
       .map((f) => coerceFilterValue(f, schema));
 
+    const pageLimit = limitN > 0 ? limitN : 100;
     const req: StructuredQueryRequest = {
       time_range: timeRange,
       filters: realFilters,
       logic: filterLogic,
       aggregate: limitN > 0 ? { type: 'limit', n: limitN } : undefined,
       offset: 0,
-      limit: limitN > 0 ? limitN : 100,
+      limit: pageLimit + 1,
     };
 
     setLoading(true);
@@ -398,17 +399,35 @@ export function App() {
     try {
       const res = await executeStructuredQuery(req);
       if (controller.signal.aborted) return;
+
+      const gotExtra = res.rows.length > pageLimit;
+      const displayRows = gotExtra ? res.rows.slice(0, pageLimit) : res.rows;
+
       setColumns(res.columns);
-      setAllRows(res.rows);
+      setAllRows(displayRows);
       setStats(res.stats);
       setExplain((res as unknown as Record<string, unknown>).explain as unknown[] ?? null);
-      setPagination(res.pagination);
-      // Pin time range for infinite scroll — subsequent pages use these
-      // absolute bounds instead of re-resolving the relative duration.
+      setPagination({
+        offset: 0,
+        limit: pageLimit,
+        total: res.pagination.total,
+        has_more: gotExtra,
+      });
+
+      // Pin time range for cursor-based scroll. Use the +1 row's
+      // timestamp as the initial cursor so loadMore can start there.
+      const timeColIdx = res.columns.findIndex((c) => c.name === 'flowcusExportTime');
+      let cursorEnd = res.time_range.end;
+      if (gotExtra && timeColIdx >= 0) {
+        const extraTime = res.rows[pageLimit][timeColIdx];
+        if (typeof extraTime === 'number') cursorEnd = extraTime;
+      }
       lastStructuredReq.current = {
         ...req,
+        limit: pageLimit,
         time_start: res.time_range.start,
-        time_end: res.time_range.end,
+        time_end: cursorEnd,
+        pinned_columns: res.schema_columns,
       };
     } catch (err: unknown) {
       if (controller.signal.aborted) return;
@@ -479,28 +498,63 @@ export function App() {
   const loadMore = useCallback(async () => {
     if (!pagination?.has_more || loadingMore || !lastStructuredReq.current) return;
 
-    const nextOffset = pagination.offset + pagination.limit;
-    // Safety: don't load beyond the total row count
-    if (nextOffset >= pagination.total) return;
+    const pageLimit = pagination.limit;
+    const timeColIdx = columns.findIndex((c) => c.name === 'flowcusExportTime');
+    if (timeColIdx < 0) return;
 
     setLoadingMore(true);
     try {
-      const req = { ...lastStructuredReq.current, offset: nextOffset };
+      // Cursor-based pagination: fetch limit+1 using stored time_end as
+      // cursor. The +1 row's timestamp becomes the next cursor, giving us
+      // a clean ms-level boundary that avoids re-fetching displayed rows.
+      const req = {
+        ...lastStructuredReq.current,
+        offset: 0,
+        limit: pageLimit + 1,
+      };
       const res = await executeStructuredQuery(req);
-      if (res.rows.length === 0) {
-        // No more data — stop pagination regardless of has_more
+      const gotExtra = res.rows.length > pageLimit;
+      const displayRows = gotExtra ? res.rows.slice(0, pageLimit) : res.rows;
+
+      if (displayRows.length === 0) {
         setPagination((prev) => prev ? { ...prev, has_more: false } : prev);
         return;
       }
-      setAllRows((prev) => [...prev, ...res.rows]);
-      setPagination(res.pagination);
+
+      // Advance cursor: use the +1 row's timestamp as next time_end
+      if (gotExtra) {
+        const extraRow = res.rows[pageLimit];
+        const extraTime = extraRow[timeColIdx];
+        if (typeof extraTime === 'number') {
+          lastStructuredReq.current = {
+            ...lastStructuredReq.current,
+            time_end: extraTime,
+            pinned_columns: res.schema_columns,
+          };
+        }
+      }
+
+      // Merge new columns into existing set (columns only grow)
+      setColumns((prev) => {
+        const names = new Set(prev.map((c) => c.name));
+        const added = res.columns.filter((c) => !names.has(c.name));
+        return added.length > 0 ? [...prev, ...added] : prev;
+      });
+
+      setAllRows((prev) => [...prev, ...displayRows]);
+      setPagination({
+        offset: 0,
+        limit: pageLimit,
+        total: res.pagination.total,
+        has_more: gotExtra,
+      });
       setStats(res.stats);
     } catch {
       // silently fail on scroll-load errors
     } finally {
       setLoadingMore(false);
     }
-  }, [pagination, loadingMore]);
+  }, [pagination, loadingMore, columns]);
 
   const handleRowSelect = useCallback((index: number) => {
     setSelectedRow(index);

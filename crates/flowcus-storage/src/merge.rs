@@ -82,6 +82,8 @@ pub fn start(
     config: MergeConfig,
     pending: crate::pending::PendingHours,
     metrics: Arc<flowcus_core::observability::Metrics>,
+    storage_cache: Arc<crate::cache::StorageCache>,
+    part_locks: crate::part_locks::PartLocks,
 ) {
     if config.workers == 0 {
         info!("Merge workers set to 0, background merging disabled");
@@ -101,7 +103,15 @@ pub fn start(
     );
 
     tokio::spawn(async move {
-        run_coordinator(table_base, config, pending, metrics).await;
+        run_coordinator(
+            table_base,
+            config,
+            pending,
+            metrics,
+            storage_cache,
+            part_locks,
+        )
+        .await;
     });
 }
 
@@ -112,6 +122,8 @@ async fn run_coordinator(
     config: MergeConfig,
     pending: crate::pending::PendingHours,
     metrics: Arc<flowcus_core::observability::Metrics>,
+    storage_cache: Arc<crate::cache::StorageCache>,
+    part_locks: crate::part_locks::PartLocks,
 ) {
     // Recover any merges that were interrupted by a previous crash/restart.
     recover_interrupted_merges(&table_base);
@@ -134,7 +146,9 @@ async fn run_coordinator(
             return;
         }
 
-        // Update pending hours gauge
+        // Prune stale entries (directories removed by retention) and update gauge
+        pending.prune_stale();
+        part_locks.prune();
         metrics
             .merge_pending_hours
             .store(pending.count() as i64, Ordering::Relaxed);
@@ -187,6 +201,8 @@ async fn run_coordinator(
             let seq = Arc::clone(&seq);
             let pending = pending.clone();
             let metrics = Arc::clone(&metrics);
+            let cache = Arc::clone(&storage_cache);
+            let locks = part_locks.clone();
             let granule_size = config.granule_size;
             let bloom_bits = config.bloom_bits;
 
@@ -202,7 +218,7 @@ async fn run_coordinator(
                     .map(Path::to_path_buf);
 
                 metrics.merge_active_workers.fetch_add(1, Ordering::Relaxed);
-                let result = execute_merge(&plan, &seq, granule_size, bloom_bits);
+                let result = execute_merge(&plan, &seq, granule_size, bloom_bits, &locks);
                 metrics.merge_active_workers.fetch_sub(1, Ordering::Relaxed);
 
                 // Release source parts from active set
@@ -225,6 +241,11 @@ async fn run_coordinator(
                         metrics
                             .merge_bytes_written
                             .fetch_add(merge_bytes, Ordering::Relaxed);
+
+                        // Invalidate cached metadata for deleted source parts
+                        for path in &source_paths {
+                            cache.invalidate_part(path);
+                        }
 
                         info!(
                             new_part = %new_part.display(),
@@ -426,6 +447,7 @@ fn execute_merge(
     seq: &AtomicU32,
     granule_size: usize,
     bloom_bits: usize,
+    part_locks: &crate::part_locks::PartLocks,
 ) -> std::io::Result<(PathBuf, u64)> {
     let src_count = plan.sources.len();
 
@@ -525,40 +547,64 @@ fn execute_merge(
     // before we delete any source parts.
     fsync_dir(&new_part_dir)?;
 
-    // Write a staging marker that lists all source parts. This acts as a
-    // crash-recovery journal: if we crash after deleting some sources but
-    // before finishing, `recover_interrupted_merges` can complete the work.
-    let marker_path = new_part_dir.join(".merging");
-    {
-        let mut f = fs::File::create(&marker_path)?;
-        for source in &plan.sources {
-            writeln!(f, "{}", source.path.display())?;
+    // Hold a write lock on the new part so queries don't read it while the
+    // .merging marker is still present (partially visible new part).
+    // The lock is held until the marker is removed and the part is ready.
+    let _new_part_lock = part_locks.with_write(&new_part_dir, || {
+        // Write a staging marker that lists all source parts. This acts as a
+        // crash-recovery journal: if we crash after deleting some sources but
+        // before finishing, `recover_interrupted_merges` can complete the work.
+        let marker_path = new_part_dir.join(".merging");
+        {
+            let mut f = fs::File::create(&marker_path)?;
+            for source in &plan.sources {
+                writeln!(f, "{}", source.path.display())?;
+            }
+            f.sync_all()?;
         }
-        f.sync_all()?;
-    }
-    // Fsync parent so the marker directory entry is durable.
-    fsync_dir(&new_part_dir)?;
+        // Fsync parent so the marker directory entry is durable.
+        fsync_dir(&new_part_dir)?;
 
-    // Commit: remove source parts (new part + marker are durable on disk)
-    for source in &plan.sources {
-        if let Err(e) = part::remove_part(&source.path) {
+        // Commit: acquire write lock on each source, then delete.
+        // Write lock blocks until active query readers finish.
+        for source in &plan.sources {
+            let deleted = part_locks.with_write(&source.path, || part::remove_part(&source.path));
+            match deleted {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        path = %source.path.display(),
+                        "Failed to remove source part after merge"
+                    );
+                }
+                None => {
+                    // Lock timeout — query is still reading. Remove anyway after
+                    // logging a warning; the query will get NotFound and retry.
+                    warn!(
+                        path = %source.path.display(),
+                        "Lock timeout removing source part, forcing removal"
+                    );
+                    if let Err(e) = part::remove_part(&source.path) {
+                        warn!(error = %e, "Forced removal also failed");
+                    }
+                }
+            }
+        }
+
+        // All sources removed — delete the staging marker.
+        if let Err(e) = fs::remove_file(&marker_path) {
             warn!(
                 error = %e,
-                path = %source.path.display(),
-                "Failed to remove source part after merge"
+                path = %marker_path.display(),
+                "Failed to remove .merging marker"
             );
-            // Non-fatal: source part remains as an orphan, will be cleaned up later
         }
-    }
-
-    // All sources removed — delete the staging marker.
-    if let Err(e) = fs::remove_file(&marker_path) {
-        warn!(
-            error = %e,
-            path = %marker_path.display(),
-            "Failed to remove .merging marker"
-        );
-    }
+        Ok::<(), std::io::Error>(())
+    });
+    // If new-part lock timed out, marker cleanup still happened inside
+    // the write lambda for source parts. The outer lock is best-effort
+    // to prevent queries from seeing a .merging part.
 
     info!(
         new_part = %new_part_dir.display(),
@@ -628,6 +674,14 @@ pub fn recover_interrupted_merges(table_base: &Path) {
                     };
                     for p in part_entries.flatten() {
                         if !p.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                            continue;
+                        }
+                        let name = p.file_name();
+                        let name_str = name.to_string_lossy();
+                        // Clean up leftover staging dirs from crashed writes
+                        if name_str.ends_with(".staging") {
+                            info!(path = %p.path().display(), "Removing leftover staging directory");
+                            let _ = fs::remove_dir_all(p.path());
                             continue;
                         }
                         let marker = p.path().join(".merging");

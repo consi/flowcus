@@ -977,7 +977,7 @@ fn test_query_column_mapping_across_heterogeneous_parts() {
 
     let executor = make_executor(&dir);
     let query = make_wide_query(vec![]);
-    let result = executor.execute(&query, 0, 100, None).unwrap();
+    let result = executor.execute(&query, 0, 100, None, None).unwrap();
 
     // Both parts should be returned
     assert_eq!(result.rows.len(), 2, "expected 2 rows from 2 parts");
@@ -1093,7 +1093,7 @@ fn test_query_column_mapping_with_explicit_select() {
         },
     ]))]);
 
-    let result = executor.execute(&query, 0, 100, None).unwrap();
+    let result = executor.execute(&query, 0, 100, None, None).unwrap();
 
     assert_eq!(result.columns.len(), 2);
     assert_eq!(result.columns[0], "sourceIPv4Address");
@@ -1138,7 +1138,7 @@ fn test_query_early_termination_within_part() {
     let executor = make_executor(&dir);
     let query = make_wide_query(vec![Stage::Aggregate(AggExpr::Limit(5))]);
 
-    let result = executor.execute(&query, 0, 5, None).unwrap();
+    let result = executor.execute(&query, 0, 5, None, None).unwrap();
     assert_eq!(result.rows.len(), 5, "LIMIT 5 must return exactly 5 rows");
 
     cleanup(&dir);
@@ -1181,7 +1181,7 @@ fn test_query_parts_read_newest_first() {
     let executor = make_executor(&dir);
     // Request only 1 row — should come from the newer part
     let query = make_wide_query(vec![Stage::Aggregate(AggExpr::Limit(1))]);
-    let result = executor.execute(&query, 0, 1, None).unwrap();
+    let result = executor.execute(&query, 0, 1, None, None).unwrap();
 
     assert_eq!(result.rows.len(), 1);
     let bytes_idx = result
@@ -1225,7 +1225,7 @@ fn test_query_pagination_total_matching_not_capped_by_limit() {
     let query = make_wide_query(vec![]);
 
     // Page 1: offset=0, limit=5
-    let page1 = executor.execute(&query, 0, 5, None).unwrap();
+    let page1 = executor.execute(&query, 0, 5, None, None).unwrap();
     assert_eq!(page1.rows.len(), 5, "page 1 must return 5 rows");
     assert!(
         page1.total_matching_rows >= 30,
@@ -1235,7 +1235,7 @@ fn test_query_pagination_total_matching_not_capped_by_limit() {
 
     // Page 2: offset=5, limit=5 (simulating infinite scroll)
     let page2 = executor
-        .execute(&query, 5, 5, Some((page1.time_start, page1.time_end)))
+        .execute(&query, 5, 5, Some((page1.time_start, page1.time_end)), None)
         .unwrap();
     assert_eq!(page2.rows.len(), 5, "page 2 must return 5 rows");
     assert!(

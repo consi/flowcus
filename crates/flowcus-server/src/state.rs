@@ -20,6 +20,7 @@ struct AppStateInner {
     metrics: Arc<Metrics>,
     query_cache: QueryCache,
     storage_cache: Arc<StorageCache>,
+    part_locks: flowcus_storage::part_locks::PartLocks,
     /// Shared IPFIX session store for reading metadata (interface names, etc.).
     /// `None` when no IPFIX listener is configured (e.g. in tests).
     session_store: Option<Arc<tokio::sync::Mutex<SessionStore>>>,
@@ -44,6 +45,7 @@ impl AppState {
                 metrics,
                 query_cache: QueryCache::new(query_entries),
                 storage_cache: Arc::new(StorageCache::new(cache_bytes)),
+                part_locks: flowcus_storage::part_locks::PartLocks::new(),
                 session_store: None,
                 settings_path,
                 settings_lock: tokio::sync::Mutex::new(()),
@@ -59,16 +61,18 @@ impl AppState {
         metrics: Arc<Metrics>,
         session_store: Arc<tokio::sync::Mutex<SessionStore>>,
         settings_path: PathBuf,
+        storage_cache: Arc<StorageCache>,
+        part_locks: flowcus_storage::part_locks::PartLocks,
     ) -> Self {
         let query_entries = config.server.query_cache_entries;
-        let cache_bytes = config.storage.storage_cache_bytes;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(AppStateInner {
                 config,
                 metrics,
                 query_cache: QueryCache::new(query_entries),
-                storage_cache: Arc::new(StorageCache::new(cache_bytes)),
+                storage_cache,
+                part_locks,
                 session_store: Some(session_store),
                 settings_path,
                 settings_lock: tokio::sync::Mutex::new(()),
@@ -102,6 +106,11 @@ impl AppState {
     /// Access the shared storage LRU cache.
     pub fn storage_cache(&self) -> &Arc<StorageCache> {
         &self.inner.storage_cache
+    }
+
+    /// Access the shared part lock registry.
+    pub fn part_locks(&self) -> &flowcus_storage::part_locks::PartLocks {
+        &self.inner.part_locks
     }
 
     /// Access the IPFIX session store (if available).
@@ -145,10 +154,14 @@ pub struct QueryCache {
 }
 
 struct CacheInner {
-    map: HashMap<u64, CachedResult>,
+    map: HashMap<u64, (CachedResult, usize)>,
     /// Insertion-order keys for LRU eviction.
     order: Vec<u64>,
     max_entries: usize,
+    /// Approximate bytes currently held.
+    current_bytes: usize,
+    /// Max bytes budget (128 MB default).
+    max_bytes: usize,
 }
 
 /// A cached query result.
@@ -164,6 +177,19 @@ pub struct CachedResult {
     pub created_at: Instant,
     /// Resolved time range bounds for infinite scroll pinning.
     pub time_range: crate::query::TimeRangeBounds,
+    /// Unified schema columns for pinning across pagination.
+    pub schema_columns: Vec<String>,
+}
+
+impl CachedResult {
+    /// Rough byte estimate for cache budgeting.
+    fn estimate_size(&self) -> usize {
+        let col_bytes: usize = self.columns.iter().map(String::len).sum();
+        let row_bytes: usize = self.rows.iter().map(|r| r.len() * 24).sum(); // ~24 bytes per JSON cell
+        let explain_bytes = self.explain.len() * 64;
+        let schema_bytes: usize = self.schema_columns.iter().map(String::len).sum();
+        col_bytes + row_bytes + explain_bytes + schema_bytes + 128 // overhead
+    }
 }
 
 /// Cached subset of query stats (without timing info, which is per-request).
@@ -177,6 +203,9 @@ pub struct CachedQueryStats {
     pub bytes_read: u64,
 }
 
+/// Max byte budget for the query cache (128 MB).
+const QUERY_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
 impl QueryCache {
     /// Create a new cache with the given maximum entry count.
     fn new(max_entries: usize) -> Self {
@@ -185,6 +214,8 @@ impl QueryCache {
                 map: HashMap::new(),
                 order: Vec::new(),
                 max_entries,
+                current_bytes: 0,
+                max_bytes: QUERY_CACHE_MAX_BYTES,
             }),
         }
     }
@@ -207,12 +238,14 @@ impl QueryCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let entry = inner.map.get(&key)?;
+        let (entry, _size) = inner.map.get(&key)?;
         let stale =
             entry.flush_count != current_flush_count || entry.created_at.elapsed().as_secs() >= 2;
 
         if stale {
-            inner.map.remove(&key);
+            if let Some((_evicted, evicted_size)) = inner.map.remove(&key) {
+                inner.current_bytes = inner.current_bytes.saturating_sub(evicted_size);
+            }
             inner.order.retain(|k| *k != key);
             return None;
         }
@@ -225,17 +258,30 @@ impl QueryCache {
 
     /// Store a query result in the cache.
     pub fn put(&self, key: u64, result: CachedResult) {
+        let entry_size = result.estimate_size();
         let mut inner = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Evict oldest if at capacity
-        while inner.map.len() >= inner.max_entries && !inner.order.is_empty() {
+
+        // Evict oldest until within both entry count and byte budget
+        while (!inner.order.is_empty())
+            && (inner.map.len() >= inner.max_entries
+                || inner.current_bytes + entry_size > inner.max_bytes)
+        {
             let oldest_key = inner.order.remove(0);
-            inner.map.remove(&oldest_key);
+            if let Some((_evicted, evicted_size)) = inner.map.remove(&oldest_key) {
+                inner.current_bytes = inner.current_bytes.saturating_sub(evicted_size);
+            }
+        }
+
+        // Remove existing entry with same key if present
+        if let Some((_old, old_size)) = inner.map.remove(&key) {
+            inner.current_bytes = inner.current_bytes.saturating_sub(old_size);
         }
         inner.order.retain(|k| *k != key);
         inner.order.push(key);
-        inner.map.insert(key, result);
+        inner.current_bytes += entry_size;
+        inner.map.insert(key, (result, entry_size));
     }
 }

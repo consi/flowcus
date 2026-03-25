@@ -54,6 +54,7 @@ pub mod ingest;
 pub mod merge;
 pub mod migrate;
 pub mod part;
+pub mod part_locks;
 pub mod pending;
 pub mod retention;
 pub mod schema;

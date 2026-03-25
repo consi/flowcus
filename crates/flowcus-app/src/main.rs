@@ -132,11 +132,17 @@ async fn main() -> Result<()> {
         granule_size: config.storage.granule_size,
         bloom_bits: config.storage.bloom_bits_per_granule,
     };
+    let storage_cache = Arc::new(flowcus_storage::cache::StorageCache::new(
+        config.storage.storage_cache_bytes,
+    ));
+    let part_locks = flowcus_storage::part_locks::PartLocks::new();
     flowcus_storage::merge::start(
         table_base.clone(),
         merge_config,
         pending,
         Arc::clone(&metrics),
+        Arc::clone(&storage_cache),
+        part_locks.clone(),
     );
 
     // Data retention
@@ -168,7 +174,14 @@ async fn main() -> Result<()> {
     );
 
     // HTTP server with observability endpoint (shares IPFIX session for metadata API)
-    let state = AppState::with_session_store(config.clone(), metrics, session_store, settings_path);
+    let state = AppState::with_session_store(
+        config.clone(),
+        metrics,
+        session_store,
+        settings_path,
+        storage_cache,
+        part_locks,
+    );
     flowcus_server::serve(&config.server, state.clone()).await?;
 
     // Distinguish restart request from normal shutdown (ctrl+c / SIGTERM)

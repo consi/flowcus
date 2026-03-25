@@ -1498,14 +1498,6 @@
   gap: 0.25rem;
 }
 
-.history-logic {
-  font-family: var(--mono);
-  font-size: 0.6rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  opacity: 0.6;
-  padding: 0 0.1rem;
-}
 
 /* Smaller chips inside history rows */
 .search-suggestion-history .search-chip {

@@ -1110,7 +1110,6 @@ export function SearchBar({
               <span className="search-suggestion-label">
                 {entry.filters.map((f, j) => (
                   <span key={j} className="history-filter-group">
-                    {j > 0 && <span className="history-logic">and</span>}
                     {renderChip(f, null, false)}
                   </span>
                 ))}

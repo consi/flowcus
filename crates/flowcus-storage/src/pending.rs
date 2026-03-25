@@ -88,6 +88,19 @@ impl PendingHours {
         inner.dirty.iter().cloned().collect()
     }
 
+    /// Remove entries whose directories no longer exist on disk.
+    /// Called periodically by the merge coordinator to prevent stale accumulation.
+    pub fn prune_stale(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.dirty.len();
+        inner.dirty.retain(|p| p.exists());
+        let pruned = before - inner.dirty.len();
+        if pruned > 0 {
+            debug!(pruned, "Pruned stale pending entries");
+            persist_pending(&inner.persist_path, &inner.dirty);
+        }
+    }
+
     /// Number of hours pending merge.
     pub fn count(&self) -> usize {
         self.inner.lock().unwrap().dirty.len()

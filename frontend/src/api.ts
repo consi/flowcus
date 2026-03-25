@@ -49,6 +49,7 @@ export interface QueryResult {
   stats: QueryStats;
   pagination: Pagination;
   time_range: TimeRangeBounds;
+  schema_columns: string[];
 }
 
 export interface QueryError {
@@ -144,6 +145,7 @@ export interface StructuredQueryRequest {
   limit?: number;
   time_start?: number;
   time_end?: number;
+  pinned_columns?: string[];
 }
 
 export interface SchemaField {
