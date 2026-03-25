@@ -2,6 +2,8 @@
 
 High-performance IPFIX flow collector with columnar storage and built-in query engine. Single binary, zero external dependencies.
 
+![Flowcus](screenshot.png)
+
 Collects NetFlow/IPFIX (RFC 7011) over UDP/TCP, stores flows in a compressed columnar format with automatic compaction, and serves a web UI for real-time analysis.
 
 ## Features
@@ -24,6 +26,19 @@ docker run -p 2137:2137 -p 4739:4739/udp ghcr.io/consi/flowcus:latest
 ```
 
 Open `http://localhost:2137` for the web UI.
+
+### MikroTik RouterOS
+
+```routeros
+/ip traffic-flow
+set cache-entries=1k enabled=yes interfaces=ether1-wan
+/ip traffic-flow ipfix
+set nat-events=yes
+/ip traffic-flow target
+add dst-address=192.168.1.100 port=4739 src-address=192.168.1.1 version=ipfix
+```
+
+Replace `192.168.1.100` with your Flowcus server IP, `192.168.1.1` with the router's address, and `ether1-wan` with your WAN interface name.
 
 ## Installation
 
