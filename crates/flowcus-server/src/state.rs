@@ -179,6 +179,8 @@ pub struct CachedResult {
     pub time_range: crate::query::TimeRangeBounds,
     /// Unified schema columns for pinning across pagination.
     pub schema_columns: Vec<String>,
+    /// Cursor for next page — flowcusRowId of the last returned row.
+    pub next_cursor: Option<String>,
 }
 
 impl CachedResult {

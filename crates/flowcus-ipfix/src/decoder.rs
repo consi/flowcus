@@ -31,17 +31,19 @@ pub fn decode_message(msg: &mut IpfixMessage, raw: &[u8], session: &mut SessionS
     let exporter = msg.exporter;
     let domain = msg.header.observation_domain_id;
 
+    let proto_ver = msg.header.protocol_version;
+
     // First pass: register all templates from this message
     for set in &msg.sets {
         match &set.contents {
             SetContents::Template(templates) => {
                 for tmpl in templates {
-                    session.update_template(exporter, domain, tmpl);
+                    session.update_template(exporter, domain, tmpl, proto_ver);
                 }
             }
             SetContents::OptionsTemplate(templates) => {
                 for tmpl in templates {
-                    session.update_options_template(exporter, domain, tmpl);
+                    session.update_options_template(exporter, domain, tmpl, proto_ver);
                 }
             }
             SetContents::Data(_) => {}

@@ -90,6 +90,7 @@ fn make_message_with_time(records: Vec<DataRecord>, export_time: u32) -> IpfixMe
             export_time,
             sequence_number: 1,
             observation_domain_id: 1,
+            protocol_version: IPFIX_VERSION,
         },
         exporter: "10.0.0.1:4739".parse().unwrap(),
         sets: vec![Set {
@@ -175,10 +176,10 @@ fn test_ingested_data_survives_flush() {
         meta.row_count, 3,
         "meta.bin row_count must match ingested records"
     );
-    // 4 system columns + 3 template columns = 7
+    // 5 system columns + 3 template columns = 8
     assert_eq!(
-        meta.column_count, 7,
-        "meta.bin column_count must match schema (4 system + 3 template)"
+        meta.column_count, 8,
+        "meta.bin column_count must match schema (5 system + 3 template)"
     );
 
     // Each .col file header row_count matches
@@ -188,6 +189,7 @@ fn test_ingested_data_survives_flush() {
         "flowcusExporterPort",
         "flowcusExportTime",
         "flowcusObservationDomainId",
+        "flowcusRowId",
         "sourceIPv4Address",
         "destinationIPv4Address",
         "octetDeltaCount",
@@ -472,28 +474,29 @@ fn test_schema_bin_roundtrip() {
 
     let schema = part::read_schema_bin(&part_dir.join("schema.bin")).unwrap();
 
-    // 4 system columns + 3 template columns = 7
-    assert_eq!(schema.columns.len(), 7);
+    // 5 system columns + 3 template columns = 8
+    assert_eq!(schema.columns.len(), 8);
 
     // System columns come first
     assert_eq!(schema.columns[0].name, "flowcusExporterIPv4");
     assert_eq!(schema.columns[1].name, "flowcusExporterPort");
     assert_eq!(schema.columns[2].name, "flowcusExportTime");
     assert_eq!(schema.columns[3].name, "flowcusObservationDomainId");
+    assert_eq!(schema.columns[4].name, "flowcusRowId");
 
     // Template columns follow
-    let src_col = &schema.columns[4];
+    let src_col = &schema.columns[5];
     assert_eq!(src_col.name, "sourceIPv4Address");
     assert_eq!(src_col.element_id, 8);
     assert_eq!(src_col.enterprise_id, 0);
     assert_eq!(src_col.data_type, DataType::Ipv4Address);
     assert_eq!(src_col.storage_type, StorageType::U32);
 
-    let dst_col = &schema.columns[5];
+    let dst_col = &schema.columns[6];
     assert_eq!(dst_col.name, "destinationIPv4Address");
     assert_eq!(dst_col.element_id, 12);
 
-    let bytes_col = &schema.columns[6];
+    let bytes_col = &schema.columns[7];
     assert_eq!(bytes_col.name, "octetDeltaCount");
     assert_eq!(bytes_col.data_type, DataType::Unsigned64);
 
@@ -977,7 +980,7 @@ fn test_query_column_mapping_across_heterogeneous_parts() {
 
     let executor = make_executor(&dir);
     let query = make_wide_query(vec![]);
-    let result = executor.execute(&query, 0, 100, None, None).unwrap();
+    let result = executor.execute(&query, 0, 100, None, None, None).unwrap();
 
     // Both parts should be returned
     assert_eq!(result.rows.len(), 2, "expected 2 rows from 2 parts");
@@ -1093,7 +1096,7 @@ fn test_query_column_mapping_with_explicit_select() {
         },
     ]))]);
 
-    let result = executor.execute(&query, 0, 100, None, None).unwrap();
+    let result = executor.execute(&query, 0, 100, None, None, None).unwrap();
 
     assert_eq!(result.columns.len(), 2);
     assert_eq!(result.columns[0], "sourceIPv4Address");
@@ -1138,7 +1141,7 @@ fn test_query_early_termination_within_part() {
     let executor = make_executor(&dir);
     let query = make_wide_query(vec![Stage::Aggregate(AggExpr::Limit(5))]);
 
-    let result = executor.execute(&query, 0, 5, None, None).unwrap();
+    let result = executor.execute(&query, 0, 5, None, None, None).unwrap();
     assert_eq!(result.rows.len(), 5, "LIMIT 5 must return exactly 5 rows");
 
     cleanup(&dir);
@@ -1181,7 +1184,7 @@ fn test_query_parts_read_newest_first() {
     let executor = make_executor(&dir);
     // Request only 1 row — should come from the newer part
     let query = make_wide_query(vec![Stage::Aggregate(AggExpr::Limit(1))]);
-    let result = executor.execute(&query, 0, 1, None, None).unwrap();
+    let result = executor.execute(&query, 0, 1, None, None, None).unwrap();
 
     assert_eq!(result.rows.len(), 1);
     let bytes_idx = result
@@ -1225,7 +1228,7 @@ fn test_query_pagination_total_matching_not_capped_by_limit() {
     let query = make_wide_query(vec![]);
 
     // Page 1: offset=0, limit=5
-    let page1 = executor.execute(&query, 0, 5, None, None).unwrap();
+    let page1 = executor.execute(&query, 0, 5, None, None, None).unwrap();
     assert_eq!(page1.rows.len(), 5, "page 1 must return 5 rows");
     assert!(
         page1.total_matching_rows >= 30,
@@ -1235,7 +1238,14 @@ fn test_query_pagination_total_matching_not_capped_by_limit() {
 
     // Page 2: offset=5, limit=5 (simulating infinite scroll)
     let page2 = executor
-        .execute(&query, 5, 5, Some((page1.time_start, page1.time_end)), None)
+        .execute(
+            &query,
+            5,
+            5,
+            Some((page1.time_start, page1.time_end)),
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(page2.rows.len(), 5, "page 2 must return 5 rows");
     assert!(

@@ -15,6 +15,7 @@ use flowcus_core::observability::Metrics;
 
 use crate::decoder;
 use crate::display::DisplayMessage;
+use crate::netflow;
 use crate::protocol::{self, IpfixMessage, SetContents};
 use crate::session::SessionStore;
 use crate::unprocessed;
@@ -167,25 +168,86 @@ async fn run_udp(
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, src)) => {
-                metrics
-                    .ipfix_packets_received
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics
-                    .ipfix_bytes_received
-                    .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
-                if len < 16 {
-                    debug!(len, %src, "UDP datagram too short for IPFIX header, discarding");
+                use std::sync::atomic::Ordering::Relaxed;
+
+                metrics.ipfix_packets_received.fetch_add(1, Relaxed);
+                metrics.ipfix_bytes_received.fetch_add(len as u64, Relaxed);
+
+                let msg_buf = &buf[..len];
+                if len < 2 {
+                    debug!(len, %src, "UDP datagram too short, discarding");
                     continue;
                 }
-                process_ipfix_packet(
-                    &buf[..len],
-                    src,
-                    &session,
-                    &sink,
-                    &metrics,
-                    &unprocessed_dir,
-                )
-                .await;
+
+                // Detect protocol version from first 2 bytes
+                let version = u16::from_be_bytes([msg_buf[0], msg_buf[1]]);
+                match version {
+                    protocol::IPFIX_VERSION => {
+                        if len < protocol::HEADER_LEN {
+                            debug!(len, %src, "UDP datagram too short for IPFIX header");
+                            continue;
+                        }
+                        process_ipfix_packet(
+                            msg_buf,
+                            src,
+                            &session,
+                            &sink,
+                            &metrics,
+                            &unprocessed_dir,
+                        )
+                        .await;
+                    }
+                    netflow::NETFLOW_V9_VERSION => {
+                        metrics.netflow_v9_packets_received.fetch_add(1, Relaxed);
+                        match netflow::translate_v9(msg_buf, src) {
+                            Ok((msg, ipfix_buf)) => {
+                                process_parsed_packet(
+                                    msg,
+                                    &ipfix_buf,
+                                    src,
+                                    &session,
+                                    &sink,
+                                    &metrics,
+                                    &unprocessed_dir,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                metrics.ipfix_packets_errors.fetch_add(1, Relaxed);
+                                warn!(exporter = %src, error = %e, "Failed to translate NetFlow v9 message");
+                            }
+                        }
+                    }
+                    netflow::NETFLOW_V5_VERSION => {
+                        metrics.netflow_v5_packets_received.fetch_add(1, Relaxed);
+                        match netflow::translate_v5(msg_buf, src) {
+                            Ok((msg, ipfix_buf)) => {
+                                process_parsed_packet(
+                                    msg,
+                                    &ipfix_buf,
+                                    src,
+                                    &session,
+                                    &sink,
+                                    &metrics,
+                                    &unprocessed_dir,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                metrics.ipfix_packets_errors.fetch_add(1, Relaxed);
+                                warn!(exporter = %src, error = %e, "Failed to translate NetFlow v5 message");
+                            }
+                        }
+                    }
+                    _ => {
+                        metrics.ipfix_packets_errors.fetch_add(1, Relaxed);
+                        warn!(
+                            exporter = %src,
+                            version = format_args!("{version:#06x}"),
+                            "Unknown flow protocol version"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 error!(error = %e, "UDP recv error");
@@ -284,6 +346,7 @@ async fn handle_tcp_connection(
     }
 }
 
+/// Parse and process a native IPFIX (v10) packet.
 async fn process_ipfix_packet(
     buf: &[u8],
     src: SocketAddr,
@@ -295,77 +358,98 @@ async fn process_ipfix_packet(
     use std::sync::atomic::Ordering::Relaxed;
 
     match protocol::parse_message(buf, src) {
-        Ok(mut msg) => {
+        Ok(msg) => {
             metrics.ipfix_packets_parsed.fetch_add(1, Relaxed);
-
-            {
-                let mut session = session.lock().await;
-                decoder::decode_message(&mut msg, buf, &mut session);
-                metrics
-                    .ipfix_templates_active
-                    .store(session.template_count() as i64, Relaxed);
-                metrics
-                    .ipfix_exporters_active
-                    .store(session.exporter_count() as i64, Relaxed);
-            }
-
-            // Check for data sets that could not be decoded (missing template).
-            let missing_tids: Vec<u16> = msg
-                .sets
-                .iter()
-                .filter_map(|s| {
-                    if let SetContents::Data(d) = &s.contents {
-                        if d.records.is_empty() && d.template_id >= protocol::MIN_DATA_SET_ID {
-                            return Some(d.template_id);
-                        }
-                    }
-                    None
-                })
-                .collect();
-
-            if !missing_tids.is_empty() {
-                if let Err(e) =
-                    unprocessed::save_unprocessed(unprocessed_dir, buf, src, &missing_tids)
-                {
-                    warn!(error = %e, "Failed to save unprocessed IPFIX packet");
-                } else {
-                    metrics.ipfix_unprocessed_saved.fetch_add(1, Relaxed);
-                }
-            }
-
-            let record_count: usize = msg
-                .sets
-                .iter()
-                .filter_map(|s| {
-                    if let SetContents::Data(d) = &s.contents {
-                        Some(d.records.len())
-                    } else {
-                        None
-                    }
-                })
-                .sum();
-            metrics
-                .ipfix_records_decoded
-                .fetch_add(record_count as u64, Relaxed);
-
-            debug!(
-                exporter = %src,
-                seq = msg.header.sequence_number,
-                domain = msg.header.observation_domain_id,
-                records = record_count,
-                "IPFIX message decoded"
-            );
-
-            trace!("\n{}", DisplayMessage(&msg));
-
-            // Forward to storage (or other consumers)
-            sink.on_message(msg);
+            process_parsed_packet(msg, buf, src, session, sink, metrics, unprocessed_dir).await;
         }
         Err(e) => {
             metrics.ipfix_packets_errors.fetch_add(1, Relaxed);
             warn!(exporter = %src, error = %e, "Failed to parse IPFIX message");
         }
     }
+}
+
+/// Process an already-parsed message (IPFIX or translated NetFlow v9/v5).
+/// Decodes data records using templates, saves unprocessed packets, and
+/// forwards to the message sink.
+async fn process_parsed_packet(
+    mut msg: IpfixMessage,
+    raw: &[u8],
+    src: SocketAddr,
+    session: &Arc<Mutex<SessionStore>>,
+    sink: &Arc<dyn MessageSink>,
+    metrics: &Arc<Metrics>,
+    unprocessed_dir: &std::path::Path,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    {
+        let mut session = session.lock().await;
+        decoder::decode_message(&mut msg, raw, &mut session);
+        metrics
+            .ipfix_templates_active
+            .store(session.template_count() as i64, Relaxed);
+        metrics
+            .ipfix_exporters_active
+            .store(session.exporter_count() as i64, Relaxed);
+    }
+
+    // Check for data sets that could not be decoded (missing template).
+    let missing_tids: Vec<u16> = msg
+        .sets
+        .iter()
+        .filter_map(|s| {
+            if let SetContents::Data(d) = &s.contents {
+                if d.records.is_empty() && d.template_id >= protocol::MIN_DATA_SET_ID {
+                    return Some(d.template_id);
+                }
+            }
+            None
+        })
+        .collect();
+
+    if !missing_tids.is_empty() {
+        if let Err(e) = unprocessed::save_unprocessed(unprocessed_dir, raw, src, &missing_tids) {
+            warn!(error = %e, "Failed to save unprocessed packet");
+        } else {
+            metrics.ipfix_unprocessed_saved.fetch_add(1, Relaxed);
+        }
+    }
+
+    let record_count: usize = msg
+        .sets
+        .iter()
+        .filter_map(|s| {
+            if let SetContents::Data(d) = &s.contents {
+                Some(d.records.len())
+            } else {
+                None
+            }
+        })
+        .sum();
+    metrics
+        .ipfix_records_decoded
+        .fetch_add(record_count as u64, Relaxed);
+
+    let proto_label = match msg.header.protocol_version {
+        5 => "NetFlow v5",
+        9 => "NetFlow v9",
+        _ => "IPFIX",
+    };
+
+    debug!(
+        exporter = %src,
+        seq = msg.header.sequence_number,
+        domain = msg.header.observation_domain_id,
+        records = record_count,
+        protocol = proto_label,
+        "Message decoded"
+    );
+
+    trace!("\n{}", DisplayMessage(&msg));
+
+    // Forward to storage (or other consumers)
+    sink.on_message(msg);
 }
 
 #[cfg(test)]

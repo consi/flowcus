@@ -95,6 +95,7 @@ fn make_message_with_time(records: Vec<DataRecord>, export_time: u32) -> IpfixMe
             export_time,
             sequence_number: 1,
             observation_domain_id: 1,
+            protocol_version: IPFIX_VERSION,
         },
         exporter: "10.0.0.1:4739".parse().unwrap(),
         sets: vec![Set {

@@ -110,6 +110,15 @@ impl ColumnBuffer {
         }
     }
 
+    /// Push a raw `[u64; 2]` value into a U128 buffer.
+    /// Panics if the buffer is not U128.
+    pub fn push_u128(&mut self, val: [u64; 2]) {
+        match self {
+            Self::U128(v) => v.push(val),
+            _ => panic!("push_u128 called on non-U128 buffer"),
+        }
+    }
+
     /// Number of rows in this buffer.
     pub fn row_count(&self) -> usize {
         match self {

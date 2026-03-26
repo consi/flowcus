@@ -552,6 +552,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

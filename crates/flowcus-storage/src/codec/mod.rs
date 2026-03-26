@@ -49,6 +49,8 @@ pub enum CompressionType {
     None = 0,
     /// LZ4 block compression — fast, good ratio for columnar data.
     Lz4 = 1,
+    /// Zstd compression — better ratio than LZ4, used in v2+ parts.
+    Zstd = 2,
 }
 
 /// Result of encoding a column buffer to bytes.
@@ -106,6 +108,9 @@ impl CodecHint {
     const fn plain_lz4() -> Self {
         Self::new(CodecType::Plain, CompressionType::Lz4)
     }
+    const fn plain_zstd() -> Self {
+        Self::new(CodecType::Plain, CompressionType::Zstd)
+    }
 }
 
 /// Look up the optimal codec for a known column based on IPFIX field semantics.
@@ -136,6 +141,8 @@ fn hint_for_system_column(name: &str) -> Option<CodecHint> {
         "flowcusObservationDomainId" => CodecHint::plain_lz4(),
         // Computed flow duration — variable but benefits from LZ4.
         "flowcusFlowDuration" => CodecHint::plain_lz4(),
+        // UUIDv7 row identifier — monotonic U128, zstd handles the timestamp prefix well.
+        "flowcusRowId" => CodecHint::plain_zstd(),
         _ => return None,
     })
 }
@@ -285,6 +292,12 @@ fn hint_for_iana_ie_by_id(id: u16) -> Option<CodecHint> {
         // httpStatusCode, dnsQueryType, dnsResponseCode
         459 | 469 | 470 => CodecHint::plain_lz4(),
 
+        // ── NAT fields (RFC 8158) ─────────────────────────────────────
+        // postNATSourceIPv4Address, postNATDestinationIPv4Address
+        225 | 226 => CodecHint::plain_lz4(),
+        // postNAPTSourceTransportPort, postNAPTDestinationTransportPort
+        227 | 228 => CodecHint::plain_lz4(),
+
         _ => return None,
     })
 }
@@ -312,15 +325,29 @@ fn hint_for_data_type(dt: DataType) -> Option<CodecHint> {
     })
 }
 
-/// Minimum data size for LZ4 to be worthwhile. Aggressive: columns are rarely
-/// read (bloom/mark skipping), so we favour smaller disk footprint.
-const LZ4_MIN_SIZE: usize = 32;
+/// Minimum data size for compression to be worthwhile. Aggressive: columns are
+/// rarely read (bloom/mark skipping), so we favour smaller disk footprint.
+const COMPRESS_MIN_SIZE: usize = 32;
+
+/// Zstd compression level — level 3 provides good ratio with fast decode.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Encode a column buffer for v1 parts (LZ4 compression).
+pub fn encode(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
+    encode_with_version(buffer, col, 1)
+}
+
+/// Encode a column buffer for v2 parts (zstd compression).
+pub fn encode_v2(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
+    encode_with_version(buffer, col, 2)
+}
 
 /// Encode a column buffer, selecting codec via static hint or heuristic fallback.
 ///
 /// When `col` provides a known IPFIX field, the optimal codec is selected
 /// statically (no data sampling). Unknown fields fall back to heuristic analysis.
-pub fn encode(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
+/// `part_version` determines whether LZ4 (v1) or zstd (v2+) compression is used.
+fn encode_with_version(buffer: &ColumnBuffer, col: &ColumnDef, part_version: u32) -> EncodedColumn {
     let hint = hint_for_column(col);
 
     let mut encoded = match buffer {
@@ -334,8 +361,16 @@ pub fn encode(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
         }
     };
 
-    let force_lz4 = hint.is_some_and(|h| h.compression == CompressionType::Lz4);
-    encoded = try_compress_lz4(encoded, force_lz4);
+    // v2+ parts use zstd; v1 parts use lz4.
+    if part_version >= 2 {
+        let force = hint.is_some_and(|h| {
+            h.compression == CompressionType::Lz4 || h.compression == CompressionType::Zstd
+        });
+        encoded = try_compress_zstd(encoded, force);
+    } else {
+        let force_lz4 = hint.is_some_and(|h| h.compression == CompressionType::Lz4);
+        encoded = try_compress_lz4(encoded, force_lz4);
+    }
     encoded
 }
 
@@ -393,7 +428,7 @@ fn encode_fixed_with_hint(buffer: &ColumnBuffer, transform: CodecType) -> Encode
 /// When `force` is true (hint-driven), we always attempt compression regardless
 /// of data size — the hint already determined this column benefits from LZ4.
 fn try_compress_lz4(mut encoded: EncodedColumn, force: bool) -> EncodedColumn {
-    if !force && encoded.data.len() < LZ4_MIN_SIZE {
+    if !force && encoded.data.len() < COMPRESS_MIN_SIZE {
         return encoded;
     }
 
@@ -408,6 +443,53 @@ fn try_compress_lz4(mut encoded: EncodedColumn, force: bool) -> EncodedColumn {
         encoded.compression = CompressionType::Lz4;
     }
     encoded
+}
+
+/// Apply zstd compression if it actually reduces size.
+fn try_compress_zstd(mut encoded: EncodedColumn, force: bool) -> EncodedColumn {
+    if !force && encoded.data.len() < COMPRESS_MIN_SIZE {
+        return encoded;
+    }
+
+    if encoded.data.is_empty() {
+        return encoded;
+    }
+
+    match zstd::bulk::compress(&encoded.data, ZSTD_LEVEL) {
+        Ok(compressed) if compressed.len() < encoded.data.len() => {
+            encoded.uncompressed_size = encoded.data.len();
+            encoded.data = compressed;
+            encoded.compression = CompressionType::Zstd;
+        }
+        _ => {}
+    }
+    encoded
+}
+
+/// Decompress data based on the compression type stored in the column header.
+///
+/// For zstd, we use streaming decompression instead of `bulk::decompress` to
+/// avoid "Destination buffer is too small" errors when the stored `raw_size`
+/// doesn't match the actual decompressed size (e.g. GCD codec adds a header
+/// value, making the encoded output larger than `row_count * element_size`).
+pub fn decompress(
+    data: &[u8],
+    compression: CompressionType,
+    uncompressed_size: usize,
+) -> std::io::Result<Vec<u8>> {
+    match compression {
+        CompressionType::None => Ok(data.to_vec()),
+        CompressionType::Lz4 => lz4_flex::decompress_size_prepended(data).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("LZ4 error: {e}"))
+        }),
+        CompressionType::Zstd => {
+            // Pre-allocate with the hint but let the decoder grow if needed.
+            let mut out = Vec::with_capacity(uncompressed_size);
+            let mut decoder = zstd::Decoder::new(std::io::Cursor::new(data))?;
+            std::io::Read::read_to_end(&mut decoder, &mut out)?;
+            Ok(out)
+        }
+    }
 }
 
 /// For fixed-size columns, analyze and pick the best numeric codec.
@@ -629,8 +711,24 @@ fn compute_min_max(buffer: &ColumnBuffer) -> ([u8; 16], [u8; 16]) {
                 max_val[0] = max;
             }
         }
+        ColumnBuffer::U128(v) => {
+            if !v.is_empty() {
+                let min = v
+                    .iter()
+                    .min_by(|a, b| a[0].cmp(&b[0]).then(a[1].cmp(&b[1])))
+                    .unwrap();
+                let max = v
+                    .iter()
+                    .max_by(|a, b| a[0].cmp(&b[0]).then(a[1].cmp(&b[1])))
+                    .unwrap();
+                min_val[..8].copy_from_slice(&min[0].to_be_bytes());
+                min_val[8..].copy_from_slice(&min[1].to_be_bytes());
+                max_val[..8].copy_from_slice(&max[0].to_be_bytes());
+                max_val[8..].copy_from_slice(&max[1].to_be_bytes());
+            }
+        }
         _ => {
-            // For U128, Mac, VarLen: zeroed min/max for now
+            // For Mac, VarLen: zeroed min/max for now
             min_val = [0; 16];
         }
     }

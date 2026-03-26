@@ -6,6 +6,9 @@
 //!
 //! Each data type has its own memory budget so marks can't evict blooms, etc.
 //! Thread-safe via per-partition `Mutex`.
+//!
+//! Budget split: 40% marks, 34% blooms, 10% rowid_marks, 10% rowid_blooms,
+//! 5% column index, 1% metadata.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -106,10 +109,13 @@ impl<V: Clone> LruPool<V> {
 
 /// Thread-safe partitioned LRU cache for storage index structures.
 ///
-/// Budget split: 50% marks, 44% blooms, 5% column index, 1% metadata.
+/// Budget split: 40% marks, 34% blooms, 10% rowid_marks, 10% rowid_blooms,
+/// 5% column index, 1% metadata.
 pub struct StorageCache {
     blooms: Mutex<LruPool<(u32, Vec<GranuleBloom>)>>,
     marks: Mutex<LruPool<(u32, Vec<GranuleMark>)>>,
+    rowid_blooms: Mutex<LruPool<(u32, Vec<GranuleBloom>)>>,
+    rowid_marks: Mutex<LruPool<(u32, Vec<GranuleMark>)>>,
     column_index: Mutex<LruPool<Vec<ColumnIndexEntry>>>,
     meta: Mutex<LruPool<PartMetadataHeader>>,
 }
@@ -118,10 +124,12 @@ impl StorageCache {
     /// Create a new partitioned cache with the given total memory budget.
     pub fn new(total_bytes: usize) -> Self {
         Self {
-            marks: Mutex::new(LruPool::new(total_bytes / 2)), // 50%
-            blooms: Mutex::new(LruPool::new(total_bytes * 44 / 100)), // 44%
+            marks: Mutex::new(LruPool::new(total_bytes * 40 / 100)), // 40%
+            blooms: Mutex::new(LruPool::new(total_bytes * 34 / 100)), // 34%
+            rowid_marks: Mutex::new(LruPool::new(total_bytes * 10 / 100)), // 10%
+            rowid_blooms: Mutex::new(LruPool::new(total_bytes * 10 / 100)), // 10%
             column_index: Mutex::new(LruPool::new(total_bytes * 5 / 100)), // 5%
-            meta: Mutex::new(LruPool::new(total_bytes / 100)), // 1%
+            meta: Mutex::new(LruPool::new(total_bytes / 100)),       // 1%
         }
     }
 
@@ -151,6 +159,32 @@ impl StorageCache {
         Ok((gs, marks, false))
     }
 
+    pub fn get_rowid_blooms(&self, path: &Path) -> std::io::Result<(u32, Vec<GranuleBloom>, bool)> {
+        if let Some((bits, blooms)) = self.rowid_blooms.lock().unwrap().get(path) {
+            return Ok((bits, blooms, true));
+        }
+        let (bits, blooms) = crate::granule::read_blooms(path)?;
+        let size = blooms.iter().map(|b| b.bits.len() * 8).sum::<usize>() + 64;
+        self.rowid_blooms
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (bits, blooms.clone()), size);
+        Ok((bits, blooms, false))
+    }
+
+    pub fn get_rowid_marks(&self, path: &Path) -> std::io::Result<(u32, Vec<GranuleMark>, bool)> {
+        if let Some((gs, marks)) = self.rowid_marks.lock().unwrap().get(path) {
+            return Ok((gs, marks, true));
+        }
+        let (gs, marks) = crate::granule::read_marks(path)?;
+        let size = marks.len() * std::mem::size_of::<GranuleMark>() + 64;
+        self.rowid_marks
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (gs, marks.clone()), size);
+        Ok((gs, marks, false))
+    }
+
     pub fn get_meta(&self, path: &Path) -> std::io::Result<(PartMetadataHeader, bool)> {
         if let Some(meta) = self.meta.lock().unwrap().get(path) {
             return Ok((meta, true));
@@ -162,6 +196,32 @@ impl StorageCache {
             .unwrap()
             .insert(path.to_path_buf(), meta.clone(), size);
         Ok((meta, false))
+    }
+
+    /// Get blooms for a column, routing `flowcusRowId` to the dedicated pool.
+    pub fn get_blooms_for_column(
+        &self,
+        path: &Path,
+        col_name: &str,
+    ) -> std::io::Result<(u32, Vec<GranuleBloom>, bool)> {
+        if col_name == "flowcusRowId" {
+            self.get_rowid_blooms(path)
+        } else {
+            self.get_blooms(path)
+        }
+    }
+
+    /// Get marks for a column, routing `flowcusRowId` to the dedicated pool.
+    pub fn get_marks_for_column(
+        &self,
+        path: &Path,
+        col_name: &str,
+    ) -> std::io::Result<(u32, Vec<GranuleMark>, bool)> {
+        if col_name == "flowcusRowId" {
+            self.get_rowid_marks(path)
+        } else {
+            self.get_marks(path)
+        }
     }
 
     pub fn get_column_index(&self, path: &Path) -> std::io::Result<(Vec<ColumnIndexEntry>, bool)> {
@@ -181,6 +241,11 @@ impl StorageCache {
     pub fn invalidate_part(&self, part_dir: &Path) {
         self.blooms.lock().unwrap().invalidate_prefix(part_dir);
         self.marks.lock().unwrap().invalidate_prefix(part_dir);
+        self.rowid_blooms
+            .lock()
+            .unwrap()
+            .invalidate_prefix(part_dir);
+        self.rowid_marks.lock().unwrap().invalidate_prefix(part_dir);
         self.column_index
             .lock()
             .unwrap()
@@ -192,29 +257,37 @@ impl StorageCache {
     pub fn stats(&self) -> (u64, u64) {
         let (bh, bm) = self.blooms.lock().unwrap().stats();
         let (mh, mm) = self.marks.lock().unwrap().stats();
+        let (rbh, rbm) = self.rowid_blooms.lock().unwrap().stats();
+        let (rmh, rmm) = self.rowid_marks.lock().unwrap().stats();
         let (ih, im) = self.column_index.lock().unwrap().stats();
         let (eh, em) = self.meta.lock().unwrap().stats();
-        (bh + mh + ih + eh, bm + mm + im + em)
+        (bh + mh + rbh + rmh + ih + eh, bm + mm + rbm + rmm + im + em)
     }
 
     /// Get aggregate cache saturation (used_bytes, max_bytes).
     pub fn saturation(&self) -> (usize, usize) {
         let (bu, bm) = self.blooms.lock().unwrap().saturation();
         let (mu, mm) = self.marks.lock().unwrap().saturation();
+        let (rbu, rbm) = self.rowid_blooms.lock().unwrap().saturation();
+        let (rmu, rmm) = self.rowid_marks.lock().unwrap().saturation();
         let (iu, im) = self.column_index.lock().unwrap().saturation();
         let (eu, em) = self.meta.lock().unwrap().saturation();
-        (bu + mu + iu + eu, bm + mm + im + em)
+        (bu + mu + rbu + rmu + iu + eu, bm + mm + rbm + rmm + im + em)
     }
 
     /// Per-partition cache breakdown: `[(name, used_bytes, max_bytes)]`.
-    pub fn partition_stats(&self) -> [(&'static str, usize, usize); 4] {
+    pub fn partition_stats(&self) -> [(&'static str, usize, usize); 6] {
         let (mu, mm) = self.marks.lock().unwrap().saturation();
         let (bu, bm) = self.blooms.lock().unwrap().saturation();
+        let (rmu, rmm) = self.rowid_marks.lock().unwrap().saturation();
+        let (rbu, rbm) = self.rowid_blooms.lock().unwrap().saturation();
         let (iu, im) = self.column_index.lock().unwrap().saturation();
         let (eu, em) = self.meta.lock().unwrap().saturation();
         [
             ("marks", mu, mm),
             ("blooms", bu, bm),
+            ("rowid_marks", rmu, rmm),
+            ("rowid_blooms", rbu, rbm),
             ("column_index", iu, im),
             ("metadata", eu, em),
         ]
@@ -237,5 +310,25 @@ mod tests {
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 0);
         assert_eq!(misses, 0);
+    }
+
+    #[test]
+    fn cache_partition_budget_split() {
+        let total = 1_000_000;
+        let cache = StorageCache::new(total);
+        let parts = cache.partition_stats();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[0].0, "marks");
+        assert_eq!(parts[0].2, total * 40 / 100);
+        assert_eq!(parts[1].0, "blooms");
+        assert_eq!(parts[1].2, total * 34 / 100);
+        assert_eq!(parts[2].0, "rowid_marks");
+        assert_eq!(parts[2].2, total * 10 / 100);
+        assert_eq!(parts[3].0, "rowid_blooms");
+        assert_eq!(parts[3].2, total * 10 / 100);
+        assert_eq!(parts[4].0, "column_index");
+        assert_eq!(parts[4].2, total * 5 / 100);
+        assert_eq!(parts[5].0, "metadata");
+        assert_eq!(parts[5].2, total / 100);
     }
 }

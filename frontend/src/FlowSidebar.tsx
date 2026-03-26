@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import type { QueryColumn } from './api';
+import { fetchRowDetail } from './api';
 import { getSidebarFormatter, getColumnLabel, computeDerivedFields } from './formatters';
 
 interface FlowSidebarProps {
@@ -10,6 +11,7 @@ interface FlowSidebarProps {
   onNavigate: (index: number) => void;
   totalRows: number;
   onAddFilter?: (field: string, value: unknown, negated: boolean) => void;
+  rowId?: string | null;
 }
 
 export function FlowSidebar({
@@ -20,9 +22,9 @@ export function FlowSidebar({
   onNavigate,
   totalRows: _totalRows,
   onAddFilter,
+  rowId,
 }: FlowSidebarProps) {
   const row = rows[selectedIndex];
-  if (!row) return null;
 
   const canPrev = selectedIndex > 0;
   const canNext = selectedIndex < rows.length - 1;
@@ -54,6 +56,70 @@ export function FlowSidebar({
     () => computeDerivedFields(columns, row),
     [columns, row],
   );
+
+  // Lazy-load full row details when rowId is available
+  const [detailValues, setDetailValues] = useState<Record<string, unknown> | null>(null);
+  const [detailColumns, setDetailColumns] = useState<QueryColumn[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastFetchedId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!rowId || rowId === lastFetchedId.current) return;
+
+    setDetailLoading(true);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const detail = await fetchRowDetail(rowId);
+        lastFetchedId.current = rowId;
+        setDetailValues(detail.values);
+        setDetailColumns(detail.columns);
+      } catch {
+        // Silently fail — show partial data from list query
+      } finally {
+        setDetailLoading(false);
+      }
+    }, 150);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [rowId]);
+
+  // Reset detail state when selectedIndex changes and rowId changes
+  useEffect(() => {
+    lastFetchedId.current = null;
+    setDetailValues(null);
+    setDetailColumns([]);
+  }, [selectedIndex]);
+
+  // Build merged columns: list-query columns + any extra from detail
+  const mergedColumns = useMemo(() => {
+    const listNames = new Set(columns.map(c => c.name));
+    const extra = detailColumns.filter(c => !listNames.has(c.name) && c.name !== 'flowcusRowId');
+    return [...columns.filter(c => c.name !== 'flowcusRowId'), ...extra];
+  }, [columns, detailColumns]);
+
+  // Get value for a column — prefer detail values if available
+  const getValue = (colName: string, colIdx: number): unknown => {
+    if (detailValues && colName in detailValues) return detailValues[colName];
+    if (row && colIdx >= 0 && colIdx < row.length) return row[colIdx];
+    return null;
+  };
+
+  // Get flowcusRowId value
+  const rowIdValue = useMemo(() => {
+    if (detailValues && 'flowcusRowId' in detailValues) return detailValues['flowcusRowId'];
+    if (row) {
+      const idx = columns.findIndex(c => c.name === 'flowcusRowId');
+      if (idx >= 0 && idx < row.length) return row[idx];
+    }
+    return rowId ?? null;
+  }, [columns, row, detailValues, rowId]);
+
+  if (!row) return null;
 
   return (
     <aside className="flow-sidebar">
@@ -104,9 +170,9 @@ export function FlowSidebar({
           </>
         )}
 
-        {columns.map((col, i) => {
+        {mergedColumns.map((col) => {
           const formatter = getSidebarFormatter(col.name);
-          const raw = row[i];
+          const raw = getValue(col.name, columns.findIndex(c => c.name === col.name));
           const formatted = formatter(raw);
           const isNull = raw === null || raw === undefined;
 
@@ -135,6 +201,28 @@ export function FlowSidebar({
             </div>
           );
         })}
+
+        {detailLoading && (
+          <div className="sidebar-field sidebar-field-computed">
+            <div className="sidebar-field-value">Loading details...</div>
+          </div>
+        )}
+
+        {/* Flowcus Row UUID — special field at the bottom */}
+        {rowIdValue != null && (
+          <>
+            <div className="sidebar-divider" />
+            <div className="sidebar-field sidebar-field-computed">
+              <div className="sidebar-field-label">
+                Flowcus Row UUID
+                <span className="sidebar-field-name">flowcusRowId</span>
+              </div>
+              <div className="sidebar-field-value">
+                {String(rowIdValue)}
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="sidebar-footer">

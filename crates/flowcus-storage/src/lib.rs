@@ -59,6 +59,7 @@ pub mod pending;
 pub mod retention;
 pub mod schema;
 pub mod table;
+pub mod uuid7;
 pub mod writer;
 
 pub use ingest::IngestionHandle;

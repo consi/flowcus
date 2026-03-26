@@ -20,6 +20,7 @@ use crate::column::ColumnBuffer;
 use crate::part;
 use crate::schema::Schema;
 use crate::table::Table;
+use crate::uuid7::Uuid7Generator;
 
 /// Configuration for the storage writer.
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ struct SchemaBuffer {
     exporter: std::net::SocketAddr,
     observation_domain_id: u32,
     created_at: Instant,
+    uuid7_gen: Uuid7Generator,
 }
 
 impl SchemaBuffer {
@@ -81,6 +83,7 @@ impl SchemaBuffer {
             exporter: ([0, 0, 0, 0], 0).into(),
             observation_domain_id: 0,
             created_at: Instant::now(),
+            uuid7_gen: Uuid7Generator::new(),
         }
     }
 
@@ -93,17 +96,19 @@ impl SchemaBuffer {
         observation_domain_id: u32,
     ) {
         let num_sys = self.schema.system_column_count();
-        // Push system column values into the first 4 column buffers.
+        // Push system column values into the first 5 column buffers.
         self.columns[0].push_u32(exporter_ipv4);
         self.columns[1].push_u16(exporter_port);
         self.columns[2].push_u64(export_time_ms);
         self.columns[3].push_u32(observation_domain_id);
+        // flowcusRowId: UUIDv7 derived from export timestamp.
+        self.columns[4].push_u128(self.uuid7_gen.generate(export_time_ms));
 
         // Compute and push flow duration if this schema has the column.
         if let Some(src) = self.schema.duration_source {
             let duration_ms = compute_duration_ms(src, &record.fields);
-            // Duration column is at index 4 (right after the 4 base system columns).
-            self.columns[4].push_u32(duration_ms);
+            // Duration column is at index 5 (after the 5 base system columns).
+            self.columns[5].push_u32(duration_ms);
         }
 
         // Push template field values into the remaining column buffers.
@@ -425,7 +430,7 @@ fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io
     let mut disk_bytes: u64 = 0;
 
     for (def, col_buf) in buf.schema.columns.iter().zip(buf.columns.iter()) {
-        let encoded = codec::encode(col_buf, def);
+        let encoded = codec::encode_v2(col_buf, def);
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
         let (marks, blooms) = crate::granule::compute_granules(
@@ -522,6 +527,7 @@ mod tests {
                 export_time: 1_700_000_000,
                 sequence_number: 1,
                 observation_domain_id: 1,
+                protocol_version: IPFIX_VERSION,
             },
             exporter: "10.0.0.1:4739".parse().unwrap(),
             sets: vec![Set {
@@ -584,7 +590,7 @@ mod tests {
         let header = part::read_meta_bin(&part_dir.join("meta.bin")).unwrap();
         assert_eq!(header.row_count, 2);
         assert_eq!(header.generation, 0);
-        assert_eq!(header.column_count, 7); // 4 system + 3 template
+        assert_eq!(header.column_count, 8); // 5 system + 3 template
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -678,6 +684,7 @@ mod tests {
                 export_time: 1_700_000_000,
                 sequence_number: 1,
                 observation_domain_id: 1,
+                protocol_version: IPFIX_VERSION,
             },
             exporter: "10.0.0.1:4739".parse().unwrap(),
             sets: vec![Set {
@@ -713,13 +720,13 @@ mod tests {
 
         // Check the schema has the duration column
         let buf = writer.buffers.values().next().unwrap();
-        assert_eq!(buf.schema.columns[4].name, "flowcusFlowDuration");
-        // 4 base sys + 1 duration + 4 template = 9
-        assert_eq!(buf.schema.columns.len(), 9);
-        assert_eq!(buf.schema.system_column_count(), 5);
+        assert_eq!(buf.schema.columns[5].name, "flowcusFlowDuration");
+        // 5 base sys + 1 duration + 4 template = 10
+        assert_eq!(buf.schema.columns.len(), 10);
+        assert_eq!(buf.schema.system_column_count(), 6);
 
         // Verify the computed duration value in the buffer
-        match &buf.columns[4] {
+        match &buf.columns[5] {
             crate::column::ColumnBuffer::U32(vals) => {
                 assert_eq!(vals[0], 5432);
             }
@@ -733,7 +740,7 @@ mod tests {
         assert_eq!(parts.len(), 1);
 
         let header = part::read_meta_bin(&parts[0].path.join("meta.bin")).unwrap();
-        assert_eq!(header.column_count, 9); // 5 system + 4 template
+        assert_eq!(header.column_count, 10); // 6 system (5 base + 1 duration) + 4 template
         assert!(
             parts[0]
                 .path

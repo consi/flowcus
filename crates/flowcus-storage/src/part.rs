@@ -100,10 +100,11 @@ pub const COLUMN_INDEX_ENTRY_SIZE: usize = 64;
 pub const COLUMN_INDEX_MAGIC: &[u8; 4] = b"FCIX";
 pub const SCHEMA_MAGIC: &[u8; 4] = b"FSCH";
 
-/// Current part format version. Encoded in directory name as `v{N}_...`.
+/// Current part format version. Encoded in directory name as `{N}_...`.
 /// - v0 (implicit, no prefix): original format (4-segment dir name).
-/// - v1 (current, 5-segment dir name): adds version prefix to directory name.
-pub const PART_FORMAT_VERSION: u32 = 1;
+/// - v1 (5-segment dir name): adds version prefix to directory name, LZ4 compression.
+/// - v2 (current, 5-segment dir name): adds flowcusRowId, zstd compression.
+pub const PART_FORMAT_VERSION: u32 = 2;
 
 // ---- Part metadata ----
 
@@ -650,11 +651,11 @@ fn write_column_file(
     header[6] = storage_type_to_u8(def.storage_type);
     header[7] = encoded.compression as u8;
     header[8..16].copy_from_slice(&row_count.to_le_bytes());
-    let raw_size = def
-        .storage_type
-        .element_size()
-        .map(|es| row_count * es as u64)
-        .unwrap_or(encoded.uncompressed_size as u64);
+    // Store the actual pre-compression size (post-transform). This is the
+    // size needed to decompress the data. For most codecs this equals
+    // row_count * element_size, but GCD prepends a header value making
+    // the encoded output larger.
+    let raw_size = encoded.uncompressed_size as u64;
     header[16..24].copy_from_slice(&raw_size.to_le_bytes());
     header[24..32].copy_from_slice(&(encoded.data.len() as u64).to_le_bytes());
     header[32..48].copy_from_slice(&encoded.min_value);
@@ -855,7 +856,7 @@ mod tests {
     fn part_dir_name_format() {
         let name = part_dir_name(0, 1_700_000_000_000, 1_700_003_599_000, 1);
         // Format: {version}_{gen:05}_{min}_{max}_{seq:06}
-        assert_eq!(name, "1_00000_1700000000000_1700003599000_000001");
+        assert_eq!(name, "2_00000_1700000000000_1700003599000_000001");
     }
 
     #[test]

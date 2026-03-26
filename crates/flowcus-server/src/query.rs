@@ -58,6 +58,9 @@ pub struct StructuredQueryRequest {
     /// Prevents columns from disappearing across pages due to background merges.
     #[serde(default)]
     pub pinned_columns: Option<Vec<String>>,
+    /// Cursor for keyset pagination — hex-encoded flowcusRowId of the last seen row.
+    /// When set, returns rows with flowcusRowId > this value.
+    pub after_row_id: Option<String>,
 }
 
 /// FQL text query (the original path).
@@ -74,6 +77,8 @@ pub struct FqlQueryRequest {
     /// Pin the column list for paginated queries.
     #[serde(default)]
     pub pinned_columns: Option<Vec<String>>,
+    /// Cursor for keyset pagination — hex-encoded flowcusRowId of the last seen row.
+    pub after_row_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +92,9 @@ pub struct QueryResponse {
     pub time_range: TimeRangeBounds,
     /// Unified schema column list for pinning across pagination requests.
     pub schema_columns: Vec<String>,
+    /// Cursor for the next page — flowcusRowId of the last returned row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -191,6 +199,7 @@ pub struct SchemaField {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/query", post(execute_query))
+        .route("/query/row/{id}", get(get_row_by_id))
         .route("/query/completions", get(completions))
         .route("/query/fields", get(fields))
         .route("/query/schema", get(schema))
@@ -215,6 +224,7 @@ struct ParsedRequest {
     limit: u64,
     pinned_time: Option<(u64, u64)>,
     pinned_columns: Option<Vec<String>>,
+    cursor_row_id: Option<[u64; 2]>,
 }
 
 /// Parse the incoming request (FQL or structured) into a canonical AST.
@@ -230,6 +240,10 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                 _ => None,
             };
             let pinned_columns = fql.pinned_columns;
+            let cursor_row_id = fql
+                .after_row_id
+                .as_deref()
+                .and_then(flowcus_storage::uuid7::parse_uuid_hex);
             let cache_key = crate::state::QueryCache::cache_key(&fql.query, offset, limit);
 
             match flowcus_query::parse(&fql.query) {
@@ -243,6 +257,7 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                         limit,
                         pinned_time,
                         pinned_columns,
+                        cursor_row_id,
                     })
                 }
                 Err(err) => {
@@ -266,6 +281,10 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                 _ => None,
             };
             let pinned_columns = s.pinned_columns;
+            let cursor_row_id = s
+                .after_row_id
+                .as_deref()
+                .and_then(flowcus_storage::uuid7::parse_uuid_hex);
 
             // Build the structured query and convert to AST
             let structured = flowcus_query::structured::StructuredQuery {
@@ -299,6 +318,7 @@ fn parse_request(req: QueryRequest) -> Result<ParsedRequest, (QueryError, std::t
                         limit,
                         pinned_time,
                         pinned_columns,
+                        cursor_row_id,
                     })
                 }
                 Err(err) => Err((
@@ -351,6 +371,7 @@ async fn execute_query(
         limit: req_limit,
         pinned_time,
         pinned_columns,
+        cursor_row_id,
     } = parsed;
 
     // Combine flush + merge counters for cache invalidation.
@@ -395,6 +416,7 @@ async fn execute_query(
             },
             time_range: cached.time_range,
             schema_columns: cached.schema_columns,
+            next_cursor: cached.next_cursor,
         };
         return (
             StatusCode::OK,
@@ -429,6 +451,7 @@ async fn execute_query(
             req_limit,
             pinned_time,
             pinned_columns,
+            cursor_row_id,
         )
     })
     .await;
@@ -515,6 +538,7 @@ async fn execute_query(
                 },
                 time_range: time_range.clone(),
                 schema_columns: result.schema_columns,
+                next_cursor: result.next_cursor,
             };
 
             let cache_entry = CachedResult {
@@ -527,6 +551,7 @@ async fn execute_query(
                 created_at: Instant::now(),
                 time_range,
                 schema_columns: response.schema_columns.clone(),
+                next_cursor: response.next_cursor.clone(),
             };
             state.query_cache().put(cache_key, cache_entry);
 
@@ -569,6 +594,7 @@ async fn execute_query(
                 },
                 time_range: TimeRangeBounds { start: 0, end: 0 },
                 schema_columns: Vec::new(),
+                next_cursor: None,
             };
 
             (
@@ -1276,6 +1302,79 @@ fn classify_semantic_hint(name: &str, data_type: flowcus_ipfix::protocol::DataTy
 
 // ---------------------------------------------------------------------------
 // GET /api/query/completions
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GET /api/query/row/:id
+// ---------------------------------------------------------------------------
+
+async fn get_row_by_id(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(row_id) = flowcus_storage::uuid7::parse_uuid_hex(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid UUID format"})),
+        )
+            .into_response();
+    };
+
+    let storage_dir = state.storage_dir().to_string();
+    let granule_size = state.granule_size();
+    let storage_cache = state.storage_cache().clone();
+    let part_locks = state.part_locks().clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let executor = flowcus_storage::executor::QueryExecutor::with_cache(
+            Path::new(&storage_dir),
+            granule_size,
+            storage_cache,
+            part_locks,
+        );
+        executor.execute_single_row(row_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(row))) => {
+            let columns: Vec<ColumnInfo> = row
+                .columns
+                .iter()
+                .map(|name| ColumnInfo {
+                    name: name.clone(),
+                    col_type: resolve_column_type(name),
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "columns": columns,
+                    "values": row.values,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Row not found"})),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]

@@ -1,10 +1,11 @@
 //! Column decoder: reads encoded column files back into typed `ColumnBuffer`s.
 //!
-//! Decode pipeline: read raw → decompress (LZ4) → undo transform (delta/gcd) → typed buffer.
+//! Decode pipeline: read raw → decompress (LZ4/zstd) → undo transform (delta/gcd) → typed buffer.
 
 use std::io;
 use std::path::Path;
 
+use crate::codec;
 use crate::column::ColumnBuffer;
 use crate::part;
 use crate::schema::StorageType;
@@ -26,14 +27,13 @@ pub fn decode_column(path: &Path, storage_type: StorageType) -> io::Result<Colum
         return Ok(ColumnBuffer::new(storage_type));
     }
 
-    // Step 1: Decompress if LZ4
-    let decompressed = if header.compression == 1 {
-        lz4_flex::decompress_size_prepended(&raw_data).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("LZ4 decompress: {e}"))
-        })?
-    } else {
-        raw_data
+    // Step 1: Decompress based on compression type
+    let compression = match header.compression {
+        1 => codec::CompressionType::Lz4,
+        2 => codec::CompressionType::Zstd,
+        _ => codec::CompressionType::None,
     };
+    let decompressed = codec::decompress(&raw_data, compression, header.raw_size as usize)?;
 
     // Step 2: Reverse transform codec
     let mut buf = ColumnBuffer::with_capacity(storage_type, rows);

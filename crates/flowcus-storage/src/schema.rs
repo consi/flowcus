@@ -89,11 +89,18 @@ pub const fn storage_type_for(dt: DataType) -> StorageType {
 /// Sentinel enterprise ID used for system columns (not real IPFIX IEs).
 pub const SYSTEM_ENTERPRISE_ID: u32 = u32::MAX;
 
-/// Returns the 4 system column definitions that are prepended to every schema.
+/// Returns the 5 system column definitions prepended to every v2+ schema.
 ///
 /// These columns capture IPFIX message metadata (exporter address, port,
-/// export time, observation domain ID) rather than flow record fields.
+/// export time, observation domain ID, row UUID) rather than flow record fields.
 pub fn system_columns() -> Vec<ColumnDef> {
+    let mut cols = system_columns_v1();
+    cols.push(row_id_column());
+    cols
+}
+
+/// Returns the 4 system column definitions used by v1 parts (no `flowcusRowId`).
+pub fn system_columns_v1() -> Vec<ColumnDef> {
     vec![
         ColumnDef {
             name: "flowcusExporterIPv4".into(),
@@ -128,6 +135,18 @@ pub fn system_columns() -> Vec<ColumnDef> {
             wire_length: 4,
         },
     ]
+}
+
+/// Column definition for `flowcusRowId` — UUIDv7 row identifier.
+fn row_id_column() -> ColumnDef {
+    ColumnDef {
+        name: "flowcusRowId".into(),
+        element_id: 0,
+        enterprise_id: SYSTEM_ENTERPRISE_ID,
+        data_type: DataType::Unsigned64,
+        storage_type: StorageType::U128,
+        wire_length: 16,
+    }
 }
 
 /// Column definition for `flowcusFlowDuration` (milliseconds).
@@ -299,19 +318,21 @@ mod tests {
             },
         ];
         let schema = Schema::from_template(&specs);
-        // 4 system columns + 5 template columns
-        assert_eq!(schema.columns.len(), 9);
-        // First 4 are system columns
+        // 5 system columns + 5 template columns
+        assert_eq!(schema.columns.len(), 10);
+        // First 5 are system columns
         assert_eq!(schema.columns[0].name, "flowcusExporterIPv4");
         assert_eq!(schema.columns[1].name, "flowcusExporterPort");
         assert_eq!(schema.columns[2].name, "flowcusExportTime");
         assert_eq!(schema.columns[3].name, "flowcusObservationDomainId");
-        // Template columns start at index 4
-        assert_eq!(schema.columns[4].name, "sourceIPv4Address");
-        assert_eq!(schema.columns[4].storage_type, StorageType::U32);
-        assert_eq!(schema.columns[6].name, "sourceTransportPort");
-        assert_eq!(schema.columns[6].storage_type, StorageType::U16);
-        assert_eq!(schema.columns[8].storage_type, StorageType::U8);
+        assert_eq!(schema.columns[4].name, "flowcusRowId");
+        assert_eq!(schema.columns[4].storage_type, StorageType::U128);
+        // Template columns start at index 5
+        assert_eq!(schema.columns[5].name, "sourceIPv4Address");
+        assert_eq!(schema.columns[5].storage_type, StorageType::U32);
+        assert_eq!(schema.columns[7].name, "sourceTransportPort");
+        assert_eq!(schema.columns[7].storage_type, StorageType::U16);
+        assert_eq!(schema.columns[9].storage_type, StorageType::U8);
     }
 
     #[test]
@@ -342,15 +363,15 @@ mod tests {
             }, // flowEndMilliseconds
         ];
         let schema = Schema::from_template(&specs);
-        // 4 base system + 1 duration + 3 template = 8
-        assert_eq!(schema.columns.len(), 8);
-        assert_eq!(schema.columns[4].name, "flowcusFlowDuration");
-        assert_eq!(schema.columns[4].storage_type, StorageType::U32);
+        // 5 base system + 1 duration + 3 template = 9
+        assert_eq!(schema.columns.len(), 9);
+        assert_eq!(schema.columns[5].name, "flowcusFlowDuration");
+        assert_eq!(schema.columns[5].storage_type, StorageType::U32);
         assert!(matches!(
             schema.duration_source,
             Some(DurationSource::Milliseconds { .. })
         ));
-        assert_eq!(schema.system_column_count(), 5);
+        assert_eq!(schema.system_column_count(), 6);
     }
 
     #[test]
@@ -368,7 +389,7 @@ mod tests {
             }, // flowEndSeconds
         ];
         let schema = Schema::from_template(&specs);
-        assert_eq!(schema.columns[4].name, "flowcusFlowDuration");
+        assert_eq!(schema.columns[5].name, "flowcusFlowDuration");
         assert!(matches!(
             schema.duration_source,
             Some(DurationSource::Seconds { .. })
@@ -390,7 +411,7 @@ mod tests {
             }, // flowEndSysUpTime
         ];
         let schema = Schema::from_template(&specs);
-        assert_eq!(schema.columns[4].name, "flowcusFlowDuration");
+        assert_eq!(schema.columns[5].name, "flowcusFlowDuration");
         assert!(matches!(
             schema.duration_source,
             Some(DurationSource::SysUpTime { .. })
@@ -424,7 +445,7 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "flowcusFlowDuration")
         );
-        assert_eq!(schema.system_column_count(), 4); // only base system columns
+        assert_eq!(schema.system_column_count(), 5); // only base system columns (including rowId)
     }
 
     #[test]
@@ -443,7 +464,7 @@ mod tests {
         ];
         let schema = Schema::from_template(&specs);
         assert!(schema.duration_source.is_none());
-        assert_eq!(schema.system_column_count(), 4);
+        assert_eq!(schema.system_column_count(), 5);
     }
 
     #[test]

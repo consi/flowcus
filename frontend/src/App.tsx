@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ResultsTable } from './ResultsTable';
 import { FlowSidebar } from './FlowSidebar';
 import { TimeRangePicker } from './TimeRangePicker';
@@ -8,6 +8,7 @@ import { ThemeSwitcher } from './ThemeSwitcher';
 import { AboutDialog } from './AboutDialog';
 import { SettingsPanel } from './SettingsPanel';
 import { HealthPanel } from './HealthPanel';
+import { ExportModal } from './ExportModal';
 import { TimeHistogram } from './TimeHistogram';
 import {
   executeStructuredQuery,
@@ -24,7 +25,7 @@ import {
   type StructuredQueryRequest,
   type SchemaResponse,
 } from './api';
-import { setInterfaceNames, getTimezone, setTimezone, getAvailableTimezones } from './formatters';
+import { setInterfaceNames, getTimezone, setTimezone, getAvailableTimezones, selectVisibleColumns } from './formatters';
 import { formatCache } from './formatCache';
 import type { SchemaField } from './api';
 
@@ -276,6 +277,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [healthOpen, setHealthOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [queryGen, setQueryGen] = useState(0);
 
   // Query state — initialized from URL params if present
@@ -387,7 +389,7 @@ export function App() {
       logic: filterLogic,
       aggregate: limitN > 0 ? { type: 'limit', n: limitN } : undefined,
       offset: 0,
-      limit: pageLimit + 1,
+      limit: pageLimit,
     };
 
     setLoading(true);
@@ -400,34 +402,25 @@ export function App() {
       const res = await executeStructuredQuery(req);
       if (controller.signal.aborted) return;
 
-      const gotExtra = res.rows.length > pageLimit;
-      const displayRows = gotExtra ? res.rows.slice(0, pageLimit) : res.rows;
-
       setColumns(res.columns);
-      setAllRows(displayRows);
+      setAllRows(res.rows);
       setStats(res.stats);
       setExplain((res as unknown as Record<string, unknown>).explain as unknown[] ?? null);
       setPagination({
         offset: 0,
         limit: pageLimit,
         total: res.pagination.total,
-        has_more: gotExtra,
+        has_more: res.rows.length === pageLimit,
       });
 
-      // Pin time range for cursor-based scroll. Use the +1 row's
-      // timestamp as the initial cursor so loadMore can start there.
-      const timeColIdx = res.columns.findIndex((c) => c.name === 'flowcusExportTime');
-      let cursorEnd = res.time_range.end;
-      if (gotExtra && timeColIdx >= 0) {
-        const extraTime = res.rows[pageLimit][timeColIdx];
-        if (typeof extraTime === 'number') cursorEnd = extraTime;
-      }
+      // Pin time range + use next_cursor for stable cursor-based pagination.
       lastStructuredReq.current = {
         ...req,
         limit: pageLimit,
         time_start: res.time_range.start,
-        time_end: cursorEnd,
+        time_end: res.time_range.end,
         pinned_columns: res.schema_columns,
+        after_row_id: res.next_cursor,
       };
     } catch (err: unknown) {
       if (controller.signal.aborted) return;
@@ -499,40 +492,29 @@ export function App() {
     if (!pagination?.has_more || loadingMore || !lastStructuredReq.current) return;
 
     const pageLimit = pagination.limit;
-    const timeColIdx = columns.findIndex((c) => c.name === 'flowcusExportTime');
-    if (timeColIdx < 0) return;
 
     setLoadingMore(true);
     try {
-      // Cursor-based pagination: fetch limit+1 using stored time_end as
-      // cursor. The +1 row's timestamp becomes the next cursor, giving us
-      // a clean ms-level boundary that avoids re-fetching displayed rows.
+      // Cursor-based pagination via after_row_id (flowcusRowId).
+      // Falls back to time-based cursor if rowId is unavailable (v1 parts).
       const req = {
         ...lastStructuredReq.current,
         offset: 0,
-        limit: pageLimit + 1,
+        limit: pageLimit,
       };
       const res = await executeStructuredQuery(req);
-      const gotExtra = res.rows.length > pageLimit;
-      const displayRows = gotExtra ? res.rows.slice(0, pageLimit) : res.rows;
 
-      if (displayRows.length === 0) {
+      if (res.rows.length === 0) {
         setPagination((prev) => prev ? { ...prev, has_more: false } : prev);
         return;
       }
 
-      // Advance cursor: use the +1 row's timestamp as next time_end
-      if (gotExtra) {
-        const extraRow = res.rows[pageLimit];
-        const extraTime = extraRow[timeColIdx];
-        if (typeof extraTime === 'number') {
-          lastStructuredReq.current = {
-            ...lastStructuredReq.current,
-            time_end: extraTime,
-            pinned_columns: res.schema_columns,
-          };
-        }
-      }
+      // Advance cursor for next page.
+      lastStructuredReq.current = {
+        ...lastStructuredReq.current,
+        after_row_id: res.next_cursor ?? lastStructuredReq.current.after_row_id,
+        pinned_columns: res.schema_columns,
+      };
 
       // Merge new columns into existing set (columns only grow)
       setColumns((prev) => {
@@ -541,12 +523,12 @@ export function App() {
         return added.length > 0 ? [...prev, ...added] : prev;
       });
 
-      setAllRows((prev) => [...prev, ...displayRows]);
+      setAllRows((prev) => [...prev, ...res.rows]);
       setPagination({
         offset: 0,
         limit: pageLimit,
         total: res.pagination.total,
-        has_more: gotExtra,
+        has_more: res.rows.length === pageLimit,
       });
       setStats(res.stats);
     } catch {
@@ -569,6 +551,15 @@ export function App() {
   }, [allRows.length]);
 
   const timezones = getAvailableTimezones();
+
+  // Resolve visible column names for export modal
+  const resolvedVisibleColumns = useMemo(() => {
+    if (visibleColumns && visibleColumns.length > 0) {
+      const names = new Set(columns.map((c) => c.name));
+      return visibleColumns.filter((n) => names.has(n));
+    }
+    return selectVisibleColumns(columns).map((i) => columns[i].name);
+  }, [visibleColumns, columns]);
 
   return (
     <div className="app">
@@ -763,18 +754,42 @@ export function App() {
       )}
 
 
-      {selectedRow !== null && (
-        <FlowSidebar
-          columns={columns}
-          rows={allRows}
-          selectedIndex={selectedRow}
-          onClose={handleSidebarClose}
-          onNavigate={handleSidebarNavigate}
-          totalRows={pagination?.total ?? allRows.length}
-          onAddFilter={handleAddFilter}
-        />
+      {selectedRow !== null && (() => {
+        const rowIdColIdx = columns.findIndex(c => c.name === 'flowcusRowId');
+        const selectedRowId = rowIdColIdx >= 0 && allRows[selectedRow]
+          ? (allRows[selectedRow][rowIdColIdx] as string | null)
+          : null;
+        return (
+          <FlowSidebar
+            columns={columns}
+            rows={allRows}
+            selectedIndex={selectedRow}
+            onClose={handleSidebarClose}
+            onNavigate={handleSidebarNavigate}
+            totalRows={pagination?.total ?? allRows.length}
+            onAddFilter={handleAddFilter}
+            rowId={selectedRowId}
+          />
+        );
+      })()}
+
+      {allRows.length > 0 && (
+        <button className="export-fab" onClick={() => setExportOpen(true)} title="Export rows">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </button>
       )}
 
+      <ExportModal
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        columns={columns}
+        visibleColumns={resolvedVisibleColumns}
+        rows={allRows}
+      />
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <HealthPanel open={healthOpen} onClose={() => setHealthOpen(false)} />
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} version={info?.version} />

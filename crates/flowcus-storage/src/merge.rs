@@ -460,10 +460,6 @@ fn execute_merge(
         "Starting merge"
     );
 
-    // For each column: read raw data from all sources, concatenate, re-encode
-    let mut encoded_columns = Vec::with_capacity(plan.schema.columns.len());
-    let mut disk_bytes: u64 = 0;
-
     // Read row counts from source parts
     let source_rows: Vec<u64> = plan
         .sources
@@ -473,15 +469,152 @@ fn execute_merge(
         .collect();
     let total_rows: u64 = source_rows.iter().sum();
 
-    // granule_size and bloom_bits are passed from MergeConfig
-
+    // Phase 1: Read and concatenate all columns from all sources into ColumnBuffers.
+    let mut combined_buffers: Vec<crate::column::ColumnBuffer> =
+        Vec::with_capacity(plan.schema.columns.len());
     for col_def in &plan.schema.columns {
-        let (combined_buf, encoded) = merge_column(col_def, &plan.sources, &source_rows)?;
+        let (combined_buf, _encoded) = merge_column(col_def, &plan.sources, &source_rows)?;
+        combined_buffers.push(combined_buf);
+    }
+
+    // Phase 2: Sort all columns by flowcusRowId if present.
+    if let Some(rowid_idx) = plan
+        .schema
+        .columns
+        .iter()
+        .position(|c| c.name == "flowcusRowId")
+    {
+        // Mixed v1+v2 merge: v1 rows have zero-padded [0,0] rowids from
+        // pad_column. Fill them with generated UUIDs from their export_time
+        // before sorting, so they interleave correctly with real v2 UUIDs.
+        let has_zeros = matches!(
+            &combined_buffers[rowid_idx],
+            crate::column::ColumnBuffer::U128(v) if v.contains(&[0, 0])
+        );
+        if has_zeros {
+            if let Some(et_idx) = plan
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == "flowcusExportTime")
+            {
+                let timestamps: Vec<u64> =
+                    if let crate::column::ColumnBuffer::U64(ref ts) = combined_buffers[et_idx] {
+                        ts.clone()
+                    } else {
+                        Vec::new()
+                    };
+                if let crate::column::ColumnBuffer::U128(ref mut rowids) =
+                    combined_buffers[rowid_idx]
+                {
+                    let mut uuid_gen = crate::uuid7::Uuid7Generator::new();
+                    for (i, rid) in rowids.iter_mut().enumerate() {
+                        if *rid == [0, 0] {
+                            let ts = timestamps.get(i).copied().unwrap_or(0);
+                            *rid = uuid_gen.generate(ts);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let crate::column::ColumnBuffer::U128(ref rowids) = combined_buffers[rowid_idx] {
+            if !rowids.is_empty() {
+                // Use the minimum row count across all buffers to avoid
+                // out-of-range indices when sources have inconsistent counts.
+                let min_rows = combined_buffers
+                    .iter()
+                    .map(|b| b.row_count())
+                    .min()
+                    .unwrap_or(rowids.len());
+                let sort_len = rowids.len().min(min_rows);
+                let mut perm: Vec<usize> = (0..sort_len).collect();
+                perm.sort_unstable_by(|&a, &b| {
+                    rowids[a][0]
+                        .cmp(&rowids[b][0])
+                        .then(rowids[a][1].cmp(&rowids[b][1]))
+                });
+                // Apply permutation to all column buffers.
+                for buf in &mut combined_buffers {
+                    apply_permutation(buf, &perm);
+                }
+            }
+        }
+    } else {
+        // Source parts lack flowcusRowId (v1 parts) — generate rowids during merge.
+        // Read export_time column (index 2) to derive UUIDv7s.
+        if let Some(export_time_idx) = plan
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name == "flowcusExportTime")
+        {
+            let timestamps: Vec<u64> = if let crate::column::ColumnBuffer::U64(ref ts) =
+                combined_buffers[export_time_idx]
+            {
+                ts.clone()
+            } else {
+                Vec::new()
+            };
+
+            if !timestamps.is_empty() {
+                let mut uuid_gen = crate::uuid7::Uuid7Generator::new();
+                let rowids = uuid_gen.generate_batch(&timestamps, true);
+
+                // Compute sort permutation from rowids before moving them.
+                let mut perm: Vec<usize> = (0..rowids.len()).collect();
+                perm.sort_unstable_by(|&a, &b| {
+                    rowids[a][0]
+                        .cmp(&rowids[b][0])
+                        .then(rowids[a][1].cmp(&rowids[b][1]))
+                });
+
+                // Insert flowcusRowId at index 4 (after the 4 base system columns).
+                // Move, don't clone — permutation was computed above.
+                let insert_idx = 4.min(combined_buffers.len());
+                combined_buffers.insert(insert_idx, crate::column::ColumnBuffer::U128(rowids));
+
+                // Apply sort permutation to all columns including the inserted one.
+                for buf in &mut combined_buffers {
+                    apply_permutation(buf, &perm);
+                }
+            }
+        }
+    }
+
+    // Phase 3: Re-encode all columns with v2 codecs and compute granules.
+    let mut encoded_columns = Vec::with_capacity(plan.schema.columns.len());
+    let mut disk_bytes: u64 = 0;
+
+    // Build the effective schema: if we inserted a rowid column for v1 parts, update schema.
+    let effective_schema = if combined_buffers.len() > plan.schema.columns.len() {
+        // We inserted a flowcusRowId column — rebuild schema.
+        let mut cols = plan.schema.columns.clone();
+        let rowid_col_def = crate::schema::ColumnDef {
+            name: "flowcusRowId".into(),
+            element_id: 0,
+            enterprise_id: crate::schema::SYSTEM_ENTERPRISE_ID,
+            data_type: flowcus_ipfix::protocol::DataType::Unsigned64,
+            storage_type: crate::schema::StorageType::U128,
+            wire_length: 16,
+        };
+        let insert_idx = 4.min(cols.len());
+        cols.insert(insert_idx, rowid_col_def);
+        crate::schema::Schema {
+            columns: cols,
+            duration_source: plan.schema.duration_source,
+        }
+    } else {
+        plan.schema.clone()
+    };
+
+    for (col_def, combined_buf) in effective_schema.columns.iter().zip(combined_buffers.iter()) {
+        let encoded = codec::encode_v2(combined_buf, col_def);
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
         // Recompute granule marks + bloom filters for the merged data
         let (marks, blooms) = crate::granule::compute_granules(
-            &combined_buf,
+            combined_buf,
             &encoded.data,
             granule_size,
             bloom_bits,
@@ -513,10 +646,10 @@ fn execute_merge(
         observation_domain_id: source_meta.observation_domain_id,
         created_at_ms: now,
         disk_bytes,
-        column_count: plan.schema.columns.len() as u32,
-        schema_fingerprint: plan.schema.fingerprint(),
+        column_count: effective_schema.columns.len() as u32,
+        schema_fingerprint: effective_schema.fingerprint(),
         exporter: read_exporter_from_meta(&first_source.path)?,
-        schema: plan.schema.clone(),
+        schema: effective_schema,
     };
 
     let merge_seq = seq.fetch_add(1, Ordering::Relaxed);
@@ -783,17 +916,13 @@ fn merge_column(
         let header = part::read_column_header(&col_path)?;
 
         // Decompress if needed
-        let decompressed = if header.compression == 1 {
-            // LZ4
-            lz4_flex::decompress_size_prepended(&raw_data).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("LZ4 decompress: {e}"),
-                )
-            })?
-        } else {
-            raw_data
+        let compression = match header.compression {
+            1 => crate::codec::CompressionType::Lz4,
+            2 => crate::codec::CompressionType::Zstd,
+            _ => crate::codec::CompressionType::None,
         };
+        let decompressed =
+            crate::codec::decompress(&raw_data, compression, header.raw_size as usize)?;
 
         // For merge, we append the raw decoded bytes directly to the combined buffer.
         // The codec transform (delta, gcd) must be decoded first.
@@ -812,7 +941,7 @@ fn merge_column(
 
     // Re-encode: uses static hint for known fields, heuristic for unknown.
     // Merged data is larger → heuristic analysis is more accurate for unknowns.
-    let encoded = codec::encode(&combined, col_def);
+    let encoded = codec::encode_v2(&combined, col_def);
     Ok((combined, encoded))
 }
 
@@ -1114,6 +1243,76 @@ fn append_varlen_raw(buf: &mut ColumnBuffer, data: &[u8], _rows: usize) -> std::
 }
 
 /// Pad a column buffer with zero values.
+/// Reorder a `ColumnBuffer` according to a permutation.
+///
+/// `perm[i]` says "the element at old index `perm[i]` goes to new index `i`".
+/// Out-of-range indices produce default (zero) values — this handles the case
+/// where source parts have inconsistent row counts between columns.
+fn apply_permutation(buf: &mut ColumnBuffer, perm: &[usize]) {
+    match buf {
+        ColumnBuffer::U8(v) => {
+            let gathered: Vec<u8> = perm
+                .iter()
+                .map(|&p| v.get(p).copied().unwrap_or(0))
+                .collect();
+            *v = gathered;
+        }
+        ColumnBuffer::U16(v) => {
+            let gathered: Vec<u16> = perm
+                .iter()
+                .map(|&p| v.get(p).copied().unwrap_or(0))
+                .collect();
+            *v = gathered;
+        }
+        ColumnBuffer::U32(v) => {
+            let gathered: Vec<u32> = perm
+                .iter()
+                .map(|&p| v.get(p).copied().unwrap_or(0))
+                .collect();
+            *v = gathered;
+        }
+        ColumnBuffer::U64(v) => {
+            let gathered: Vec<u64> = perm
+                .iter()
+                .map(|&p| v.get(p).copied().unwrap_or(0))
+                .collect();
+            *v = gathered;
+        }
+        ColumnBuffer::U128(v) => {
+            let gathered: Vec<[u64; 2]> = perm
+                .iter()
+                .map(|&p| v.get(p).copied().unwrap_or([0, 0]))
+                .collect();
+            *v = gathered;
+        }
+        ColumnBuffer::Mac(v) => {
+            let gathered: Vec<[u8; 6]> = perm
+                .iter()
+                .map(|&p| v.get(p).copied().unwrap_or([0; 6]))
+                .collect();
+            *v = gathered;
+        }
+        ColumnBuffer::VarLen { offsets, data } => {
+            let mut new_data = Vec::with_capacity(data.len());
+            let mut new_offsets = Vec::with_capacity(offsets.len());
+            for &p in perm {
+                let start = if p == 0 {
+                    0usize
+                } else {
+                    offsets.get(p - 1).copied().unwrap_or(0) as usize
+                };
+                let end = offsets.get(p).copied().unwrap_or(start as u32) as usize;
+                if end <= data.len() && start <= end {
+                    new_data.extend_from_slice(&data[start..end]);
+                }
+                new_offsets.push(new_data.len() as u32);
+            }
+            *offsets = new_offsets;
+            *data = new_data;
+        }
+    }
+}
+
 fn pad_column(buf: &mut ColumnBuffer, st: StorageType, rows: usize) {
     use flowcus_ipfix::protocol::FieldValue;
     let zero = match st {
@@ -1411,5 +1610,86 @@ mod tests {
         assert_eq!(gen_groups[&0].len(), 2);
         // gen1 has 1 part → not mergeable yet (needs another gen1)
         assert_eq!(gen_groups[&1].len(), 1);
+    }
+
+    #[test]
+    fn apply_permutation_basic_reorder() {
+        let mut buf = ColumnBuffer::U32(vec![10, 20, 30, 40]);
+        apply_permutation(&mut buf, &[3, 1, 0, 2]);
+        assert_eq!(
+            match &buf {
+                ColumnBuffer::U32(v) => v.clone(),
+                _ => panic!("wrong type"),
+            },
+            vec![40, 20, 10, 30]
+        );
+    }
+
+    #[test]
+    fn apply_permutation_u128_reorder() {
+        let mut buf = ColumnBuffer::U128(vec![[0, 1], [0, 2], [0, 3]]);
+        apply_permutation(&mut buf, &[2, 0, 1]);
+        assert_eq!(
+            match &buf {
+                ColumnBuffer::U128(v) => v.clone(),
+                _ => panic!("wrong type"),
+            },
+            vec![[0, 3], [0, 1], [0, 2]]
+        );
+    }
+
+    #[test]
+    fn apply_permutation_shorter_buffer_does_not_panic() {
+        // Permutation indices go up to 4 but buffer only has 3 elements.
+        // Out-of-range indices should produce default (zero) values.
+        let mut buf = ColumnBuffer::U64(vec![100, 200, 300]);
+        apply_permutation(&mut buf, &[2, 4, 0, 3, 1]);
+        let v = match &buf {
+            ColumnBuffer::U64(v) => v.clone(),
+            _ => panic!("wrong type"),
+        };
+        assert_eq!(v.len(), 5);
+        assert_eq!(v[0], 300); // index 2 → 300
+        assert_eq!(v[1], 0); // index 4 → out of range → 0
+        assert_eq!(v[2], 100); // index 0 → 100
+        assert_eq!(v[3], 0); // index 3 → out of range → 0
+        assert_eq!(v[4], 200); // index 1 → 200
+    }
+
+    #[test]
+    fn apply_permutation_varlen_shorter_buffer() {
+        let mut buf = ColumnBuffer::VarLen {
+            offsets: vec![3, 6], // 2 entries: "abc", "def"
+            data: b"abcdef".to_vec(),
+        };
+        // Permutation asks for index 2 which doesn't exist.
+        apply_permutation(&mut buf, &[1, 2, 0]);
+        let (offsets, data) = match &buf {
+            ColumnBuffer::VarLen { offsets, data } => (offsets.clone(), data.clone()),
+            _ => panic!("wrong type"),
+        };
+        assert_eq!(offsets.len(), 3);
+        // index 1 → "def", index 2 → missing (empty), index 0 → "abc"
+        assert_eq!(&data[..offsets[0] as usize], b"def");
+        assert_eq!(offsets[0], offsets[1]); // empty entry for missing index
+        assert_eq!(&data[offsets[1] as usize..offsets[2] as usize], b"abc");
+    }
+
+    #[test]
+    fn apply_permutation_all_types_consistent() {
+        // Verify all column types produce the same length output as the permutation.
+        let perm = vec![2, 0, 1, 3];
+
+        let mut u8_buf = ColumnBuffer::U8(vec![1, 2, 3]); // shorter than perm
+        apply_permutation(&mut u8_buf, &perm);
+        assert_eq!(u8_buf.row_count(), 4);
+
+        let mut u16_buf = ColumnBuffer::U16(vec![1, 2, 3]);
+        apply_permutation(&mut u16_buf, &perm);
+        assert_eq!(u16_buf.row_count(), 4);
+
+        let mut mac_buf = ColumnBuffer::Mac(vec![[1; 6], [2; 6], [3; 6]]);
+        apply_permutation(&mut mac_buf, &perm);
+        assert_eq!(mac_buf.row_count(), 4);
     }
 }

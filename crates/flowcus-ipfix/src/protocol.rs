@@ -69,6 +69,8 @@ pub struct MessageHeader {
     pub export_time: u32,
     pub sequence_number: u32,
     pub observation_domain_id: u32,
+    /// Original protocol version before translation (5 for NetFlow v5, 9 for v9, 10 for IPFIX).
+    pub protocol_version: u16,
 }
 
 /// A fully parsed IPFIX message.
@@ -215,7 +217,7 @@ impl fmt::Display for FieldValue {
 // ---------------------------------------------------------------------------
 
 /// Read a `u16` from a byte slice at the given offset.
-fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ParseError> {
+pub(crate) fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ParseError> {
     if offset + 2 > buf.len() {
         return Err(ParseError::BufferTooShort {
             need: offset + 2,
@@ -226,7 +228,7 @@ fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ParseError> {
 }
 
 /// Read a `u32` from a byte slice at the given offset.
-fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ParseError> {
+pub(crate) fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ParseError> {
     if offset + 4 > buf.len() {
         return Err(ParseError::BufferTooShort {
             need: offset + 4,
@@ -265,6 +267,7 @@ impl MessageHeader {
             export_time: read_u32(buf, 4)?,
             sequence_number: read_u32(buf, 8)?,
             observation_domain_id: read_u32(buf, 12)?,
+            protocol_version: IPFIX_VERSION,
         })
     }
 }

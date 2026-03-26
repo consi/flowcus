@@ -785,6 +785,7 @@ const COLUMN_LABELS: Record<string, string> = {
   flowcusExporterIPv4: 'Exporter',
   flowcusExporterPort: 'Exp Port',
   flowcusObservationDomainId: 'Obs Domain',
+  flowcusRowId: 'Flowcus Row UUID',
 
   // Interfaces
   ingressInterface: 'In If',

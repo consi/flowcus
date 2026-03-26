@@ -26,6 +26,7 @@ pub mod decoder;
 pub mod display;
 pub mod ie;
 pub mod listener;
+pub mod netflow;
 pub mod protocol;
 pub mod session;
 pub mod unprocessed;

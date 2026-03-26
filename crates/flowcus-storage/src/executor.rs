@@ -162,6 +162,14 @@ pub struct QueryResult {
     /// Unified column list across all parts, before SELECT projection.
     /// Used as `pinned_columns` for subsequent pagination requests.
     pub schema_columns: Vec<String>,
+    /// Cursor for next page — hex-encoded flowcusRowId of the last returned row.
+    pub next_cursor: Option<String>,
+}
+
+/// Result for a single-row lookup by flowcusRowId.
+pub struct SingleRowResult {
+    pub columns: Vec<String>,
+    pub values: HashMap<String, serde_json::Value>,
 }
 
 /// Lightweight histogram built from part metadata only (no column scan).
@@ -191,6 +199,11 @@ enum ResolvedFilter {
     Numeric(ResolvedNumericFilter),
     StringFilter(ResolvedStringFilter),
     Field(ResolvedFieldFilter),
+    /// Cursor filter: only rows with flowcusRowId > (hi, lo).
+    RowIdCursor {
+        hi: u64,
+        lo: u64,
+    },
 }
 
 struct ResolvedIpFilter {
@@ -784,7 +797,7 @@ fn column_get_u64(buf: &ColumnBuffer, row: usize) -> u64 {
     }
 }
 
-fn _column_get_u128(buf: &ColumnBuffer, row: usize) -> [u64; 2] {
+fn column_get_u128(buf: &ColumnBuffer, row: usize) -> [u64; 2] {
     match buf {
         ColumnBuffer::U128(v) => v.get(row).copied().unwrap_or([0, 0]),
         _ => [0, 0],
@@ -839,6 +852,8 @@ fn column_to_json(buf: &ColumnBuffer, row: usize, col_name: &str) -> serde_json:
                 octets[8..].copy_from_slice(&pair[1].to_be_bytes());
                 let ip = std::net::Ipv6Addr::from(octets);
                 serde_json::Value::String(ip.to_string())
+            } else if col_name == "flowcusRowId" {
+                serde_json::Value::String(crate::uuid7::format_uuid(pair))
             } else {
                 serde_json::Value::String(format!("{:016x}{:016x}", pair[0], pair[1]))
             }
@@ -888,6 +903,17 @@ fn evaluate_resolved_filter(
         ResolvedFilter::Numeric(num) => eval_resolved_numeric(num, row, columns),
         ResolvedFilter::StringFilter(sf) => eval_resolved_string(sf, row, columns),
         ResolvedFilter::Field(ff) => eval_resolved_field(ff, row, columns),
+        ResolvedFilter::RowIdCursor { hi, lo } => {
+            // Default query order is descending (newest first). The cursor is
+            // the last (oldest) row's UUID on the previous page. To get the
+            // next page of older rows, we need flowcusRowId < cursor.
+            if let Some(buf) = columns.get("flowcusRowId") {
+                let pair = column_get_u128(buf, row);
+                pair[0] < *hi || (pair[0] == *hi && pair[1] < *lo)
+            } else {
+                true // v1 parts without rowId: include all rows
+            }
+        }
     }
 }
 
@@ -1698,6 +1724,7 @@ impl QueryExecutor {
         limit: u64,
         pinned_time: Option<(u64, u64)>,
         pinned_columns: Option<Vec<String>>,
+        cursor_row_id: Option<[u64; 2]>,
     ) -> std::io::Result<QueryResult> {
         let mut plan = ExecutionPlan {
             steps: Vec::new(),
@@ -1777,6 +1804,11 @@ impl QueryExecutor {
             })),
         ));
 
+        // Inject cursor filter if provided — rows must have flowcusRowId > cursor.
+        if let Some([hi, lo]) = cursor_row_id {
+            resolved_filters.push(ResolvedFilter::RowIdCursor { hi, lo });
+        }
+
         // Step 5: Deduplicate parts (skip lower-gen parts subsumed by higher-gen)
         let mut filtered_parts = filtered_parts;
         deduplicate_parts(&mut filtered_parts, &mut plan);
@@ -1834,6 +1866,10 @@ impl QueryExecutor {
         if !filter_col_names.contains(&"flowcusExportTime".to_string()) {
             filter_col_names.push("flowcusExportTime".to_string());
         }
+        // When cursor is present, ensure flowcusRowId is loaded for filtering.
+        if cursor_row_id.is_some() && !filter_col_names.contains(&"flowcusRowId".to_string()) {
+            filter_col_names.push("flowcusRowId".to_string());
+        }
 
         // Step 7: Build unified column list across all parts in the time range.
         // This must happen before processing so that every part's rows use the
@@ -1841,7 +1877,33 @@ impl QueryExecutor {
         // would be misaligned when concatenated.
         // When pinned_columns is provided (paginated queries), use it as the base
         // to ensure columns never disappear across pages due to background merges.
+        // User-selected columns (from a Select stage) are always included so they
+        // remain stable even if no part in the current time range contains them.
         let mut all_schema_columns: Vec<String> = pinned_columns.unwrap_or_default();
+
+        // Seed with user-selected columns so they're always in schema_columns.
+        for stage in &query.stages {
+            if let Stage::Select(SelectExpr::Fields(fields)) = stage {
+                for f in fields {
+                    let col_name = f.alias.clone().unwrap_or_else(|| match &f.expr {
+                        SelectFieldExpr::Field(name) => resolve_field_name(name).to_string(),
+                        SelectFieldExpr::BinaryOp { left, op, right } => {
+                            let op_str = match op {
+                                flowcus_query::ast::ArithOp::Add => "+",
+                                flowcus_query::ast::ArithOp::Sub => "-",
+                                flowcus_query::ast::ArithOp::Mul => "*",
+                                flowcus_query::ast::ArithOp::Div => "/",
+                            };
+                            format!("{left} {op_str} {right}")
+                        }
+                    });
+                    if !all_schema_columns.contains(&col_name) {
+                        all_schema_columns.push(col_name);
+                    }
+                }
+            }
+        }
+
         for pe in &filtered_parts {
             if pe.path.join(".merging").exists() {
                 continue;
@@ -2235,6 +2297,9 @@ impl QueryExecutor {
             misses: cache_misses,
         });
 
+        // Extract next_cursor from the last row's flowcusRowId column.
+        let next_cursor = extract_row_cursor(&paginated_rows, &result_columns);
+
         Ok(QueryResult {
             columns: result_columns,
             rows: paginated_rows,
@@ -2247,7 +2312,105 @@ impl QueryExecutor {
             time_start,
             time_end,
             schema_columns: all_schema_columns,
+            next_cursor,
         })
+    }
+
+    /// Look up a single row by its flowcusRowId.
+    ///
+    /// Uses UUIDv7 timestamp to narrow the time range, then bloom filter on
+    /// flowcusRowId to find the containing granule, then linear scan for exact match.
+    /// Returns all columns for the matched row.
+    pub fn execute_single_row(&self, row_id: [u64; 2]) -> std::io::Result<Option<SingleRowResult>> {
+        let ts_ms = crate::uuid7::extract_timestamp_ms(row_id);
+
+        // Search ±1 hour around the embedded timestamp.
+        let hour_ms = 3_600_000;
+        let time_start = ts_ms.saturating_sub(hour_ms);
+        let time_end = ts_ms.saturating_add(hour_ms);
+
+        let table =
+            crate::table::Table::open(self.table_base.parent().unwrap_or(Path::new(".")), "flows")?;
+        let parts = table.list_parts(Some(time_start), Some(time_end))?;
+
+        let _target_hex = format!("{:016x}{:016x}", row_id[0], row_id[1]);
+
+        for pe in &parts {
+            let part_dir = &pe.path;
+            // NOTE: we intentionally do NOT skip parts with a `.merging`
+            // marker here. The marker is a crash-recovery journal created
+            // *after* the part data is fully written and fsync'd, so the
+            // data is safe to read. Skipping these parts causes a race
+            // where row-by-id returns 404: source parts are deleted while
+            // the new merged part is still hidden behind `.merging`.
+
+            // Check if this part has flowcusRowId column.
+            let schema_path = part_dir.join("schema.bin");
+            let schema = match part::read_schema_bin(&schema_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let rowid_col = schema.columns.iter().find(|c| c.name == "flowcusRowId");
+            if rowid_col.is_none() {
+                continue;
+            }
+
+            // Try bloom filter to skip this part quickly.
+            let bloom_path = part_dir.join("columns").join("flowcusRowId.bloom");
+            if bloom_path.exists() {
+                if let Ok((_bits, blooms, _cached)) = self.cache.get_rowid_blooms(&bloom_path) {
+                    let mut hash_bytes = [0u8; 16];
+                    hash_bytes[..8].copy_from_slice(&row_id[0].to_le_bytes());
+                    hash_bytes[8..].copy_from_slice(&row_id[1].to_le_bytes());
+                    let may_contain = blooms.iter().any(|b| b.may_contain(&hash_bytes));
+                    if !may_contain {
+                        continue;
+                    }
+                }
+            }
+
+            // Decode flowcusRowId column and find the row.
+            let col_path = part_dir.join("columns").join("flowcusRowId.col");
+            if !col_path.exists() {
+                continue;
+            }
+
+            let rowid_buf = crate::decode::decode_column(&col_path, StorageType::U128)?;
+            let _row_count = rowid_buf.row_count();
+
+            let matched_row = match &rowid_buf {
+                ColumnBuffer::U128(v) => v.iter().position(|r| *r == row_id),
+                _ => None,
+            };
+
+            if let Some(row_idx) = matched_row {
+                // Found! Decode all columns for this row.
+                let mut values = HashMap::new();
+                let mut col_names = Vec::new();
+
+                for col_def in &schema.columns {
+                    col_names.push(col_def.name.clone());
+                    let col_path = part_dir
+                        .join("columns")
+                        .join(format!("{}.col", col_def.name));
+                    if !col_path.exists() {
+                        values.insert(col_def.name.clone(), serde_json::Value::Null);
+                        continue;
+                    }
+                    let buf = crate::decode::decode_column(&col_path, col_def.storage_type)?;
+                    let val = column_to_json(&buf, row_idx, &col_def.name);
+                    values.insert(col_def.name.clone(), val);
+                }
+
+                return Ok(Some(SingleRowResult {
+                    columns: col_names,
+                    values,
+                }));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Map rows from part-schema column ordering to output column ordering.
@@ -2975,8 +3138,29 @@ impl QueryExecutor {
         });
         plan.parts_skipped_by_index = parts_skipped_index;
 
-        // Determine output columns
+        // Determine output columns — seed with user-selected columns for stability.
         let mut all_schema_columns: Vec<String> = Vec::new();
+        for stage in &query.stages {
+            if let Stage::Select(SelectExpr::Fields(fields)) = stage {
+                for f in fields {
+                    let col_name = f.alias.clone().unwrap_or_else(|| match &f.expr {
+                        SelectFieldExpr::Field(name) => resolve_field_name(name).to_string(),
+                        SelectFieldExpr::BinaryOp { left, op, right } => {
+                            let op_str = match op {
+                                flowcus_query::ast::ArithOp::Add => "+",
+                                flowcus_query::ast::ArithOp::Sub => "-",
+                                flowcus_query::ast::ArithOp::Mul => "*",
+                                flowcus_query::ast::ArithOp::Div => "/",
+                            };
+                            format!("{left} {op_str} {right}")
+                        }
+                    });
+                    if !all_schema_columns.contains(&col_name) {
+                        all_schema_columns.push(col_name);
+                    }
+                }
+            }
+        }
         for (_, col_names) in &part_schemas {
             for col in col_names {
                 if !all_schema_columns.contains(col) {
@@ -3055,6 +3239,8 @@ impl QueryExecutor {
         let total_parts_skipped =
             (plan.parts_skipped_by_time + parts_skipped_index + parts_skipped_merge) as u64;
 
+        let next_cursor = extract_row_cursor(&result_rows, &output_columns);
+
         Some(Ok(QueryResult {
             columns: output_columns,
             rows: result_rows,
@@ -3067,6 +3253,7 @@ impl QueryExecutor {
             time_start,
             time_end,
             schema_columns: all_schema_columns,
+            next_cursor,
         }))
     }
 
@@ -3400,7 +3587,8 @@ impl QueryExecutor {
         // Bloom filter checks.
         for (col_name, value_bytes) in bloom_lookups {
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
-            if let Ok((_bits, blooms, _)) = self.cache.get_blooms(&bloom_path) {
+            if let Ok((_bits, blooms, _)) = self.cache.get_blooms_for_column(&bloom_path, col_name)
+            {
                 let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
                 let col_st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
                 let effective_bytes: &[u8] = match col_st.element_size() {
@@ -3418,7 +3606,8 @@ impl QueryExecutor {
         // List bloom checks.
         for (col_name, values_list) in bloom_list_lookups {
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
-            if let Ok((_bits, blooms, _)) = self.cache.get_blooms(&bloom_path) {
+            if let Ok((_bits, blooms, _)) = self.cache.get_blooms_for_column(&bloom_path, col_name)
+            {
                 let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
                 for (gi, bloom) in blooms.iter().enumerate() {
                     if gi < mask.len() && mask[gi] {
@@ -3433,7 +3622,7 @@ impl QueryExecutor {
         // Mark-based range pruning on filter columns.
         for col_name in filter_col_names {
             let marks_path = part_dir.join("columns").join(format!("{col_name}.mrk"));
-            if let Ok((_gs, marks, _)) = self.cache.get_marks(&marks_path) {
+            if let Ok((_gs, marks, _)) = self.cache.get_marks_for_column(&marks_path, col_name) {
                 let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
                 let mask = granule_mask.get_or_insert_with(|| vec![true; marks.len()]);
                 for (gi, mark) in marks.iter().enumerate() {
@@ -3508,6 +3697,11 @@ impl QueryExecutor {
                     .all(|f| evaluate_resolved_filter(f, row_idx, &decoded))
         };
 
+        // Bounds for skipping rows outside the bucket window — bucket_idx
+        // clamps out-of-range timestamps which would inflate boundary buckets.
+        let win_start = bucket_starts[0];
+        let win_end = bucket_starts[num_buckets - 1] + bucket_ms;
+
         if let Some(ref mask) = granule_mask {
             for (granule_idx, &active) in mask.iter().enumerate() {
                 if !active {
@@ -3518,11 +3712,13 @@ impl QueryExecutor {
                 for row_idx in row_start..row_end {
                     if process_row(row_idx) {
                         if let Some(&ts) = time_values.get(row_idx) {
-                            let bi = bucket_idx(bucket_starts, bucket_ms, ts);
-                            if let Some(c) = counts.get_mut(bi) {
-                                *c += 1;
+                            if ts >= win_start && ts < win_end {
+                                let bi = bucket_idx(bucket_starts, bucket_ms, ts);
+                                if let Some(c) = counts.get_mut(bi) {
+                                    *c += 1;
+                                }
+                                total_matching += 1;
                             }
-                            total_matching += 1;
                         }
                     }
                 }
@@ -3531,11 +3727,13 @@ impl QueryExecutor {
             for row_idx in 0..row_count {
                 if process_row(row_idx) {
                     if let Some(&ts) = time_values.get(row_idx) {
-                        let bi = bucket_idx(bucket_starts, bucket_ms, ts);
-                        if let Some(c) = counts.get_mut(bi) {
-                            *c += 1;
+                        if ts >= win_start && ts < win_end {
+                            let bi = bucket_idx(bucket_starts, bucket_ms, ts);
+                            if let Some(c) = counts.get_mut(bi) {
+                                *c += 1;
+                            }
+                            total_matching += 1;
                         }
-                        total_matching += 1;
                     }
                 }
             }
@@ -3558,7 +3756,15 @@ impl QueryExecutor {
 
         // Fast path: if the entire part fits within a single bucket AND no
         // bloom filters are active, skip granule-level work entirely.
-        if bucket_ms > 0 && bloom_lookups.is_empty() {
+        // Guard: only when the part is genuinely inside the bucket window —
+        // bucket_idx clamps out-of-range timestamps, which would incorrectly
+        // dump all rows into a boundary bucket.
+        let window_end = bucket_starts[num_buckets - 1] + bucket_ms;
+        if bucket_ms > 0
+            && bloom_lookups.is_empty()
+            && pe.time_min >= bucket_starts[0]
+            && pe.time_max < window_end
+        {
             let part_first_bucket = bucket_idx(bucket_starts, bucket_ms, pe.time_min);
             let part_last_bucket = bucket_idx(bucket_starts, bucket_ms, pe.time_max);
             if part_first_bucket == part_last_bucket {
@@ -3587,7 +3793,7 @@ impl QueryExecutor {
                     let mut mask = vec![true; marks.len()];
                     for (col_name, value_bytes) in bloom_lookups {
                         let bloom_path = pe.path.join(format!("columns/{col_name}.bloom"));
-                        let blooms = match self.cache.get_blooms(&bloom_path) {
+                        let blooms = match self.cache.get_blooms_for_column(&bloom_path, col_name) {
                             Ok((_bits, blooms, _cached)) => blooms,
                             Err(_) => continue,
                         };
@@ -3684,10 +3890,15 @@ fn distribute_rows_to_buckets(
     }
 
     if t_min == t_max {
-        // Point timestamp — direct index.
-        let idx = bucket_idx(bucket_starts, bucket_ms, t_min);
-        if let Some(c) = counts.get_mut(idx) {
-            *c += row_count;
+        // Point timestamp — direct index, but skip if outside the window
+        // (bucket_idx clamps, which would inflate boundary buckets).
+        let first_start = bucket_starts[0];
+        let last_end = bucket_starts[bucket_starts.len() - 1] + bucket_ms;
+        if t_min >= first_start && t_min < last_end {
+            let idx = bucket_idx(bucket_starts, bucket_ms, t_min);
+            if let Some(c) = counts.get_mut(idx) {
+                *c += row_count;
+            }
         }
         return;
     }
@@ -3933,7 +4144,7 @@ impl QueryExecutor {
         for (col_name, value_bytes) in &bloom_lookups {
             let bloom_step_start = Instant::now();
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
-            let bloom_result = self.cache.get_blooms(&bloom_path);
+            let bloom_result = self.cache.get_blooms_for_column(&bloom_path, col_name);
             if let Err(e) = &bloom_result {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(std::io::Error::new(
@@ -3977,7 +4188,7 @@ impl QueryExecutor {
         for (col_name, values_list) in &bloom_list_lookups {
             let bloom_step_start = Instant::now();
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
-            let bloom_result = self.cache.get_blooms(&bloom_path);
+            let bloom_result = self.cache.get_blooms_for_column(&bloom_path, col_name);
             if let Err(e) = &bloom_result {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(std::io::Error::new(
@@ -4022,7 +4233,7 @@ impl QueryExecutor {
         for col_name in &mark_check_cols {
             let mark_step_start = Instant::now();
             let marks_path = part_dir.join("columns").join(format!("{col_name}.mrk"));
-            let marks_result = self.cache.get_marks(&marks_path);
+            let marks_result = self.cache.get_marks_for_column(&marks_path, col_name);
             if let Err(e) = &marks_result {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(std::io::Error::new(
@@ -4282,6 +4493,16 @@ impl QueryExecutor {
             rows_scanned: row_count as u64,
             total_matching,
         })
+    }
+}
+
+/// Extract the flowcusRowId from the last row of results for cursor pagination.
+fn extract_row_cursor(rows: &[Vec<serde_json::Value>], columns: &[String]) -> Option<String> {
+    let last_row = rows.last()?;
+    let idx = columns.iter().position(|c| c == "flowcusRowId")?;
+    match last_row.get(idx)? {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -4907,5 +5128,94 @@ mod tests {
         );
         let lookups = bloom_lookup_bytes(&filter);
         assert_eq!(lookups.len(), 2);
+    }
+
+    // ── Histogram bucketing tests ────────────────────────────────
+
+    #[test]
+    fn distribute_rows_partial_overlap_before_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Part spans 500-1500, window starts at 1000. 50% overlap with bucket 0.
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 500, 1500, 1000, bucket_ms);
+        assert_eq!(counts[0], 500);
+        assert_eq!(counts[1], 0);
+        assert_eq!(counts[2], 0);
+    }
+
+    #[test]
+    fn distribute_rows_entirely_before_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Part spans 200-800, entirely before window start 1000.
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 200, 800, 5000, bucket_ms);
+        assert_eq!(counts, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn distribute_rows_entirely_after_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Part spans 5000-6000, entirely after window end 4000.
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 5000, 6000, 5000, bucket_ms);
+        assert_eq!(counts, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn distribute_rows_point_before_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Point timestamp at 500, before window start.
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 500, 500, 100, bucket_ms);
+        assert_eq!(counts, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn distribute_rows_point_after_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Point timestamp at 5000, after window end.
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 5000, 5000, 100, bucket_ms);
+        assert_eq!(counts, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn distribute_rows_point_inside_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Point timestamp at 2500, inside bucket 1.
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 2500, 2500, 100, bucket_ms);
+        assert_eq!(counts, vec![0, 100, 0]);
+    }
+
+    #[test]
+    fn distribute_rows_spanning_full_window() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        let mut counts = vec![0u64; 3];
+        // Part spans 0-5000, window is 1000-4000 (3 buckets).
+        distribute_rows_to_buckets(&mut counts, &bucket_starts, 0, 5000, 5000, bucket_ms);
+        // Each bucket covers 1000ms out of 5000ms total span → 1000 rows each.
+        assert_eq!(counts[0], 1000);
+        assert_eq!(counts[1], 1000);
+        assert_eq!(counts[2], 1000);
+    }
+
+    #[test]
+    fn bucket_idx_clamps_to_boundaries() {
+        let bucket_starts = vec![1000, 2000, 3000];
+        let bucket_ms = 1000;
+        assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 500), 0); // before window
+        assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 1000), 0); // first bucket start
+        assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 1500), 0); // mid bucket 0
+        assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 2000), 1); // bucket 1 start
+        assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 3500), 2); // mid bucket 2
+        assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 5000), 2); // after window, clamped
     }
 }

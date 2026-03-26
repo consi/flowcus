@@ -100,11 +100,16 @@ impl SessionStore {
     }
 
     /// Register or refresh a template from a Template Set.
+    ///
+    /// `protocol_version` is the original wire protocol version (5, 9, or 10).
+    /// NetFlow v9 does not have template withdrawal, so redefinition warnings
+    /// are suppressed for v9 sources.
     pub fn update_template(
         &mut self,
         exporter: SocketAddr,
         observation_domain_id: u32,
         record: &TemplateRecord,
+        protocol_version: u16,
     ) {
         if record.field_specifiers.is_empty() {
             // Template withdrawal (RFC 7011 Section 8.1)
@@ -144,16 +149,20 @@ impl SessionStore {
             template_id: record.template_id,
         };
 
-        // Gap 2: warn on template redefinition without prior withdrawal
-        if let Some(existing) = self.templates.get(&key) {
-            if existing.field_specifiers != record.field_specifiers {
-                warn!(
-                    template_id = record.template_id,
-                    %exporter,
-                    observation_domain_id,
-                    "Template {} redefined without withdrawal",
-                    record.template_id
-                );
+        // Gap 2: warn on template redefinition without prior withdrawal.
+        // NetFlow v9 (RFC 3954) has no withdrawal mechanism — templates are
+        // simply overwritten, so we only warn for IPFIX (v10+).
+        if protocol_version >= 10 {
+            if let Some(existing) = self.templates.get(&key) {
+                if existing.field_specifiers != record.field_specifiers {
+                    warn!(
+                        template_id = record.template_id,
+                        %exporter,
+                        observation_domain_id,
+                        "Template {} redefined without withdrawal",
+                        record.template_id
+                    );
+                }
             }
         }
 
@@ -169,11 +178,14 @@ impl SessionStore {
     }
 
     /// Register or refresh an options template.
+    ///
+    /// `protocol_version` is the original wire protocol version (5, 9, or 10).
     pub fn update_options_template(
         &mut self,
         exporter: SocketAddr,
         observation_domain_id: u32,
         record: &OptionsTemplateRecord,
+        protocol_version: u16,
     ) {
         if record.field_specifiers.is_empty() {
             // Options template withdrawal (RFC 7011 Section 8.1)
@@ -213,16 +225,17 @@ impl SessionStore {
             template_id: record.template_id,
         };
 
-        // Gap 2: warn on template redefinition without prior withdrawal
-        if let Some(existing) = self.templates.get(&key) {
-            if existing.field_specifiers != record.field_specifiers {
-                warn!(
-                    template_id = record.template_id,
-                    %exporter,
-                    observation_domain_id,
-                    "Template {} redefined without withdrawal",
-                    record.template_id
-                );
+        if protocol_version >= 10 {
+            if let Some(existing) = self.templates.get(&key) {
+                if existing.field_specifiers != record.field_specifiers {
+                    warn!(
+                        template_id = record.template_id,
+                        %exporter,
+                        observation_domain_id,
+                        "Template {} redefined without withdrawal",
+                        record.template_id
+                    );
+                }
             }
         }
 
@@ -371,7 +384,7 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:4739".parse().unwrap();
         let tmpl = test_template(256);
 
-        store.update_template(addr, 1, &tmpl);
+        store.update_template(addr, 1, &tmpl, 10);
         let cached = store.get_template(addr, 1, 256).unwrap();
         assert_eq!(cached.field_specifiers.len(), 2);
         assert_eq!(cached.min_record_length, 8);
@@ -382,14 +395,14 @@ mod tests {
         let mut store = SessionStore::new(1800);
         let addr: SocketAddr = "10.0.0.1:4739".parse().unwrap();
 
-        store.update_template(addr, 1, &test_template(256));
+        store.update_template(addr, 1, &test_template(256), 10);
         assert_eq!(store.template_count(), 1);
 
         let withdrawal = TemplateRecord {
             template_id: 256,
             field_specifiers: Vec::new(),
         };
-        store.update_template(addr, 1, &withdrawal);
+        store.update_template(addr, 1, &withdrawal, 10);
         assert_eq!(store.template_count(), 0);
     }
 
@@ -399,8 +412,8 @@ mod tests {
         let a1: SocketAddr = "10.0.0.1:4739".parse().unwrap();
         let a2: SocketAddr = "10.0.0.2:4739".parse().unwrap();
 
-        store.update_template(a1, 1, &test_template(256));
-        store.update_template(a2, 1, &test_template(256));
+        store.update_template(a1, 1, &test_template(256), 10);
+        store.update_template(a2, 1, &test_template(256), 10);
         assert_eq!(store.template_count(), 2);
 
         assert!(store.get_template(a1, 1, 256).is_some());

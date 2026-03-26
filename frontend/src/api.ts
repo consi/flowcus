@@ -50,6 +50,7 @@ export interface QueryResult {
   pagination: Pagination;
   time_range: TimeRangeBounds;
   schema_columns: string[];
+  next_cursor?: string;
 }
 
 export interface QueryError {
@@ -146,6 +147,7 @@ export interface StructuredQueryRequest {
   time_start?: number;
   time_end?: number;
   pinned_columns?: string[];
+  after_row_id?: string;
 }
 
 export interface SchemaField {
@@ -170,6 +172,20 @@ export async function executeStructuredQuery(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    throw err;
+  }
+  return res.json();
+}
+
+export interface RowDetailResult {
+  columns: QueryColumn[];
+  values: Record<string, unknown>;
+}
+
+export async function fetchRowDetail(rowId: string): Promise<RowDetailResult> {
+  const res = await fetch(`/api/query/row/${encodeURIComponent(rowId)}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
     throw err;

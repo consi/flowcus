@@ -119,8 +119,20 @@ async fn main() -> Result<()> {
         "Storage engine ready"
     );
 
-    // Migrate old-format parts in background (v0 → v1: directory rename)
-    flowcus_storage::migrate::start_background_migration(table_base.clone());
+    // Check for interrupted migration — exits if manual recovery is needed.
+    flowcus_storage::migrate::check_interrupted_migration(&table_base)?;
+
+    // Create storage cache before migration so it can be shared.
+    let storage_cache = Arc::new(flowcus_storage::cache::StorageCache::new(
+        config.storage.storage_cache_bytes,
+    ));
+
+    // Migrate old-format parts in background (v1 → v2: add flowcusRowId, zstd)
+    flowcus_storage::migrate::start_background_migration(
+        table_base.clone(),
+        Arc::clone(&storage_cache),
+        Arc::clone(&metrics),
+    );
 
     // Background merge
     let merge_config = MergeConfig {
@@ -132,9 +144,6 @@ async fn main() -> Result<()> {
         granule_size: config.storage.granule_size,
         bloom_bits: config.storage.bloom_bits_per_granule,
     };
-    let storage_cache = Arc::new(flowcus_storage::cache::StorageCache::new(
-        config.storage.storage_cache_bytes,
-    ));
     let part_locks = flowcus_storage::part_locks::PartLocks::new();
     flowcus_storage::merge::start(
         table_base.clone(),

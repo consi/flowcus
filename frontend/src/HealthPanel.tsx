@@ -33,6 +33,8 @@ function formatUptime(startSecs: number): string {
 const PARTITION_COLORS: Record<string, string> = {
   marks: '#7c6fc4',
   blooms: '#4ea8de',
+  rowid_marks: '#c084fc',
+  rowid_blooms: '#38bdf8',
   column_index: '#4ade80',
   metadata: '#fbbf24',
 };

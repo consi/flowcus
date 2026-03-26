@@ -35,6 +35,10 @@ pub struct Metrics {
     /// Current count of pending .unproc files.
     pub ipfix_unprocessed_pending: AtomicI64,
 
+    // ---- NetFlow ----
+    pub netflow_v9_packets_received: AtomicU64,
+    pub netflow_v5_packets_received: AtomicU64,
+
     // ---- Storage writer (ingestion) ----
     pub writer_records_ingested: AtomicU64,
     pub writer_parts_flushed: AtomicU64,
@@ -104,6 +108,9 @@ impl Metrics {
             ipfix_unprocessed_reprocessed: AtomicU64::new(0),
             ipfix_unprocessed_expired: AtomicU64::new(0),
             ipfix_unprocessed_pending: AtomicI64::new(0),
+
+            netflow_v9_packets_received: AtomicU64::new(0),
+            netflow_v5_packets_received: AtomicU64::new(0),
 
             writer_records_ingested: AtomicU64::new(0),
             writer_parts_flushed: AtomicU64::new(0),
@@ -185,6 +192,14 @@ impl Metrics {
             (
                 "ipfix_exporters_active",
                 self.ipfix_exporters_active.load(Ordering::Relaxed),
+            ),
+            (
+                "netflow_v9_packets_received",
+                self.netflow_v9_packets_received.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "netflow_v5_packets_received",
+                self.netflow_v5_packets_received.load(Ordering::Relaxed) as i64,
             ),
             (
                 "writer_records_ingested",
