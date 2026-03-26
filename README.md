@@ -27,7 +27,7 @@ docker run -p 2137:2137 -p 4739:4739/udp ghcr.io/consi/flowcus:latest
 
 Open `http://localhost:2137` for the web UI.
 
-### MikroTik RouterOS
+#### MikroTik RouterOS Configuration Example
 
 ```routeros
 /ip traffic-flow
