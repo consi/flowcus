@@ -25,13 +25,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::codec::{self, EncodedColumn};
+use crate::codec;
 use crate::column::ColumnBuffer;
 use crate::part::{self, ColumnFileHeader, MAX_GENERATION, PartMetadata};
 use crate::schema::{Schema, StorageType};
@@ -47,6 +46,7 @@ pub struct MergeConfig {
     pub partition_duration_secs: u32,
     pub granule_size: usize,
     pub bloom_bits: usize,
+    pub max_batch_size: usize,
 }
 
 /// A plan to merge a set of parts into one.
@@ -76,6 +76,16 @@ impl MergePlan {
     }
 }
 
+/// Result sent from a worker thread back to the coordinator.
+struct MergeResult {
+    source_paths: Vec<PathBuf>,
+    source_count: usize,
+    total_rows: u64,
+    target_generation: u32,
+    hour_dir: Option<PathBuf>,
+    outcome: std::io::Result<(PathBuf, u64)>,
+}
+
 /// Start the background merge system.
 pub fn start(
     table_base: PathBuf,
@@ -102,6 +112,69 @@ pub fn start(
         "Merge coordinator starting"
     );
 
+    // Work queue: coordinator pushes MergePlans, workers pull.
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<MergePlan>(config.workers);
+    let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+
+    // Result channel: workers push results, coordinator drains.
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+
+    // Shared state for workers
+    let seq = Arc::new(AtomicU32::new(1));
+
+    // Spawn persistent worker threads
+    for worker_id in 0..config.workers {
+        let rx = Arc::clone(&work_rx);
+        let tx = result_tx.clone();
+        let seq = Arc::clone(&seq);
+        let locks = part_locks.clone();
+        let granule_size = config.granule_size;
+        let bloom_bits = config.bloom_bits;
+        let metrics = Arc::clone(&metrics);
+
+        std::thread::Builder::new()
+            .name(format!("merge-worker-{worker_id}"))
+            .spawn(move || {
+                loop {
+                    // Block until a plan is available.
+                    let plan = {
+                        let rx = rx.lock().unwrap();
+                        match rx.recv() {
+                            Ok(plan) => plan,
+                            Err(_) => return, // Channel closed, shutdown.
+                        }
+                    };
+
+                    let source_paths: Vec<PathBuf> =
+                        plan.sources.iter().map(|s| s.path.clone()).collect();
+                    let source_count = source_paths.len();
+                    let total_rows = plan.total_rows();
+                    let target_generation = plan.target_generation;
+                    let hour_dir = source_paths
+                        .first()
+                        .and_then(|p| p.parent())
+                        .map(Path::to_path_buf);
+
+                    metrics.merge_active_workers.fetch_add(1, Ordering::Relaxed);
+                    let outcome = execute_merge(&plan, &seq, granule_size, bloom_bits, &locks);
+                    metrics.merge_active_workers.fetch_sub(1, Ordering::Relaxed);
+
+                    let _ = tx.send(MergeResult {
+                        source_paths,
+                        source_count,
+                        total_rows,
+                        target_generation,
+                        hour_dir,
+                        outcome,
+                    });
+                }
+            })
+            .expect("Failed to spawn merge worker thread");
+    }
+    // Drop the extra sender so the channel closes when coordinator drops its sender.
+    drop(result_tx);
+
+    let coordinator_locks = part_locks.clone();
     tokio::spawn(async move {
         run_coordinator(
             table_base,
@@ -109,14 +182,16 @@ pub fn start(
             pending,
             metrics,
             storage_cache,
-            part_locks,
+            coordinator_locks,
+            work_tx,
+            result_rx,
         )
         .await;
     });
 }
 
-/// The coordinator loop: scans, plans, dispatches, cleans up.
-#[allow(clippy::too_many_lines)]
+/// The coordinator loop: scans, plans, dispatches, processes results.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_coordinator(
     table_base: PathBuf,
     config: MergeConfig,
@@ -124,27 +199,31 @@ async fn run_coordinator(
     metrics: Arc<flowcus_core::observability::Metrics>,
     storage_cache: Arc<crate::cache::StorageCache>,
     part_locks: crate::part_locks::PartLocks,
+    work_tx: std::sync::mpsc::SyncSender<MergePlan>,
+    result_rx: std::sync::mpsc::Receiver<MergeResult>,
 ) {
     // Recover any merges that were interrupted by a previous crash/restart.
     recover_interrupted_merges(&table_base);
 
-    // Semaphore limits concurrent merge operations for fair scheduling.
-    // Starts at full capacity, shrinks when system is under load.
-    let merge_permits = Arc::new(Semaphore::new(config.workers));
     let active_merges: Arc<std::sync::Mutex<HashSet<PathBuf>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
-    let seq = Arc::new(AtomicU32::new(1));
-    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let mut throttle =
+        ThrottleController::new(config.workers, config.cpu_throttle, config.mem_throttle);
 
     let mut interval = tokio::time::interval(config.scan_interval);
 
     loop {
         interval.tick().await;
 
-        if shutdown.load(Ordering::Relaxed) {
-            info!("Merge coordinator shutting down");
-            return;
-        }
+        // Drain completed merge results from workers
+        process_results(
+            &result_rx,
+            &active_merges,
+            &pending,
+            &metrics,
+            &storage_cache,
+        );
 
         // Prune stale entries (directories removed by retention) and update gauge
         pending.prune_stale();
@@ -153,13 +232,8 @@ async fn run_coordinator(
             .merge_pending_hours
             .store(pending.count() as i64, Ordering::Relaxed);
 
-        // Throttle check: reduce available permits based on system load
-        let effective_workers = compute_effective_workers(
-            config.workers,
-            config.cpu_throttle,
-            config.mem_throttle,
-            &metrics,
-        );
+        // Recompute throttle slots
+        let slots = throttle.recompute(&metrics);
 
         // Scan ONLY pending hours (not full tree traversal)
         let plans = match build_merge_plans(
@@ -167,6 +241,7 @@ async fn run_coordinator(
             &active_merges,
             &pending,
             config.partition_duration_secs,
+            config.max_batch_size,
         ) {
             Ok(plans) => plans,
             Err(e) => {
@@ -180,14 +255,14 @@ async fn run_coordinator(
             continue;
         }
 
-        debug!(plans = plans.len(), effective_workers, "Merge plans ready");
+        debug!(plans = plans.len(), slots, "Merge plans ready");
 
+        let mut dispatched = 0usize;
         for plan in plans {
-            // Check if we have capacity (fair scheduling)
-            let Ok(permit) = merge_permits.clone().try_acquire_owned() else {
-                trace!("All merge workers busy, deferring remaining plans");
+            if dispatched >= slots {
+                trace!("Throttle limit reached, deferring remaining plans");
                 break;
-            };
+            }
 
             // Mark source parts as being merged
             {
@@ -197,83 +272,83 @@ async fn run_coordinator(
                 }
             }
 
-            let active_merges = Arc::clone(&active_merges);
-            let seq = Arc::clone(&seq);
-            let pending = pending.clone();
-            let metrics = Arc::clone(&metrics);
-            let cache = Arc::clone(&storage_cache);
-            let locks = part_locks.clone();
-            let granule_size = config.granule_size;
-            let bloom_bits = config.bloom_bits;
-
-            tokio::task::spawn_blocking(move || {
-                let source_paths: Vec<PathBuf> =
-                    plan.sources.iter().map(|s| s.path.clone()).collect();
-                let source_count = source_paths.len();
-
-                // Remember the hour directory for clean-up
-                let hour_dir = source_paths
-                    .first()
-                    .and_then(|p| p.parent())
-                    .map(Path::to_path_buf);
-
-                metrics.merge_active_workers.fetch_add(1, Ordering::Relaxed);
-                let result = execute_merge(&plan, &seq, granule_size, bloom_bits, &locks);
-                metrics.merge_active_workers.fetch_sub(1, Ordering::Relaxed);
-
-                // Release source parts from active set
-                {
+            // Push to work queue; if full (all workers busy), stop dispatching.
+            match work_tx.try_send(plan) {
+                Ok(()) => dispatched += 1,
+                Err(std::sync::mpsc::TrySendError::Full(plan)) => {
+                    // Undo active marks — plan wasn't dispatched.
                     let mut active = active_merges.lock().unwrap();
-                    for path in &source_paths {
-                        active.remove(path);
+                    for src in &plan.sources {
+                        active.remove(&src.path);
                     }
+                    trace!("Work queue full, deferring remaining plans");
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    error!("Merge work queue disconnected, workers gone");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Drain completed merge results and update metrics/cache/pending.
+fn process_results(
+    result_rx: &std::sync::mpsc::Receiver<MergeResult>,
+    active_merges: &std::sync::Mutex<HashSet<PathBuf>>,
+    pending: &crate::pending::PendingHours,
+    metrics: &flowcus_core::observability::Metrics,
+    storage_cache: &crate::cache::StorageCache,
+) {
+    while let Ok(result) = result_rx.try_recv() {
+        // Release source parts from active set
+        {
+            let mut active = active_merges.lock().unwrap();
+            for path in &result.source_paths {
+                active.remove(path);
+            }
+        }
+
+        match result.outcome {
+            Ok((new_part, merge_bytes)) => {
+                metrics.merge_completed.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .merge_rows_processed
+                    .fetch_add(result.total_rows, Ordering::Relaxed);
+                metrics
+                    .merge_parts_removed
+                    .fetch_add(result.source_count as u64, Ordering::Relaxed);
+                metrics
+                    .merge_bytes_written
+                    .fetch_add(merge_bytes, Ordering::Relaxed);
+
+                for path in &result.source_paths {
+                    storage_cache.invalidate_part(path);
                 }
 
-                match result {
-                    Ok((new_part, merge_bytes)) => {
-                        metrics.merge_completed.fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .merge_rows_processed
-                            .fetch_add(plan.total_rows(), Ordering::Relaxed);
-                        metrics
-                            .merge_parts_removed
-                            .fetch_add(source_count as u64, Ordering::Relaxed);
-                        metrics
-                            .merge_bytes_written
-                            .fetch_add(merge_bytes, Ordering::Relaxed);
+                info!(
+                    new_part = %new_part.display(),
+                    sources = result.source_count,
+                    generation = result.target_generation,
+                    "Merge completed"
+                );
 
-                        // Invalidate cached metadata for deleted source parts
-                        for path in &source_paths {
-                            cache.invalidate_part(path);
-                        }
-
-                        info!(
-                            new_part = %new_part.display(),
-                            sources = source_count,
-                            generation = plan.target_generation,
-                            "Merge completed"
-                        );
-
-                        // Check if this hour is now fully merged (single part)
-                        if let Some(hour) = &hour_dir {
-                            let remaining = crate::pending::count_parts_in(hour);
-                            if remaining <= 1 {
-                                pending.mark_clean(hour);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        metrics.merge_failed.fetch_add(1, Ordering::Relaxed);
-                        error!(
-                            error = %e,
-                            sources = source_paths.len(),
-                            "Merge failed, source parts preserved"
-                        );
+                if let Some(hour) = &result.hour_dir {
+                    let remaining = crate::pending::count_parts_in(hour);
+                    if remaining <= 1 {
+                        pending.mark_clean(hour);
                     }
                 }
-
-                drop(permit);
-            });
+            }
+            Err(e) => {
+                metrics.merge_failed.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    error = %e,
+                    sources = result.source_count,
+                    "Merge failed, source parts preserved"
+                );
+            }
         }
     }
 }
@@ -286,6 +361,7 @@ fn build_merge_plans(
     active_merges: &std::sync::Mutex<HashSet<PathBuf>>,
     pending: &crate::pending::PendingHours,
     partition_duration_secs: u32,
+    max_batch_size: usize,
 ) -> std::io::Result<Vec<MergePlan>> {
     let mut plans = Vec::new();
     let active = active_merges.lock().unwrap();
@@ -315,7 +391,13 @@ fn build_merge_plans(
             // Hour was deleted (retention policy?), clean it
             drop(active); // release lock before calling pending
             pending.mark_clean(hour_dir);
-            return build_merge_plans(table_base, active_merges, pending, partition_duration_secs);
+            return build_merge_plans(
+                table_base,
+                active_merges,
+                pending,
+                partition_duration_secs,
+                max_batch_size,
+            );
         }
 
         let Ok(entries) = std::fs::read_dir(hour_dir) else {
@@ -379,53 +461,29 @@ fn build_merge_plans(
             continue;
         }
 
-        let time_min = parts.iter().map(|p| p.time_min).min().unwrap();
-        let time_max = parts.iter().map(|p| p.time_max).max().unwrap();
-        let partition_of_parts = time_min / partition_duration_ms;
-        let is_past = partition_of_parts < current_partition;
+        // Both past and current hours: group by generation, chunk into bounded batches.
+        // Past hours get priority in the final sort (below) so they converge first.
+        // Multiple merge rounds increment generations until only one part remains.
+        let mut gen_groups: HashMap<u32, Vec<PartEntry>> = HashMap::new();
+        for p in parts {
+            gen_groups.entry(p.generation).or_default().push(p);
+        }
 
-        if is_past {
-            // Past hour: merge ALL parts (any generation) into one.
-            // This is the key fix: past hours must converge to a single part.
-            // We merge across generations — a gen0 + gen1 part become gen2.
-            info!(
-                hour = %hour_dir.display(),
-                parts = parts.len(),
-                target_gen,
-                "Past hour merge: converging to single part"
-            );
-            plans.push(MergePlan {
-                sources: parts,
-                target_generation: target_gen,
-                time_min,
-                time_max,
-                schema,
-                base_dir: table_base.to_path_buf(),
-            });
-        } else {
-            // Current hour: merge same-generation parts in small batches.
-            // Group by generation so we don't mix raw and merged data.
-            let mut gen_groups: HashMap<u32, Vec<PartEntry>> = HashMap::new();
-            for p in parts {
-                gen_groups.entry(p.generation).or_default().push(p);
+        for (generation, gen_parts) in gen_groups {
+            if gen_parts.len() < 2 {
+                continue;
             }
-
-            for (generation, gen_parts) in gen_groups {
-                if gen_parts.len() < 2 {
-                    continue;
-                }
-                for chunk in gen_parts.chunks(4).filter(|c| c.len() >= 2) {
-                    let chunk_min = chunk.iter().map(|p| p.time_min).min().unwrap();
-                    let chunk_max = chunk.iter().map(|p| p.time_max).max().unwrap();
-                    plans.push(MergePlan {
-                        sources: chunk.to_vec(),
-                        target_generation: generation + 1,
-                        time_min: chunk_min,
-                        time_max: chunk_max,
-                        schema: schema.clone(),
-                        base_dir: table_base.to_path_buf(),
-                    });
-                }
+            for chunk in gen_parts.chunks(max_batch_size).filter(|c| c.len() >= 2) {
+                let chunk_min = chunk.iter().map(|p| p.time_min).min().unwrap();
+                let chunk_max = chunk.iter().map(|p| p.time_max).max().unwrap();
+                plans.push(MergePlan {
+                    sources: chunk.to_vec(),
+                    target_generation: generation + 1,
+                    time_min: chunk_min,
+                    time_max: chunk_max,
+                    schema: schema.clone(),
+                    base_dir: table_base.to_path_buf(),
+                });
             }
         }
     }
@@ -439,7 +497,8 @@ fn build_merge_plans(
     Ok(plans)
 }
 
-/// Execute a merge plan: read source columns, concatenate, re-encode, write new part.
+/// Execute a streaming merge plan: read rowids to build merge order, then process
+/// one column at a time to avoid holding all data in memory simultaneously.
 /// Returns the new part directory and total bytes written on success.
 #[allow(clippy::too_many_lines)]
 fn execute_merge(
@@ -457,7 +516,7 @@ fn execute_merge(
         time_min = plan.time_min,
         time_max = plan.time_max,
         columns = plan.schema.columns.len(),
-        "Starting merge"
+        "Starting streaming merge"
     );
 
     // Read row counts from source parts
@@ -469,126 +528,13 @@ fn execute_merge(
         .collect();
     let total_rows: u64 = source_rows.iter().sum();
 
-    // Phase 1: Read and concatenate all columns from all sources into ColumnBuffers.
-    let mut combined_buffers: Vec<crate::column::ColumnBuffer> =
-        Vec::with_capacity(plan.schema.columns.len());
-    for col_def in &plan.schema.columns {
-        let (combined_buf, _encoded) = merge_column(col_def, &plan.sources, &source_rows)?;
-        combined_buffers.push(combined_buf);
-    }
+    // Determine effective schema (may insert flowcusRowId for v1 parts)
+    let has_rowid = plan.schema.columns.iter().any(|c| c.name == "flowcusRowId");
 
-    // Phase 2: Sort all columns by flowcusRowId if present.
-    if let Some(rowid_idx) = plan
-        .schema
-        .columns
-        .iter()
-        .position(|c| c.name == "flowcusRowId")
-    {
-        // Mixed v1+v2 merge: v1 rows have zero-padded [0,0] rowids from
-        // pad_column. Fill them with generated UUIDs from their export_time
-        // before sorting, so they interleave correctly with real v2 UUIDs.
-        let has_zeros = matches!(
-            &combined_buffers[rowid_idx],
-            crate::column::ColumnBuffer::U128(v) if v.contains(&[0, 0])
-        );
-        if has_zeros {
-            if let Some(et_idx) = plan
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.name == "flowcusExportTime")
-            {
-                let timestamps: Vec<u64> =
-                    if let crate::column::ColumnBuffer::U64(ref ts) = combined_buffers[et_idx] {
-                        ts.clone()
-                    } else {
-                        Vec::new()
-                    };
-                if let crate::column::ColumnBuffer::U128(ref mut rowids) =
-                    combined_buffers[rowid_idx]
-                {
-                    let mut uuid_gen = crate::uuid7::Uuid7Generator::new();
-                    for (i, rid) in rowids.iter_mut().enumerate() {
-                        if *rid == [0, 0] {
-                            let ts = timestamps.get(i).copied().unwrap_or(0);
-                            *rid = uuid_gen.generate(ts);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let crate::column::ColumnBuffer::U128(ref rowids) = combined_buffers[rowid_idx] {
-            if !rowids.is_empty() {
-                // Use the minimum row count across all buffers to avoid
-                // out-of-range indices when sources have inconsistent counts.
-                let min_rows = combined_buffers
-                    .iter()
-                    .map(|b| b.row_count())
-                    .min()
-                    .unwrap_or(rowids.len());
-                let sort_len = rowids.len().min(min_rows);
-                let mut perm: Vec<usize> = (0..sort_len).collect();
-                perm.sort_unstable_by(|&a, &b| {
-                    rowids[a][0]
-                        .cmp(&rowids[b][0])
-                        .then(rowids[a][1].cmp(&rowids[b][1]))
-                });
-                // Apply permutation to all column buffers.
-                for buf in &mut combined_buffers {
-                    apply_permutation(buf, &perm);
-                }
-            }
-        }
+    let effective_schema = if has_rowid {
+        plan.schema.clone()
     } else {
-        // Source parts lack flowcusRowId (v1 parts) — generate rowids during merge.
-        // Read export_time column (index 2) to derive UUIDv7s.
-        if let Some(export_time_idx) = plan
-            .schema
-            .columns
-            .iter()
-            .position(|c| c.name == "flowcusExportTime")
-        {
-            let timestamps: Vec<u64> = if let crate::column::ColumnBuffer::U64(ref ts) =
-                combined_buffers[export_time_idx]
-            {
-                ts.clone()
-            } else {
-                Vec::new()
-            };
-
-            if !timestamps.is_empty() {
-                let mut uuid_gen = crate::uuid7::Uuid7Generator::new();
-                let rowids = uuid_gen.generate_batch(&timestamps, true);
-
-                // Compute sort permutation from rowids before moving them.
-                let mut perm: Vec<usize> = (0..rowids.len()).collect();
-                perm.sort_unstable_by(|&a, &b| {
-                    rowids[a][0]
-                        .cmp(&rowids[b][0])
-                        .then(rowids[a][1].cmp(&rowids[b][1]))
-                });
-
-                // Insert flowcusRowId at index 4 (after the 4 base system columns).
-                // Move, don't clone — permutation was computed above.
-                let insert_idx = 4.min(combined_buffers.len());
-                combined_buffers.insert(insert_idx, crate::column::ColumnBuffer::U128(rowids));
-
-                // Apply sort permutation to all columns including the inserted one.
-                for buf in &mut combined_buffers {
-                    apply_permutation(buf, &perm);
-                }
-            }
-        }
-    }
-
-    // Phase 3: Re-encode all columns with v2 codecs and compute granules.
-    let mut encoded_columns = Vec::with_capacity(plan.schema.columns.len());
-    let mut disk_bytes: u64 = 0;
-
-    // Build the effective schema: if we inserted a rowid column for v1 parts, update schema.
-    let effective_schema = if combined_buffers.len() > plan.schema.columns.len() {
-        // We inserted a flowcusRowId column — rebuild schema.
+        // v1 parts: insert flowcusRowId column at index 4
         let mut cols = plan.schema.columns.clone();
         let rowid_col_def = crate::schema::ColumnDef {
             name: "flowcusRowId".into(),
@@ -604,65 +550,84 @@ fn execute_merge(
             columns: cols,
             duration_source: plan.schema.duration_source,
         }
-    } else {
-        plan.schema.clone()
     };
 
-    for (col_def, combined_buf) in effective_schema.columns.iter().zip(combined_buffers.iter()) {
-        let encoded = codec::encode_v2(combined_buf, col_def);
-        disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
+    // Phase 1: Build merge order from rowids only (memory-efficient).
+    let merge_order = build_merge_order(plan, &source_rows, has_rowid)?;
 
-        // Recompute granule marks + bloom filters for the merged data
-        let (marks, blooms) = crate::granule::compute_granules(
-            combined_buf,
-            &encoded.data,
-            granule_size,
-            bloom_bits,
-            col_def.storage_type,
-        );
+    // Phase 2: Stream one column at a time through PartWriter.
+    let merge_seq = seq.fetch_add(1, Ordering::Relaxed);
 
-        encoded_columns.push(part::ColumnWriteData {
-            def: col_def.clone(),
-            encoded,
-            marks,
-            blooms,
-        });
-    }
-
-    // Build metadata for the merged part
+    // Build metadata (disk_bytes updated after all columns written)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-
     let first_source = &plan.sources[0];
     let source_meta = part::read_meta_bin(&first_source.path.join("meta.bin"))?;
 
-    let metadata = PartMetadata {
+    let mut metadata = PartMetadata {
         row_count: total_rows,
         generation: plan.target_generation,
         time_min: plan.time_min,
         time_max: plan.time_max,
         observation_domain_id: source_meta.observation_domain_id,
         created_at_ms: now,
-        disk_bytes,
+        disk_bytes: 0,
         column_count: effective_schema.columns.len() as u32,
         schema_fingerprint: effective_schema.fingerprint(),
         exporter: read_exporter_from_meta(&first_source.path)?,
-        schema: effective_schema,
+        schema: effective_schema.clone(),
     };
 
-    let merge_seq = seq.fetch_add(1, Ordering::Relaxed);
+    let mut writer = part::PartWriter::new(&plan.base_dir, &metadata, merge_seq)?;
+    let mut disk_bytes: u64 = 0;
 
-    // Stage: write new merged part
-    let new_part_dir = part::write_part(
-        &plan.base_dir,
-        &metadata,
-        &encoded_columns,
-        granule_size,
-        bloom_bits,
-        merge_seq,
-    )?;
+    for col_def in &effective_schema.columns {
+        // For v1 parts that had no flowcusRowId, we generated it in build_merge_order.
+        // The rowid column was not on disk — it's synthesized. We need to reconstruct it
+        // from the merge order itself (which already encodes the sorted rowid sequence).
+        let merged_buf = if col_def.name == "flowcusRowId" && !has_rowid {
+            // Regenerate rowids in merge order (they're already sorted).
+            build_generated_rowid_column(plan, &source_rows, &merge_order)?
+        } else {
+            // Read this column from all sources, then gather in merge order.
+            let source_bufs = read_column_from_sources(col_def, &plan.sources, &source_rows)?;
+            gather_in_order(
+                &source_bufs,
+                &merge_order,
+                col_def.storage_type,
+                total_rows as usize,
+            )
+        };
+
+        let encoded = codec::encode_v2(&merged_buf, col_def);
+        disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
+
+        let (marks, blooms) = crate::granule::compute_granules(
+            &merged_buf,
+            &encoded.data,
+            granule_size,
+            bloom_bits,
+            col_def.storage_type,
+        );
+
+        writer.write_column(
+            &part::ColumnWriteData {
+                def: col_def.clone(),
+                encoded,
+                marks,
+                blooms,
+            },
+            total_rows,
+            granule_size,
+            bloom_bits,
+        )?;
+        // merged_buf dropped here — memory freed before next column
+    }
+
+    metadata.disk_bytes = disk_bytes;
+    let new_part_dir = writer.finish(&metadata)?;
 
     // Verify the new part was written correctly
     let verify = part::read_meta_bin(&new_part_dir.join("meta.bin"))?;
@@ -676,17 +641,367 @@ fn execute_merge(
         ));
     }
 
-    // Fsync the new part directory so the merged data is durable on disk
-    // before we delete any source parts.
-    fsync_dir(&new_part_dir)?;
+    // Commit: write .merging marker, delete sources, remove marker.
+    commit_merge(&new_part_dir, plan, part_locks)?;
+
+    info!(
+        new_part = %new_part_dir.display(),
+        rows = total_rows,
+        generation = plan.target_generation,
+        sources_removed = src_count,
+        "Merge committed"
+    );
+
+    Ok((new_part_dir, disk_bytes))
+}
+
+/// Build the global merge order by reading only rowid columns.
+/// Returns `Vec<(u8, u32)>` where each entry is (source_index, row_within_source),
+/// representing the globally sorted sequence of rows.
+fn build_merge_order(
+    plan: &MergePlan,
+    source_rows: &[u64],
+    has_rowid: bool,
+) -> std::io::Result<Vec<(u8, u32)>> {
+    let total_rows: usize = source_rows.iter().map(|r| *r as usize).sum();
+
+    // Read rowids from each source
+    let mut source_rowids: Vec<Vec<[u64; 2]>> = Vec::with_capacity(plan.sources.len());
+
+    if has_rowid {
+        for (i, source) in plan.sources.iter().enumerate() {
+            let rows = source_rows.get(i).copied().unwrap_or(0) as usize;
+            let col_path = source.path.join("columns").join("flowcusRowId.col");
+            if col_path.exists() {
+                let mut buf = ColumnBuffer::with_capacity(StorageType::U128, rows);
+                let raw_data = part::read_column_raw(&col_path)?;
+                let header = part::read_column_header(&col_path)?;
+                let compression = match header.compression {
+                    1 => crate::codec::CompressionType::Lz4,
+                    2 => crate::codec::CompressionType::Zstd,
+                    _ => crate::codec::CompressionType::None,
+                };
+                let decompressed =
+                    crate::codec::decompress(&raw_data, compression, header.raw_size as usize)?;
+                append_raw_to_buffer(&mut buf, StorageType::U128, &decompressed, &header)?;
+
+                let mut rowids = match buf {
+                    ColumnBuffer::U128(v) => v,
+                    _ => Vec::new(),
+                };
+
+                // Handle v1 parts with zero-padded rowids (mixed v1+v2 merge)
+                if rowids.contains(&[0, 0]) {
+                    if let Some(et_idx) = plan
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == "flowcusExportTime")
+                    {
+                        let timestamps =
+                            read_export_times(source, rows, &plan.schema.columns[et_idx])?;
+                        let mut uuid_gen = crate::uuid7::Uuid7Generator::new();
+                        for (j, rid) in rowids.iter_mut().enumerate() {
+                            if *rid == [0, 0] {
+                                let ts = timestamps.get(j).copied().unwrap_or(0);
+                                *rid = uuid_gen.generate(ts);
+                            }
+                        }
+                    }
+                }
+
+                source_rowids.push(rowids);
+            } else {
+                // Source lacks rowid column — generate from export_time
+                let rowids = generate_rowids_for_source(source, rows, &plan.schema)?;
+                source_rowids.push(rowids);
+            }
+        }
+    } else {
+        // All v1 parts: generate rowids from export_time for each source
+        for (i, source) in plan.sources.iter().enumerate() {
+            let rows = source_rows.get(i).copied().unwrap_or(0) as usize;
+            let rowids = generate_rowids_for_source(source, rows, &plan.schema)?;
+            source_rowids.push(rowids);
+        }
+    }
+
+    // K-way merge the sorted rowid arrays
+    let order = kway_merge_rowids(&source_rowids, total_rows);
+
+    Ok(order)
+}
+
+/// Read export_time values from a single source part.
+fn read_export_times(
+    source: &PartEntry,
+    rows: usize,
+    et_def: &crate::schema::ColumnDef,
+) -> std::io::Result<Vec<u64>> {
+    let col_path = source.path.join("columns").join("flowcusExportTime.col");
+    if !col_path.exists() {
+        return Ok(vec![0; rows]);
+    }
+    let mut buf = ColumnBuffer::with_capacity(StorageType::U64, rows);
+    let raw_data = part::read_column_raw(&col_path)?;
+    let header = part::read_column_header(&col_path)?;
+    let compression = match header.compression {
+        1 => crate::codec::CompressionType::Lz4,
+        2 => crate::codec::CompressionType::Zstd,
+        _ => crate::codec::CompressionType::None,
+    };
+    let decompressed = crate::codec::decompress(&raw_data, compression, header.raw_size as usize)?;
+    append_raw_to_buffer(&mut buf, et_def.storage_type, &decompressed, &header)?;
+
+    match buf {
+        ColumnBuffer::U64(v) => Ok(v),
+        _ => Ok(vec![0; rows]),
+    }
+}
+
+/// Generate rowids for a v1 source part from its export_time column.
+fn generate_rowids_for_source(
+    source: &PartEntry,
+    rows: usize,
+    schema: &crate::schema::Schema,
+) -> std::io::Result<Vec<[u64; 2]>> {
+    let timestamps = if let Some(et_def) = schema
+        .columns
+        .iter()
+        .find(|c| c.name == "flowcusExportTime")
+    {
+        read_export_times(source, rows, et_def)?
+    } else {
+        vec![0; rows]
+    };
+
+    let mut uuid_gen = crate::uuid7::Uuid7Generator::new();
+    Ok(uuid_gen.generate_batch(&timestamps, true))
+}
+
+/// Build the generated rowid column for v1 parts in merge-order sequence.
+/// Since generate_rowids_for_source produces time-sorted UUIDs and the merge
+/// order is already computed from those rowids, we just regenerate and gather.
+fn build_generated_rowid_column(
+    plan: &MergePlan,
+    source_rows: &[u64],
+    merge_order: &[(u8, u32)],
+) -> std::io::Result<ColumnBuffer> {
+    let total = merge_order.len();
+    let mut source_rowids: Vec<Vec<[u64; 2]>> = Vec::with_capacity(plan.sources.len());
+    for (i, source) in plan.sources.iter().enumerate() {
+        let rows = source_rows.get(i).copied().unwrap_or(0) as usize;
+        let rowids = generate_rowids_for_source(source, rows, &plan.schema)?;
+        source_rowids.push(rowids);
+    }
+
+    let mut result = Vec::with_capacity(total);
+    for &(src_idx, row_idx) in merge_order {
+        let rowid = source_rowids
+            .get(src_idx as usize)
+            .and_then(|v| v.get(row_idx as usize))
+            .copied()
+            .unwrap_or([0, 0]);
+        result.push(rowid);
+    }
+
+    Ok(ColumnBuffer::U128(result))
+}
+
+/// K-way merge of pre-sorted rowid arrays using a min-heap.
+/// Produces a global merge order as `(source_index, row_within_source)`.
+fn kway_merge_rowids(sources: &[Vec<[u64; 2]>], total_rows: usize) -> Vec<(u8, u32)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut order = Vec::with_capacity(total_rows);
+
+    if sources.len() == 1 {
+        // Fast path: single source, no merge needed
+        for i in 0..sources[0].len() {
+            order.push((0u8, i as u32));
+        }
+        return order;
+    }
+
+    // Heap entries: (Reverse(rowid), source_idx, cursor_position)
+    // Reverse because BinaryHeap is max-heap and we want min.
+    let mut heap: BinaryHeap<(Reverse<[u64; 2]>, u8, u32)> =
+        BinaryHeap::with_capacity(sources.len());
+
+    // Seed the heap with the first element from each source
+    for (i, src) in sources.iter().enumerate() {
+        if !src.is_empty() {
+            heap.push((Reverse(src[0]), i as u8, 0));
+        }
+    }
+
+    while let Some((Reverse(_rowid), src_idx, row_idx)) = heap.pop() {
+        order.push((src_idx, row_idx));
+
+        let next = row_idx + 1;
+        let src = &sources[src_idx as usize];
+        if (next as usize) < src.len() {
+            heap.push((Reverse(src[next as usize]), src_idx, next));
+        }
+    }
+
+    order
+}
+
+/// Read a single column from all source parts, returning one ColumnBuffer per source.
+fn read_column_from_sources(
+    col_def: &crate::schema::ColumnDef,
+    sources: &[PartEntry],
+    source_rows: &[u64],
+) -> std::io::Result<Vec<ColumnBuffer>> {
+    let col_name = &col_def.name;
+    let st = col_def.storage_type;
+    let mut result = Vec::with_capacity(sources.len());
+
+    for (i, source) in sources.iter().enumerate() {
+        let rows = source_rows.get(i).copied().unwrap_or(0) as usize;
+        let col_path = source.path.join("columns").join(format!("{col_name}.col"));
+
+        if !col_path.exists() {
+            let mut buf = ColumnBuffer::with_capacity(st, rows);
+            pad_column(&mut buf, st, rows);
+            result.push(buf);
+            continue;
+        }
+
+        let mut buf = ColumnBuffer::with_capacity(st, rows);
+        let raw_data = part::read_column_raw(&col_path)?;
+        let header = part::read_column_header(&col_path)?;
+        let compression = match header.compression {
+            1 => crate::codec::CompressionType::Lz4,
+            2 => crate::codec::CompressionType::Zstd,
+            _ => crate::codec::CompressionType::None,
+        };
+        let decompressed =
+            crate::codec::decompress(&raw_data, compression, header.raw_size as usize)?;
+        append_raw_to_buffer(&mut buf, st, &decompressed, &header)?;
+        result.push(buf);
+    }
+
+    Ok(result)
+}
+
+/// Gather rows from multiple source buffers in merge-order sequence.
+/// Produces a single combined ColumnBuffer with rows in the specified order.
+fn gather_in_order(
+    sources: &[ColumnBuffer],
+    order: &[(u8, u32)],
+    st: StorageType,
+    total_rows: usize,
+) -> ColumnBuffer {
+    match st {
+        StorageType::U8 => {
+            let mut v = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                let val = match &sources[src_idx as usize] {
+                    ColumnBuffer::U8(s) => s.get(row_idx as usize).copied().unwrap_or(0),
+                    _ => 0,
+                };
+                v.push(val);
+            }
+            ColumnBuffer::U8(v)
+        }
+        StorageType::U16 => {
+            let mut v = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                let val = match &sources[src_idx as usize] {
+                    ColumnBuffer::U16(s) => s.get(row_idx as usize).copied().unwrap_or(0),
+                    _ => 0,
+                };
+                v.push(val);
+            }
+            ColumnBuffer::U16(v)
+        }
+        StorageType::U32 => {
+            let mut v = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                let val = match &sources[src_idx as usize] {
+                    ColumnBuffer::U32(s) => s.get(row_idx as usize).copied().unwrap_or(0),
+                    _ => 0,
+                };
+                v.push(val);
+            }
+            ColumnBuffer::U32(v)
+        }
+        StorageType::U64 => {
+            let mut v = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                let val = match &sources[src_idx as usize] {
+                    ColumnBuffer::U64(s) => s.get(row_idx as usize).copied().unwrap_or(0),
+                    _ => 0,
+                };
+                v.push(val);
+            }
+            ColumnBuffer::U64(v)
+        }
+        StorageType::U128 => {
+            let mut v = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                let val = match &sources[src_idx as usize] {
+                    ColumnBuffer::U128(s) => s.get(row_idx as usize).copied().unwrap_or([0, 0]),
+                    _ => [0, 0],
+                };
+                v.push(val);
+            }
+            ColumnBuffer::U128(v)
+        }
+        StorageType::Mac => {
+            let mut v = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                let val = match &sources[src_idx as usize] {
+                    ColumnBuffer::Mac(s) => s.get(row_idx as usize).copied().unwrap_or([0; 6]),
+                    _ => [0; 6],
+                };
+                v.push(val);
+            }
+            ColumnBuffer::Mac(v)
+        }
+        StorageType::VarLen => {
+            let mut data = Vec::new();
+            let mut offsets = Vec::with_capacity(total_rows);
+            for &(src_idx, row_idx) in order {
+                if let ColumnBuffer::VarLen {
+                    offsets: src_offsets,
+                    data: src_data,
+                } = &sources[src_idx as usize]
+                {
+                    let idx = row_idx as usize;
+                    let start = if idx == 0 {
+                        0usize
+                    } else {
+                        src_offsets.get(idx - 1).copied().unwrap_or(0) as usize
+                    };
+                    let end = src_offsets.get(idx).copied().unwrap_or(start as u32) as usize;
+                    if end <= src_data.len() && start <= end {
+                        data.extend_from_slice(&src_data[start..end]);
+                    }
+                }
+                offsets.push(data.len() as u32);
+            }
+            ColumnBuffer::VarLen { offsets, data }
+        }
+    }
+}
+
+/// Commit a completed merge: write .merging marker, delete sources, clean up.
+fn commit_merge(
+    new_part_dir: &Path,
+    plan: &MergePlan,
+    part_locks: &crate::part_locks::PartLocks,
+) -> std::io::Result<()> {
+    // Fsync the new part directory so the data is durable before source deletion.
+    fsync_dir(new_part_dir)?;
 
     // Hold a write lock on the new part so queries don't read it while the
-    // .merging marker is still present (partially visible new part).
-    // The lock is held until the marker is removed and the part is ready.
-    let _new_part_lock = part_locks.with_write(&new_part_dir, || {
-        // Write a staging marker that lists all source parts. This acts as a
-        // crash-recovery journal: if we crash after deleting some sources but
-        // before finishing, `recover_interrupted_merges` can complete the work.
+    // .merging marker is still present.
+    let _new_part_lock = part_locks.with_write(new_part_dir, || {
+        // Write crash-recovery journal listing source parts.
         let marker_path = new_part_dir.join(".merging");
         {
             let mut f = fs::File::create(&marker_path)?;
@@ -695,11 +1010,9 @@ fn execute_merge(
             }
             f.sync_all()?;
         }
-        // Fsync parent so the marker directory entry is durable.
-        fsync_dir(&new_part_dir)?;
+        fsync_dir(new_part_dir)?;
 
-        // Commit: acquire write lock on each source, then delete.
-        // Write lock blocks until active query readers finish.
+        // Delete source parts with write locks.
         for source in &plan.sources {
             let deleted = part_locks.with_write(&source.path, || part::remove_part(&source.path));
             match deleted {
@@ -712,8 +1025,6 @@ fn execute_merge(
                     );
                 }
                 None => {
-                    // Lock timeout — query is still reading. Remove anyway after
-                    // logging a warning; the query will get NotFound and retry.
                     warn!(
                         path = %source.path.display(),
                         "Lock timeout removing source part, forcing removal"
@@ -725,7 +1036,7 @@ fn execute_merge(
             }
         }
 
-        // All sources removed — delete the staging marker.
+        // All sources removed — delete the marker.
         if let Err(e) = fs::remove_file(&marker_path) {
             warn!(
                 error = %e,
@@ -735,19 +1046,8 @@ fn execute_merge(
         }
         Ok::<(), std::io::Error>(())
     });
-    // If new-part lock timed out, marker cleanup still happened inside
-    // the write lambda for source parts. The outer lock is best-effort
-    // to prevent queries from seeing a .merging part.
 
-    info!(
-        new_part = %new_part_dir.display(),
-        rows = total_rows,
-        generation = plan.target_generation,
-        sources_removed = src_count,
-        "Merge committed"
-    );
-
-    Ok((new_part_dir, disk_bytes))
+    Ok(())
 }
 
 /// Fsync a directory to ensure its entries are durable on disk.
@@ -814,6 +1114,14 @@ pub fn recover_interrupted_merges(table_base: &Path) {
                         // Clean up leftover staging dirs from crashed writes
                         if name_str.ends_with(".staging") {
                             info!(path = %p.path().display(), "Removing leftover staging directory");
+                            let _ = fs::remove_dir_all(p.path());
+                            continue;
+                        }
+                        // Clean up leftover in-progress dirs from crashed merges.
+                        // Safe to delete: source parts were never removed (rename
+                        // to final path happens before source deletion).
+                        if name_str.ends_with(".inprogress") {
+                            warn!(path = %p.path().display(), "Removing incomplete merge artifact from previous run");
                             let _ = fs::remove_dir_all(p.path());
                             continue;
                         }
@@ -887,62 +1195,6 @@ pub fn recover_interrupted_merges(table_base: &Path) {
             }
         }
     }
-}
-
-/// Merge a single column from multiple source parts.
-/// Reads raw encoded data, decompresses if needed, concatenates, re-encodes.
-fn merge_column(
-    col_def: &crate::schema::ColumnDef,
-    sources: &[PartEntry],
-    source_rows: &[u64],
-) -> std::io::Result<(ColumnBuffer, EncodedColumn)> {
-    let col_name = &col_def.name;
-    let st = col_def.storage_type;
-
-    let total_rows: usize = source_rows.iter().map(|r| *r as usize).sum();
-    let mut combined = ColumnBuffer::with_capacity(st, total_rows);
-
-    for (i, source) in sources.iter().enumerate() {
-        let col_path = source.path.join("columns").join(format!("{col_name}.col"));
-        if !col_path.exists() {
-            debug!(column = col_name, path = %col_path.display(), "Column missing in source, padding with zeros");
-            // Pad with zero values for missing columns
-            let rows = source_rows.get(i).copied().unwrap_or(0) as usize;
-            pad_column(&mut combined, st, rows);
-            continue;
-        }
-
-        let raw_data = part::read_column_raw(&col_path)?;
-        let header = part::read_column_header(&col_path)?;
-
-        // Decompress if needed
-        let compression = match header.compression {
-            1 => crate::codec::CompressionType::Lz4,
-            2 => crate::codec::CompressionType::Zstd,
-            _ => crate::codec::CompressionType::None,
-        };
-        let decompressed =
-            crate::codec::decompress(&raw_data, compression, header.raw_size as usize)?;
-
-        // For merge, we append the raw decoded bytes directly to the combined buffer.
-        // The codec transform (delta, gcd) must be decoded first.
-        // For simplicity and correctness: we read the raw column data as plain bytes
-        // and push them into the buffer. This works because the re-encode step
-        // will pick the optimal codec for the combined data.
-        append_raw_to_buffer(&mut combined, st, &decompressed, &header)?;
-    }
-
-    trace!(
-        column = col_name,
-        rows = combined.row_count(),
-        mem = combined.mem_size(),
-        "Column merged, re-encoding"
-    );
-
-    // Re-encode: uses static hint for known fields, heuristic for unknown.
-    // Merged data is larger → heuristic analysis is more accurate for unknowns.
-    let encoded = codec::encode_v2(&combined, col_def);
-    Ok((combined, encoded))
 }
 
 /// Append raw bytes from a column file into a ColumnBuffer.
@@ -1242,77 +1494,6 @@ fn append_varlen_raw(buf: &mut ColumnBuffer, data: &[u8], _rows: usize) -> std::
     Ok(())
 }
 
-/// Pad a column buffer with zero values.
-/// Reorder a `ColumnBuffer` according to a permutation.
-///
-/// `perm[i]` says "the element at old index `perm[i]` goes to new index `i`".
-/// Out-of-range indices produce default (zero) values — this handles the case
-/// where source parts have inconsistent row counts between columns.
-fn apply_permutation(buf: &mut ColumnBuffer, perm: &[usize]) {
-    match buf {
-        ColumnBuffer::U8(v) => {
-            let gathered: Vec<u8> = perm
-                .iter()
-                .map(|&p| v.get(p).copied().unwrap_or(0))
-                .collect();
-            *v = gathered;
-        }
-        ColumnBuffer::U16(v) => {
-            let gathered: Vec<u16> = perm
-                .iter()
-                .map(|&p| v.get(p).copied().unwrap_or(0))
-                .collect();
-            *v = gathered;
-        }
-        ColumnBuffer::U32(v) => {
-            let gathered: Vec<u32> = perm
-                .iter()
-                .map(|&p| v.get(p).copied().unwrap_or(0))
-                .collect();
-            *v = gathered;
-        }
-        ColumnBuffer::U64(v) => {
-            let gathered: Vec<u64> = perm
-                .iter()
-                .map(|&p| v.get(p).copied().unwrap_or(0))
-                .collect();
-            *v = gathered;
-        }
-        ColumnBuffer::U128(v) => {
-            let gathered: Vec<[u64; 2]> = perm
-                .iter()
-                .map(|&p| v.get(p).copied().unwrap_or([0, 0]))
-                .collect();
-            *v = gathered;
-        }
-        ColumnBuffer::Mac(v) => {
-            let gathered: Vec<[u8; 6]> = perm
-                .iter()
-                .map(|&p| v.get(p).copied().unwrap_or([0; 6]))
-                .collect();
-            *v = gathered;
-        }
-        ColumnBuffer::VarLen { offsets, data } => {
-            let mut new_data = Vec::with_capacity(data.len());
-            let mut new_offsets = Vec::with_capacity(offsets.len());
-            for &p in perm {
-                let start = if p == 0 {
-                    0usize
-                } else {
-                    offsets.get(p - 1).copied().unwrap_or(0) as usize
-                };
-                let end = offsets.get(p).copied().unwrap_or(start as u32) as usize;
-                if end <= data.len() && start <= end {
-                    new_data.extend_from_slice(&data[start..end]);
-                }
-                new_offsets.push(new_data.len() as u32);
-            }
-            *offsets = new_offsets;
-            *data = new_data;
-        }
-    }
-}
-
 fn pad_column(buf: &mut ColumnBuffer, st: StorageType, rows: usize) {
     use flowcus_ipfix::protocol::FieldValue;
     let zero = match st {
@@ -1386,49 +1567,61 @@ fn u8_to_storage_type(v: u8) -> StorageType {
 
 // Removed: storage_type_to_data_type — now in part.rs as u8_to_data_type
 
-/// Compute effective workers based on system load.
-/// Returns a reduced count when CPU or memory is under pressure.
-fn compute_effective_workers(
+/// Stateful throttle controller with exponential ramp-down/up.
+///
+/// On high load: halves available slots each cycle (4 → 2 → 1).
+/// On low load: doubles available slots each cycle (1 → 2 → 4).
+/// Never reduces below 1 — merges are never stopped completely.
+/// Only controls how many new merges can be started; running merges finish naturally.
+struct ThrottleController {
     max_workers: usize,
-    cpu_throttle: f64,
-    mem_throttle: f64,
-    metrics: &flowcus_core::observability::Metrics,
-) -> usize {
-    let cpu_load = get_system_cpu_load();
-    let mem_usage = get_system_mem_usage();
+    current_slots: usize,
+    cpu_threshold: f64,
+    mem_threshold: f64,
+}
 
-    let mut effective = max_workers;
-    let mut throttled = false;
-
-    if cpu_load > cpu_throttle {
-        // Scale down linearly: at 100% CPU, allow only 1 worker
-        let scale = ((1.0 - cpu_load) / (1.0 - cpu_throttle)).max(0.0);
-        effective = (max_workers as f64 * scale).ceil() as usize;
-        throttled = true;
-        debug!(
-            cpu_load = format!("{:.1}%", cpu_load * 100.0),
-            effective, "CPU throttle active"
-        );
+impl ThrottleController {
+    fn new(max_workers: usize, cpu_threshold: f64, mem_threshold: f64) -> Self {
+        Self {
+            max_workers,
+            current_slots: max_workers,
+            cpu_threshold,
+            mem_threshold,
+        }
     }
 
-    if mem_usage > mem_throttle {
-        let scale = ((1.0 - mem_usage) / (1.0 - mem_throttle)).max(0.0);
-        let mem_effective = (max_workers as f64 * scale).ceil() as usize;
-        effective = effective.min(mem_effective);
-        throttled = true;
-        debug!(
-            mem_usage = format!("{:.1}%", mem_usage * 100.0),
-            effective, "Memory throttle active"
-        );
-    }
+    /// Recompute available slots based on current system load.
+    /// Returns the number of new merges that can be dispatched this cycle.
+    fn recompute(&mut self, metrics: &flowcus_core::observability::Metrics) -> usize {
+        let cpu_load = get_system_cpu_load();
+        let mem_usage = get_system_mem_usage();
 
-    if throttled {
-        metrics
-            .merge_throttled_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
+        let overloaded = cpu_load > self.cpu_threshold || mem_usage > self.mem_threshold;
 
-    effective.max(1) // always allow at least 1 worker
+        let prev = self.current_slots;
+        if overloaded {
+            self.current_slots = (self.current_slots / 2).max(1);
+            metrics
+                .merge_throttled_count
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                cpu_load = format!("{:.1}%", cpu_load * 100.0),
+                mem_usage = format!("{:.1}%", mem_usage * 100.0),
+                slots = %format!("{prev} → {}", self.current_slots),
+                "Throttle: reducing merge slots"
+            );
+        } else {
+            self.current_slots = (self.current_slots * 2).min(self.max_workers);
+            if self.current_slots != prev {
+                debug!(
+                    slots = %format!("{prev} → {}", self.current_slots),
+                    "Throttle: increasing merge slots"
+                );
+            }
+        }
+
+        self.current_slots
+    }
 }
 
 /// Read system CPU load from /proc/loadavg (Linux).
@@ -1481,13 +1674,6 @@ fn parse_meminfo_kb(val: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn effective_workers_no_load() {
-        // At 0% load, all workers available
-        let metrics = flowcus_core::observability::Metrics::new();
-        assert_eq!(compute_effective_workers(8, 0.80, 0.85, &metrics), 8);
-    }
 
     #[test]
     fn decode_delta_roundtrip() {
@@ -1612,84 +1798,134 @@ mod tests {
         assert_eq!(gen_groups[&1].len(), 1);
     }
 
+    // ---- Throttle controller tests ----
+
     #[test]
-    fn apply_permutation_basic_reorder() {
-        let mut buf = ColumnBuffer::U32(vec![10, 20, 30, 40]);
-        apply_permutation(&mut buf, &[3, 1, 0, 2]);
-        assert_eq!(
-            match &buf {
-                ColumnBuffer::U32(v) => v.clone(),
-                _ => panic!("wrong type"),
-            },
-            vec![40, 20, 10, 30]
-        );
+    fn throttle_ramp_down() {
+        // ThrottleController halves slots on high load: 4 → 2 → 1
+        let metrics = flowcus_core::observability::Metrics::new();
+        let mut tc = ThrottleController::new(4, 0.0, 0.0); // thresholds at 0% → always overloaded
+        assert_eq!(tc.recompute(&metrics), 2);
+        assert_eq!(tc.recompute(&metrics), 1);
+        assert_eq!(tc.recompute(&metrics), 1); // stays at 1
     }
 
     #[test]
-    fn apply_permutation_u128_reorder() {
-        let mut buf = ColumnBuffer::U128(vec![[0, 1], [0, 2], [0, 3]]);
-        apply_permutation(&mut buf, &[2, 0, 1]);
-        assert_eq!(
-            match &buf {
-                ColumnBuffer::U128(v) => v.clone(),
-                _ => panic!("wrong type"),
-            },
-            vec![[0, 3], [0, 1], [0, 2]]
-        );
+    fn throttle_ramp_up() {
+        // ThrottleController doubles slots on low load: 1 → 2 → 4
+        let metrics = flowcus_core::observability::Metrics::new();
+        let mut tc = ThrottleController::new(4, 1.0, 1.0); // thresholds at 100% → never overloaded
+        tc.current_slots = 1;
+        assert_eq!(tc.recompute(&metrics), 2);
+        assert_eq!(tc.recompute(&metrics), 4);
+        assert_eq!(tc.recompute(&metrics), 4); // capped at max
     }
 
     #[test]
-    fn apply_permutation_shorter_buffer_does_not_panic() {
-        // Permutation indices go up to 4 but buffer only has 3 elements.
-        // Out-of-range indices should produce default (zero) values.
-        let mut buf = ColumnBuffer::U64(vec![100, 200, 300]);
-        apply_permutation(&mut buf, &[2, 4, 0, 3, 1]);
-        let v = match &buf {
-            ColumnBuffer::U64(v) => v.clone(),
+    fn throttle_never_zero() {
+        let metrics = flowcus_core::observability::Metrics::new();
+        let mut tc = ThrottleController::new(1, 0.0, 0.0);
+        // Even with 1 worker and continuous overload, never goes to 0
+        for _ in 0..10 {
+            assert!(tc.recompute(&metrics) >= 1);
+        }
+    }
+
+    // ---- K-way merge tests ----
+
+    #[test]
+    fn kway_merge_two_sorted() {
+        let a = vec![[0u64, 1], [0, 3], [0, 5]];
+        let b = vec![[0u64, 2], [0, 4], [0, 6]];
+        let order = kway_merge_rowids(&[a, b], 6);
+        assert_eq!(order.len(), 6);
+        // Should produce globally sorted sequence
+        let expected: Vec<(u8, u32)> = vec![
+            (0, 0), // [0,1]
+            (1, 0), // [0,2]
+            (0, 1), // [0,3]
+            (1, 1), // [0,4]
+            (0, 2), // [0,5]
+            (1, 2), // [0,6]
+        ];
+        assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn kway_merge_single_source() {
+        let a = vec![[0u64, 10], [0, 20], [0, 30]];
+        let order = kway_merge_rowids(&[a], 3);
+        assert_eq!(order, vec![(0, 0), (0, 1), (0, 2)]);
+    }
+
+    #[test]
+    fn kway_merge_empty_sources() {
+        let order = kway_merge_rowids(&[], 0);
+        assert!(order.is_empty());
+
+        let order = kway_merge_rowids(&[vec![], vec![]], 0);
+        assert!(order.is_empty());
+    }
+
+    // ---- Gather in order tests ----
+
+    #[test]
+    fn gather_in_order_u64() {
+        let src0 = ColumnBuffer::U64(vec![10, 20, 30]);
+        let src1 = ColumnBuffer::U64(vec![40, 50]);
+        let order = vec![(1u8, 0u32), (0, 2), (0, 0), (1, 1), (0, 1)];
+        let result = gather_in_order(&[src0, src1], &order, StorageType::U64, 5);
+        match result {
+            ColumnBuffer::U64(v) => assert_eq!(v, vec![40, 30, 10, 50, 20]),
             _ => panic!("wrong type"),
-        };
-        assert_eq!(v.len(), 5);
-        assert_eq!(v[0], 300); // index 2 → 300
-        assert_eq!(v[1], 0); // index 4 → out of range → 0
-        assert_eq!(v[2], 100); // index 0 → 100
-        assert_eq!(v[3], 0); // index 3 → out of range → 0
-        assert_eq!(v[4], 200); // index 1 → 200
+        }
     }
 
     #[test]
-    fn apply_permutation_varlen_shorter_buffer() {
-        let mut buf = ColumnBuffer::VarLen {
-            offsets: vec![3, 6], // 2 entries: "abc", "def"
+    fn gather_in_order_u128() {
+        let src0 = ColumnBuffer::U128(vec![[0, 1], [0, 2]]);
+        let src1 = ColumnBuffer::U128(vec![[0, 3]]);
+        let order = vec![(1u8, 0u32), (0, 0), (0, 1)];
+        let result = gather_in_order(&[src0, src1], &order, StorageType::U128, 3);
+        match result {
+            ColumnBuffer::U128(v) => assert_eq!(v, vec![[0, 3], [0, 1], [0, 2]]),
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn gather_in_order_mac() {
+        let src0 = ColumnBuffer::Mac(vec![[1; 6], [2; 6]]);
+        let src1 = ColumnBuffer::Mac(vec![[3; 6]]);
+        let order = vec![(1u8, 0u32), (0, 1), (0, 0)];
+        let result = gather_in_order(&[src0, src1], &order, StorageType::Mac, 3);
+        match result {
+            ColumnBuffer::Mac(v) => assert_eq!(v, vec![[3; 6], [2; 6], [1; 6]]),
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn gather_in_order_varlen() {
+        // src0: ["abc", "def"], src1: ["xy"]
+        let src0 = ColumnBuffer::VarLen {
+            offsets: vec![3, 6],
             data: b"abcdef".to_vec(),
         };
-        // Permutation asks for index 2 which doesn't exist.
-        apply_permutation(&mut buf, &[1, 2, 0]);
-        let (offsets, data) = match &buf {
-            ColumnBuffer::VarLen { offsets, data } => (offsets.clone(), data.clone()),
-            _ => panic!("wrong type"),
+        let src1 = ColumnBuffer::VarLen {
+            offsets: vec![2],
+            data: b"xy".to_vec(),
         };
-        assert_eq!(offsets.len(), 3);
-        // index 1 → "def", index 2 → missing (empty), index 0 → "abc"
-        assert_eq!(&data[..offsets[0] as usize], b"def");
-        assert_eq!(offsets[0], offsets[1]); // empty entry for missing index
-        assert_eq!(&data[offsets[1] as usize..offsets[2] as usize], b"abc");
-    }
-
-    #[test]
-    fn apply_permutation_all_types_consistent() {
-        // Verify all column types produce the same length output as the permutation.
-        let perm = vec![2, 0, 1, 3];
-
-        let mut u8_buf = ColumnBuffer::U8(vec![1, 2, 3]); // shorter than perm
-        apply_permutation(&mut u8_buf, &perm);
-        assert_eq!(u8_buf.row_count(), 4);
-
-        let mut u16_buf = ColumnBuffer::U16(vec![1, 2, 3]);
-        apply_permutation(&mut u16_buf, &perm);
-        assert_eq!(u16_buf.row_count(), 4);
-
-        let mut mac_buf = ColumnBuffer::Mac(vec![[1; 6], [2; 6], [3; 6]]);
-        apply_permutation(&mut mac_buf, &perm);
-        assert_eq!(mac_buf.row_count(), 4);
+        let order = vec![(1u8, 0u32), (0, 1), (0, 0)]; // "xy", "def", "abc"
+        let result = gather_in_order(&[src0, src1], &order, StorageType::VarLen, 3);
+        match result {
+            ColumnBuffer::VarLen { offsets, data } => {
+                assert_eq!(offsets.len(), 3);
+                assert_eq!(&data[..offsets[0] as usize], b"xy");
+                assert_eq!(&data[offsets[0] as usize..offsets[1] as usize], b"def");
+                assert_eq!(&data[offsets[1] as usize..offsets[2] as usize], b"abc");
+            }
+            _ => panic!("wrong type"),
+        }
     }
 }

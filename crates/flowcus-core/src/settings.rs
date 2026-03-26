@@ -589,6 +589,21 @@ pub fn schema() -> SettingsSchema {
                     },
                     SettingDescriptor {
                         section: "storage",
+                        key: "merge_max_batch_size",
+                        label: "Merge Batch Size",
+                        description: "Maximum number of parts merged in a single batch.",
+                        guidance: "Limits memory during merge. Lower values reduce peak memory but require more merge rounds to converge.",
+                        control: ControlType::Number {
+                            min: Some(2.0),
+                            max: Some(64.0),
+                            step: Some(1.0),
+                            unit: "parts",
+                        },
+                        default_value: dj["storage"]["merge_max_batch_size"].clone(),
+                        restart_required: true,
+                    },
+                    SettingDescriptor {
+                        section: "storage",
                         key: "retention_hours",
                         label: "Data Retention",
                         description: "Hours to keep flow data before automatic deletion.",

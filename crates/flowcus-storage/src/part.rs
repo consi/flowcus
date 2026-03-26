@@ -221,16 +221,16 @@ pub fn write_part(
         seq,
     );
 
-    // Write to a staging directory first, then atomic-rename to the final
-    // path. This prevents queries and merges from reading a half-written
-    // part. The `.staging` suffix doesn't match the part name parser, so
+    // Write to an in-progress directory first, then atomic-rename to the
+    // final path. This prevents queries and merges from reading a half-written
+    // part. The `.inprogress` suffix doesn't match the part name parser, so
     // list_parts / walk_parts_recursive will never discover it.
-    let staging_dir = part_dir.with_extension("staging");
-    // Clean up any leftover staging dir from a previous crash
-    if staging_dir.exists() {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+    let inprogress_dir = part_dir.with_extension("inprogress");
+    // Clean up any leftover dir from a previous crash
+    if inprogress_dir.exists() {
+        let _ = std::fs::remove_dir_all(&inprogress_dir);
     }
-    let col_dir = staging_dir.join("columns");
+    let col_dir = inprogress_dir.join("columns");
     std::fs::create_dir_all(&col_dir)?;
 
     // Write column files + marks + bloom filters
@@ -255,23 +255,23 @@ pub fn write_part(
     }
 
     // Write binary metadata header
-    write_meta_bin(&staging_dir.join("meta.bin"), metadata)?;
+    write_meta_bin(&inprogress_dir.join("meta.bin"), metadata)?;
 
     // Column index for query planning (never open .col during planning)
     let index_data: Vec<_> = columns
         .iter()
         .map(|c| (c.def.clone(), c.encoded.clone()))
         .collect();
-    write_column_index(&staging_dir.join("column_index.bin"), &index_data)?;
+    write_column_index(&inprogress_dir.join("column_index.bin"), &index_data)?;
 
     // Schema for merge recovery
-    write_schema_bin(&staging_dir.join("schema.bin"), &metadata.schema)?;
+    write_schema_bin(&inprogress_dir.join("schema.bin"), &metadata.schema)?;
 
     // Atomic rename: part becomes visible to readers only after all files
     // are written. Directory rename is atomic on the same filesystem.
-    std::fs::rename(&staging_dir, &part_dir).inspect_err(|_| {
-        // Clean up staging on rename failure
-        let _ = std::fs::remove_dir_all(&staging_dir);
+    std::fs::rename(&inprogress_dir, &part_dir).inspect_err(|_| {
+        // Clean up on rename failure
+        let _ = std::fs::remove_dir_all(&inprogress_dir);
     })?;
 
     debug!(
@@ -848,6 +848,126 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+// ---- Streaming part writer for merge ----
+
+/// Incremental part writer that streams columns to an `.inprogress` directory,
+/// then atomically renames to the final path on `finish()`.
+///
+/// The `.inprogress` suffix is not recognized by `parse_part_dir_name_versioned`,
+/// so the part is invisible to queries, merges, and retention until committed.
+pub(crate) struct PartWriter {
+    inprogress_dir: PathBuf,
+    final_dir: PathBuf,
+    col_dir: PathBuf,
+    index_entries: Vec<(ColumnDef, EncodedColumn)>,
+}
+
+impl PartWriter {
+    /// Create a new part writer. The `.inprogress` directory is created on disk.
+    pub fn new(base_dir: &Path, metadata: &PartMetadata, seq: u32) -> std::io::Result<Self> {
+        let final_dir = part_path(
+            base_dir,
+            metadata.time_min,
+            metadata.generation,
+            metadata.time_max,
+            seq,
+        );
+        let inprogress_dir = final_dir.with_extension("inprogress");
+
+        // Clean up leftover from a previous crash
+        if inprogress_dir.exists() {
+            let _ = std::fs::remove_dir_all(&inprogress_dir);
+        }
+
+        let col_dir = inprogress_dir.join("columns");
+        std::fs::create_dir_all(&col_dir)?;
+
+        Ok(Self {
+            inprogress_dir,
+            final_dir,
+            col_dir,
+            index_entries: Vec::new(),
+        })
+    }
+
+    /// Write a single column (data, marks, bloom filter) to the in-progress directory.
+    pub fn write_column(
+        &mut self,
+        data: &ColumnWriteData,
+        row_count: u64,
+        granule_size: usize,
+        bloom_bits: usize,
+    ) -> std::io::Result<()> {
+        let name = &data.def.name;
+        write_column_file(
+            &self.col_dir.join(format!("{name}.col")),
+            &data.def,
+            &data.encoded,
+            row_count,
+        )?;
+        granule::write_marks(
+            &self.col_dir.join(format!("{name}.mrk")),
+            &data.marks,
+            granule_size,
+        )?;
+        granule::write_blooms(
+            &self.col_dir.join(format!("{name}.bloom")),
+            &data.blooms,
+            bloom_bits,
+        )?;
+        self.index_entries
+            .push((data.def.clone(), data.encoded.clone()));
+        Ok(())
+    }
+
+    /// Finalize the part: write metadata files, fsync, and atomically rename
+    /// from `.inprogress` to the final path.
+    pub fn finish(self, metadata: &PartMetadata) -> std::io::Result<PathBuf> {
+        write_meta_bin(&self.inprogress_dir.join("meta.bin"), metadata)?;
+        write_column_index(
+            &self.inprogress_dir.join("column_index.bin"),
+            &self.index_entries,
+        )?;
+        write_schema_bin(&self.inprogress_dir.join("schema.bin"), &metadata.schema)?;
+
+        // Fsync in-progress directory so all data is durable before rename.
+        Self::fsync_dir(&self.inprogress_dir)?;
+
+        let final_dir = self.final_dir.clone();
+        let columns = self.index_entries.len();
+
+        // Atomic rename: part becomes visible to readers.
+        // After rename, inprogress_dir no longer exists, so Drop is a no-op.
+        std::fs::rename(&self.inprogress_dir, &final_dir).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&self.inprogress_dir);
+        })?;
+
+        debug!(
+            path = %final_dir.display(),
+            rows = metadata.row_count,
+            generation = metadata.generation,
+            columns,
+            "Part written (streaming)"
+        );
+
+        Ok(final_dir)
+    }
+
+    fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+        let d = std::fs::File::open(dir)?;
+        d.sync_all()
+    }
+}
+
+impl Drop for PartWriter {
+    fn drop(&mut self) {
+        // If finish() was not called, clean up the in-progress directory.
+        if self.inprogress_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.inprogress_dir);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +1074,92 @@ mod tests {
         assert_eq!(header.disk_bytes, 123_456);
         assert_eq!(header.column_count, 8);
         assert_eq!(header.schema_fingerprint, 0xDEAD_BEEF_CAFE_1234);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn part_writer_inprogress_invisible_to_parser() {
+        // Names ending in .inprogress should not parse as valid part dirs.
+        let name = "2_00001_1700000000000_1700003599000_000001.inprogress";
+        assert!(parse_part_dir_name_versioned(name).is_none());
+    }
+
+    #[test]
+    fn part_writer_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("test_part_writer_{}", std::process::id()));
+        let base_dir = dir.join("storage/flows");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let schema = Schema {
+            columns: vec![ColumnDef {
+                name: "testCol".into(),
+                element_id: 0,
+                enterprise_id: 0,
+                data_type: flowcus_ipfix::protocol::DataType::Unsigned32,
+                storage_type: StorageType::U32,
+                wire_length: 4,
+            }],
+            duration_source: None,
+        };
+
+        let metadata = PartMetadata {
+            row_count: 3,
+            generation: 1,
+            time_min: 1_700_000_000_000,
+            time_max: 1_700_003_599_000,
+            observation_domain_id: 0,
+            created_at_ms: 0,
+            disk_bytes: 0,
+            column_count: 1,
+            schema_fingerprint: schema.fingerprint(),
+            exporter: ([0, 0, 0, 0], 0).into(),
+            schema: schema.clone(),
+        };
+
+        let mut writer = PartWriter::new(&base_dir, &metadata, 1).unwrap();
+
+        // Verify .inprogress directory was created
+        assert!(writer.inprogress_dir.exists());
+        assert!(
+            writer
+                .inprogress_dir
+                .to_string_lossy()
+                .ends_with(".inprogress")
+        );
+
+        // Write a column
+        let buf = crate::column::ColumnBuffer::U32(vec![10, 20, 30]);
+        let encoded = crate::codec::encode_v2(&buf, &schema.columns[0]);
+        let (marks, blooms) =
+            crate::granule::compute_granules(&buf, &encoded.data, 8192, 8192, StorageType::U32);
+        writer
+            .write_column(
+                &ColumnWriteData {
+                    def: schema.columns[0].clone(),
+                    encoded,
+                    marks,
+                    blooms,
+                },
+                3,
+                8192,
+                8192,
+            )
+            .unwrap();
+
+        // Verify column files exist in inprogress dir
+        assert!(writer.col_dir.join("testCol.col").exists());
+        assert!(writer.col_dir.join("testCol.mrk").exists());
+        assert!(writer.col_dir.join("testCol.bloom").exists());
+
+        // Finish: atomic rename
+        let final_path = writer.finish(&metadata).unwrap();
+        assert!(final_path.exists());
+        assert!(!final_path.to_string_lossy().contains("inprogress"));
+
+        // Verify meta.bin written
+        let header = read_meta_bin(&final_path.join("meta.bin")).unwrap();
+        assert_eq!(header.row_count, 3);
 
         std::fs::remove_dir_all(&dir).ok();
     }

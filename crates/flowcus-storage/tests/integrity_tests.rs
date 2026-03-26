@@ -1277,3 +1277,50 @@ fn test_query_pagination_total_matching_not_capped_by_limit() {
 
     cleanup(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// test_inprogress_cleanup_on_recovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_inprogress_cleanup_on_recovery() {
+    let dir = test_dir("inprogress_cleanup");
+
+    // Write a part so the directory structure exists
+    let mut writer = tiny_flush_writer(&dir);
+    let records = vec![make_record(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        100,
+    )];
+    let msg = make_message(records);
+    writer.ingest(&msg);
+    writer.flush_all();
+
+    let table = Table::open(&dir, "flows").unwrap();
+    let parts = table.list_all_parts().unwrap();
+    assert_eq!(parts.len(), 1);
+
+    // Create a fake .inprogress directory in the same hour
+    let hour_dir = parts[0].path.parent().unwrap();
+    let fake_inprogress = hour_dir.join("2_00001_1700000000000_1700003599000_000099.inprogress");
+    std::fs::create_dir_all(fake_inprogress.join("columns")).unwrap();
+    std::fs::write(fake_inprogress.join("meta.bin"), b"fake").unwrap();
+    assert!(fake_inprogress.exists());
+
+    // Run recovery — should remove the .inprogress dir
+    let table_base = dir.join("flows");
+    flowcus_storage::merge::recover_interrupted_merges(&table_base);
+
+    // .inprogress should be gone
+    assert!(
+        !fake_inprogress.exists(),
+        ".inprogress directory should be removed by recovery"
+    );
+
+    // Original part should still exist
+    let parts_after = table.list_all_parts().unwrap();
+    assert_eq!(parts_after.len(), 1, "original part should be preserved");
+
+    cleanup(&dir);
+}

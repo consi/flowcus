@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
         partition_duration_secs: config.storage.partition_duration_secs,
         granule_size: config.storage.granule_size,
         bloom_bits: config.storage.bloom_bits_per_granule,
+        max_batch_size: config.storage.merge_max_batch_size,
     };
     let part_locks = flowcus_storage::part_locks::PartLocks::new();
     flowcus_storage::merge::start(

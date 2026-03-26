@@ -96,6 +96,9 @@ pub struct StorageConfig {
     /// Maximum system memory usage fraction (0.0-1.0) before throttling merges.
     #[serde(default = "default_merge_mem_throttle")]
     pub merge_mem_throttle: f64,
+    /// Maximum parts per merge batch. Limits memory during merge. Default 8.
+    #[serde(default = "default_merge_max_batch_size")]
+    pub merge_max_batch_size: usize,
     /// Granule size in rows. Marks and bloom filters are computed per granule.
     /// Smaller = more precise seeking but more index overhead.
     #[serde(default = "default_granule_size")]
@@ -145,7 +148,7 @@ const fn default_merge_workers() -> usize {
 }
 
 const fn default_merge_scan_interval_secs() -> u64 {
-    15
+    30
 }
 
 const fn default_merge_cpu_throttle() -> f64 {
@@ -154,6 +157,10 @@ const fn default_merge_cpu_throttle() -> f64 {
 
 const fn default_merge_mem_throttle() -> f64 {
     0.85
+}
+
+const fn default_merge_max_batch_size() -> usize {
+    8
 }
 
 const fn default_granule_size() -> usize {
@@ -189,6 +196,7 @@ impl Default for StorageConfig {
             merge_scan_interval_secs: default_merge_scan_interval_secs(),
             merge_cpu_throttle: default_merge_cpu_throttle(),
             merge_mem_throttle: default_merge_mem_throttle(),
+            merge_max_batch_size: default_merge_max_batch_size(),
             granule_size: default_granule_size(),
             bloom_bits_per_granule: default_bloom_bits_per_granule(),
             storage_cache_bytes: default_storage_cache_bytes(),
