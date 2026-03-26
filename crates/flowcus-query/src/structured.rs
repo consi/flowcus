@@ -305,17 +305,48 @@ pub fn parse_duration_string(s: &str) -> Result<ast::Duration, String> {
 // Filter conversion
 // ---------------------------------------------------------------------------
 
-/// Fields that should be treated as IP addresses.
+/// Explicit list of fields that should be treated as IP addresses.
 const IP_FIELDS: &[&str] = &[
+    // Standard src/dst
     "sourceIPv4Address",
     "destinationIPv4Address",
     "sourceIPv6Address",
     "destinationIPv6Address",
+    // System columns
     "flowcusExporterIPv4",
+    // Next-hop
     "ipNextHopIPv4Address",
     "ipNextHopIPv6Address",
     "bgpNextHopIPv4Address",
     "bgpNextHopIPv6Address",
+    // NAT
+    "postNATSourceIPv4Address",
+    "postNATDestinationIPv4Address",
+    "postNATSourceIPv6Address",
+    "postNATDestinationIPv6Address",
+    // Prefixes
+    "sourceIPv4Prefix",
+    "destinationIPv4Prefix",
+    // MPLS
+    "mplsTopLabelIPv4Address",
+    "mplsTopLabelIPv6Address",
+    // Collector / exporter
+    "collectorIPv4Address",
+    "collectorIPv6Address",
+    "exporterIPv4Address",
+    "exporterIPv6Address",
+    // Vendor: Juniper
+    "juniperNatSrcAddress",
+    "juniperNatDstAddress",
+    // Vendor: VMware
+    "vmwareTenantSourceIPv4",
+    "vmwareTenantDestIPv4",
+    // Vendor: Barracuda
+    "barracudaBindIPv4Address",
+    // Vendor: Huawei
+    "huaweiNatSourceAddress",
+    "huaweiNatDestAddress",
+    // Aliases
     "src",
     "dst",
     "nexthop",
@@ -338,6 +369,12 @@ const PROTO_FIELDS: &[&str] = &["protocolIdentifier", "proto"];
 
 fn is_ip_field(field: &str) -> bool {
     IP_FIELDS.contains(&field)
+        || field.contains("IPv4Address")
+        || field.contains("IPv6Address")
+        || field.contains("Ipv4Address")
+        || field.contains("Ipv6Address")
+        || field.contains("IPv4Prefix")
+        || field.contains("IPv6Prefix")
 }
 
 fn is_port_field(field: &str) -> bool {
@@ -353,7 +390,7 @@ fn ip_direction(field: &str) -> ast::IpDirection {
     match field {
         "sourceIPv4Address" | "sourceIPv6Address" | "src" => ast::IpDirection::Src,
         "destinationIPv4Address" | "destinationIPv6Address" | "dst" => ast::IpDirection::Dst,
-        _ => ast::IpDirection::Any,
+        _ => ast::IpDirection::Named(field.to_string()),
     }
 }
 
@@ -1491,5 +1528,115 @@ mod tests {
         let s1 = serde_json::to_string(&ast1).unwrap();
         let s2 = serde_json::to_string(&ast2).unwrap();
         assert_eq!(s1, s2);
+    }
+
+    // -----------------------------------------------------------------------
+    // IP field detection and Named direction routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_ip_field_detects_nat_fields() {
+        assert!(is_ip_field("postNATSourceIPv4Address"));
+        assert!(is_ip_field("postNATDestinationIPv4Address"));
+        assert!(is_ip_field("postNATSourceIPv6Address"));
+        assert!(is_ip_field("postNATDestinationIPv6Address"));
+    }
+
+    #[test]
+    fn is_ip_field_detects_vendor_fields() {
+        assert!(is_ip_field("juniperNatSrcAddress"));
+        assert!(is_ip_field("vmwareTenantSourceIPv4"));
+        assert!(is_ip_field("huaweiNatSourceAddress"));
+        assert!(is_ip_field("barracudaBindIPv4Address"));
+    }
+
+    #[test]
+    fn is_ip_field_suffix_fallback() {
+        // Unknown field with IPv4Address suffix should be detected
+        assert!(is_ip_field("someVendorIPv4Address"));
+        assert!(is_ip_field("customIPv6Address"));
+        assert!(!is_ip_field("octetDeltaCount"));
+        assert!(!is_ip_field("sourceTransportPort"));
+    }
+
+    #[test]
+    fn ip_direction_named_for_non_standard() {
+        assert_eq!(
+            ip_direction("postNATSourceIPv4Address"),
+            ast::IpDirection::Named("postNATSourceIPv4Address".to_string())
+        );
+        assert_eq!(
+            ip_direction("ipNextHopIPv4Address"),
+            ast::IpDirection::Named("ipNextHopIPv4Address".to_string())
+        );
+        // Standard src/dst still use Src/Dst
+        assert_eq!(ip_direction("sourceIPv4Address"), ast::IpDirection::Src);
+        assert_eq!(
+            ip_direction("destinationIPv4Address"),
+            ast::IpDirection::Dst
+        );
+        assert_eq!(ip_direction("src"), ast::IpDirection::Src);
+        assert_eq!(ip_direction("dst"), ast::IpDirection::Dst);
+    }
+
+    #[test]
+    fn to_ast_nat_ip_filter_routes_to_ip_filter() {
+        let sq = StructuredQuery {
+            time_range: StructuredTimeRange::Relative {
+                duration: "1h".to_string(),
+            },
+            filters: vec![Filter {
+                field: "postNATSourceIPv4Address".to_string(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("91.150.183.53"),
+                negated: false,
+            }],
+            logic: FilterLogic::And,
+            columns: None,
+            aggregate: None,
+            sort: None,
+        };
+        let q = sq.to_ast().unwrap();
+        match &q.stages[0] {
+            ast::Stage::Filter(ast::FilterExpr::Ip(ip)) => {
+                assert_eq!(
+                    ip.direction,
+                    ast::IpDirection::Named("postNATSourceIPv4Address".to_string())
+                );
+                assert!(!ip.negated);
+                assert!(matches!(&ip.value, ast::IpValue::Addr(a) if a == "91.150.183.53"));
+            }
+            other => panic!("expected IP filter with Named direction, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_ast_nat_ipv6_filter() {
+        let sq = StructuredQuery {
+            time_range: StructuredTimeRange::Relative {
+                duration: "1h".to_string(),
+            },
+            filters: vec![Filter {
+                field: "postNATSourceIPv6Address".to_string(),
+                op: FilterOp::Ne,
+                value: serde_json::json!("::"),
+                negated: false,
+            }],
+            logic: FilterLogic::And,
+            columns: None,
+            aggregate: None,
+            sort: None,
+        };
+        let q = sq.to_ast().unwrap();
+        match &q.stages[0] {
+            ast::Stage::Filter(ast::FilterExpr::Ip(ip)) => {
+                assert_eq!(
+                    ip.direction,
+                    ast::IpDirection::Named("postNATSourceIPv6Address".to_string())
+                );
+                assert!(ip.negated);
+            }
+            other => panic!("expected IP filter, got: {other:?}"),
+        }
     }
 }

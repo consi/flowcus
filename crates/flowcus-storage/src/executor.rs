@@ -214,9 +214,19 @@ struct ResolvedIpFilter {
 
 enum ResolvedIpValue {
     Addr(u32),
-    Cidr { base_masked: u32, mask: u32 },
+    Cidr {
+        base_masked: u32,
+        mask: u32,
+    },
     List(Vec<u32>),
     Wildcard(WildcardOctets),
+    // IPv6 variants
+    Addr128([u64; 2]),
+    Cidr128 {
+        base_masked: [u64; 2],
+        mask: [u64; 2],
+    },
+    List128(Vec<[u64; 2]>),
 }
 
 /// Pre-parsed wildcard octets: `None` means `*` (match any).
@@ -284,42 +294,72 @@ fn resolve_filter(filter: &FilterExpr) -> ResolvedFilter {
     }
 }
 
+/// Convert an IPv6 address string to `[u64; 2]` (hi, lo) in big-endian order.
+fn ipv6_to_pair(addr: std::net::Ipv6Addr) -> [u64; 2] {
+    let octets = addr.octets();
+    let hi = u64::from_be_bytes(octets[..8].try_into().unwrap());
+    let lo = u64::from_be_bytes(octets[8..].try_into().unwrap());
+    [hi, lo]
+}
+
 fn resolve_ip_filter(ip: &IpFilter) -> ResolvedIpFilter {
     let value = match &ip.value {
         IpValue::Addr(addr) => {
-            let v = addr
-                .parse::<std::net::Ipv4Addr>()
-                .map(u32::from)
-                .unwrap_or(0);
-            ResolvedIpValue::Addr(v)
+            if let Ok(v4) = addr.parse::<std::net::Ipv4Addr>() {
+                ResolvedIpValue::Addr(u32::from(v4))
+            } else if let Ok(v6) = addr.parse::<std::net::Ipv6Addr>() {
+                ResolvedIpValue::Addr128(ipv6_to_pair(v6))
+            } else {
+                ResolvedIpValue::Addr(0)
+            }
         }
         IpValue::Cidr(cidr) => {
             let parts: Vec<&str> = cidr.split('/').collect();
             if parts.len() == 2 {
-                let base: u32 = parts[0]
-                    .parse::<std::net::Ipv4Addr>()
-                    .map(u32::from)
-                    .unwrap_or(0);
                 let prefix_len: u32 = parts[1].parse().unwrap_or(0);
-                let mask = if prefix_len == 0 {
-                    0
+                if let Ok(v4) = parts[0].parse::<std::net::Ipv4Addr>() {
+                    let base = u32::from(v4);
+                    let mask = if prefix_len == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix_len.min(32))
+                    };
+                    ResolvedIpValue::Cidr {
+                        base_masked: base & mask,
+                        mask,
+                    }
+                } else if let Ok(v6) = parts[0].parse::<std::net::Ipv6Addr>() {
+                    let pair = ipv6_to_pair(v6);
+                    let mask = ipv6_prefix_mask(prefix_len);
+                    ResolvedIpValue::Cidr128 {
+                        base_masked: [pair[0] & mask[0], pair[1] & mask[1]],
+                        mask,
+                    }
                 } else {
-                    u32::MAX << (32 - prefix_len.min(32))
-                };
-                ResolvedIpValue::Cidr {
-                    base_masked: base & mask,
-                    mask,
+                    ResolvedIpValue::Addr(0)
                 }
             } else {
                 ResolvedIpValue::Addr(0)
             }
         }
         IpValue::List(addrs) => {
-            let resolved: Vec<u32> = addrs
-                .iter()
-                .filter_map(|a| a.parse::<std::net::Ipv4Addr>().ok().map(u32::from))
-                .collect();
-            ResolvedIpValue::List(resolved)
+            // Try IPv4 first; if any parse as IPv6, use the IPv6 path
+            let mut v4s: Vec<u32> = Vec::new();
+            let mut v6s: Vec<[u64; 2]> = Vec::new();
+            let mut has_v6 = false;
+            for a in addrs {
+                if let Ok(v4) = a.parse::<std::net::Ipv4Addr>() {
+                    v4s.push(u32::from(v4));
+                } else if let Ok(v6) = a.parse::<std::net::Ipv6Addr>() {
+                    v6s.push(ipv6_to_pair(v6));
+                    has_v6 = true;
+                }
+            }
+            if has_v6 {
+                ResolvedIpValue::List128(v6s)
+            } else {
+                ResolvedIpValue::List(v4s)
+            }
         }
         IpValue::Wildcard(pattern) => {
             let octets: Vec<&str> = pattern.split('.').collect();
@@ -333,10 +373,30 @@ fn resolve_ip_filter(ip: &IpFilter) -> ResolvedIpFilter {
         }
     };
     ResolvedIpFilter {
-        direction: ip.direction,
+        direction: ip.direction.clone(),
         negated: ip.negated,
         value,
     }
+}
+
+/// Build a 128-bit prefix mask as `[u64; 2]` from a prefix length (0..=128).
+fn ipv6_prefix_mask(prefix_len: u32) -> [u64; 2] {
+    let pl = prefix_len.min(128);
+    let hi = if pl >= 64 {
+        u64::MAX
+    } else if pl == 0 {
+        0
+    } else {
+        u64::MAX << (64 - pl)
+    };
+    let lo = if pl >= 128 {
+        u64::MAX
+    } else if pl <= 64 {
+        0
+    } else {
+        u64::MAX << (128 - pl)
+    };
+    [hi, lo]
 }
 
 fn resolve_port_value(pv: &PortValue) -> ResolvedPortValue {
@@ -739,13 +799,14 @@ fn collect_filter_columns(f: &FilterExpr, out: &mut Vec<String>) {
             collect_filter_columns(b, out);
         }
         FilterExpr::Not(inner) => collect_filter_columns(inner, out),
-        FilterExpr::Ip(ip) => match ip.direction {
+        FilterExpr::Ip(ip) => match &ip.direction {
             IpDirection::Src => out.push("sourceIPv4Address".to_string()),
             IpDirection::Dst => out.push("destinationIPv4Address".to_string()),
             IpDirection::Any => {
                 out.push("sourceIPv4Address".to_string());
                 out.push("destinationIPv4Address".to_string());
             }
+            IpDirection::Named(col) => out.push(col.clone()),
         },
         FilterExpr::Port(port) => match port.direction {
             PortDirection::Src => out.push("sourceTransportPort".to_string()),
@@ -927,25 +988,43 @@ fn eval_resolved_ip(
             Some(b) => b,
             None => return false,
         };
-        let val = column_get_u32(buf, row);
-        let matched = match &ip.value {
-            ResolvedIpValue::Addr(addr) => val == *addr,
-            ResolvedIpValue::Cidr { base_masked, mask } => (val & *mask) == *base_masked,
-            ResolvedIpValue::List(addrs) => addrs.contains(&val),
-            ResolvedIpValue::Wildcard(wo) => {
-                let octets = val.to_be_bytes();
-                wo.0.iter()
-                    .enumerate()
-                    .all(|(i, expected)| expected.is_none() || *expected == Some(octets[i]))
+        // Dispatch based on column type: U128 columns use IPv6 comparison,
+        // U32 columns use IPv4 comparison.
+        let matched = if matches!(buf, ColumnBuffer::U128(_)) {
+            let val = column_get_u128(buf, row);
+            match &ip.value {
+                ResolvedIpValue::Addr128(addr) => val == *addr,
+                ResolvedIpValue::Cidr128 { base_masked, mask } => {
+                    (val[0] & mask[0]) == base_masked[0] && (val[1] & mask[1]) == base_masked[1]
+                }
+                ResolvedIpValue::List128(addrs) => addrs.contains(&val),
+                // IPv4 value against IPv6 column → no match
+                _ => false,
+            }
+        } else {
+            let val = column_get_u32(buf, row);
+            match &ip.value {
+                ResolvedIpValue::Addr(addr) => val == *addr,
+                ResolvedIpValue::Cidr { base_masked, mask } => (val & *mask) == *base_masked,
+                ResolvedIpValue::List(addrs) => addrs.contains(&val),
+                ResolvedIpValue::Wildcard(wo) => {
+                    let octets = val.to_be_bytes();
+                    wo.0.iter()
+                        .enumerate()
+                        .all(|(i, expected)| expected.is_none() || *expected == Some(octets[i]))
+                }
+                // IPv6 value against IPv4 column → no match
+                _ => false,
             }
         };
         if ip.negated { !matched } else { matched }
     };
 
-    match ip.direction {
+    match &ip.direction {
         IpDirection::Src => check("sourceIPv4Address"),
         IpDirection::Dst => check("destinationIPv4Address"),
         IpDirection::Any => check("sourceIPv4Address") || check("destinationIPv4Address"),
+        IpDirection::Named(col_name) => check(col_name),
     }
 }
 
@@ -1026,6 +1105,38 @@ fn eval_resolved_string(
         Some(b) => b,
         None => return false,
     };
+    // MAC columns need formatting to string for comparison
+    if let ColumnBuffer::Mac(v) = buf {
+        let mac = v.get(row).copied().unwrap_or([0; 6]);
+        let formatted = format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+        let val_lower = sf.value.to_lowercase();
+        return match sf.op {
+            StringOp::Eq => formatted == val_lower,
+            StringOp::Ne => formatted != val_lower,
+            StringOp::Regex | StringOp::NotRegex => {
+                let matched = formatted.contains(val_lower.as_str());
+                if sf.op == StringOp::NotRegex {
+                    !matched
+                } else {
+                    matched
+                }
+            }
+            StringOp::In | StringOp::NotIn => {
+                let matched = sf
+                    .list_items
+                    .iter()
+                    .any(|item| formatted == item.to_lowercase());
+                if sf.op == StringOp::NotIn {
+                    !matched
+                } else {
+                    matched
+                }
+            }
+        };
+    }
     let val_bytes = column_get_varlen(buf, row);
     let val = String::from_utf8_lossy(val_bytes);
 
@@ -1121,18 +1232,24 @@ fn index_may_match(
             index_may_match_not(inner, col_name, min_val, max_val, storage_type)
         }
         FilterExpr::Ip(ip) => {
-            let relevant = match ip.direction {
+            let relevant = match &ip.direction {
                 IpDirection::Src => col_name == "sourceIPv4Address",
                 IpDirection::Dst => col_name == "destinationIPv4Address",
                 // For `Any` direction (src OR dst), a single column's mark
                 // cannot exclude the granule — the value may be in the other
                 // column. Always return true (may match) for Any.
                 IpDirection::Any => return true,
+                IpDirection::Named(col) => col_name == col.as_str(),
             };
             if !relevant {
                 return true; // not this column
             }
-            if storage_type != StorageType::U32 {
+            if storage_type != StorageType::U32 && storage_type != StorageType::U128 {
+                return true;
+            }
+            // U128 columns (IPv6): conservatively assume may match for now.
+            // Min/max pruning for 128-bit values requires careful comparison.
+            if storage_type == StorageType::U128 {
                 return true;
             }
             let col_min = u32::from_le_bytes(min_val[..4].try_into().unwrap());
@@ -1448,17 +1565,38 @@ pub fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
             if let IpValue::Addr(addr) = &ip.value {
                 if let Ok(a) = addr.parse::<std::net::Ipv4Addr>() {
                     let bytes = u32::from(a).to_le_bytes().to_vec();
-                    match ip.direction {
+                    match &ip.direction {
                         IpDirection::Src => {
                             result.push(("sourceIPv4Address".to_string(), bytes));
                         }
                         IpDirection::Dst => {
                             result.push(("destinationIPv4Address".to_string(), bytes));
                         }
+                        IpDirection::Named(col) => {
+                            result.push((col.clone(), bytes));
+                        }
                         // `ip` (Any) means src OR dst — cannot use bloom AND
                         // semantics. A granule that has the value in src but
                         // not in dst would be incorrectly skipped. Skip bloom
                         // for `Any` direction; row-level filter handles it.
+                        IpDirection::Any => {}
+                    }
+                } else if let Ok(v6) = addr.parse::<std::net::Ipv6Addr>() {
+                    // IPv6: encode as 16 bytes (two u64 LE halves, matching storage)
+                    let pair = ipv6_to_pair(v6);
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&pair[0].to_le_bytes());
+                    bytes.extend_from_slice(&pair[1].to_le_bytes());
+                    match &ip.direction {
+                        IpDirection::Src => {
+                            result.push(("sourceIPv6Address".to_string(), bytes));
+                        }
+                        IpDirection::Dst => {
+                            result.push(("destinationIPv6Address".to_string(), bytes));
+                        }
+                        IpDirection::Named(col) => {
+                            result.push((col.clone(), bytes));
+                        }
                         IpDirection::Any => {}
                     }
                 }
@@ -1554,12 +1692,15 @@ pub fn bloom_lookup_list_bytes(filter: &FilterExpr) -> Vec<(String, Vec<Vec<u8>>
                     })
                     .collect();
                 if !bytes_list.is_empty() {
-                    match ip.direction {
+                    match &ip.direction {
                         IpDirection::Src => {
                             result.push(("sourceIPv4Address".to_string(), bytes_list));
                         }
                         IpDirection::Dst => {
                             result.push(("destinationIPv4Address".to_string(), bytes_list));
+                        }
+                        IpDirection::Named(col) => {
+                            result.push((col.clone(), bytes_list));
                         }
                         IpDirection::Any => {} // OR semantics, can't use bloom
                     }
@@ -5217,5 +5358,265 @@ mod tests {
         assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 2000), 1); // bucket 1 start
         assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 3500), 2); // mid bucket 2
         assert_eq!(bucket_idx(&bucket_starts, bucket_ms, 5000), 2); // after window, clamped
+    }
+
+    // -----------------------------------------------------------------------
+    // Named IP direction (non-src/dst columns like postNATSourceIPv4Address)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_named_ipv4_filter_eq() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Named("postNATSourceIPv4Address".to_string()),
+            negated: false,
+            value: IpValue::Addr("91.150.183.53".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U32);
+        let target = u32::from(std::net::Ipv4Addr::new(91, 150, 183, 53));
+        let other = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        if let ColumnBuffer::U32(ref mut v) = col {
+            v.push(target);
+            v.push(other);
+            v.push(0); // 0.0.0.0
+        }
+        columns.insert("postNATSourceIPv4Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns)); // exact match
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns)); // different IP
+        assert!(!evaluate_resolved_filter(&resolved, 2, &columns)); // 0.0.0.0
+    }
+
+    #[test]
+    fn test_named_ipv4_filter_ne() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Named("postNATSourceIPv4Address".to_string()),
+            negated: true,
+            value: IpValue::Addr("0.0.0.0".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U32);
+        if let ColumnBuffer::U32(ref mut v) = col {
+            v.push(u32::from(std::net::Ipv4Addr::new(91, 150, 183, 53)));
+            v.push(0); // 0.0.0.0
+        }
+        columns.insert("postNATSourceIPv4Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns)); // non-zero → passes ne
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns)); // zero → fails ne
+    }
+
+    #[test]
+    fn test_named_ipv4_cidr_filter() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Named("postNATDestinationIPv4Address".to_string()),
+            negated: false,
+            value: IpValue::Cidr("10.0.0.0/8".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U32);
+        if let ColumnBuffer::U32(ref mut v) = col {
+            v.push(u32::from(std::net::Ipv4Addr::new(10, 1, 2, 3)));
+            v.push(u32::from(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        }
+        columns.insert("postNATDestinationIPv4Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    // -----------------------------------------------------------------------
+    // IPv6 filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ipv6_filter_eq() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Named("sourceIPv6Address".to_string()),
+            negated: false,
+            value: IpValue::Addr("2001:db8::1".to_string()),
+        });
+        let target_addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let other_addr: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+        let target_pair = ipv6_to_pair(target_addr);
+        let other_pair = ipv6_to_pair(other_addr);
+
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U128);
+        if let ColumnBuffer::U128(ref mut v) = col {
+            v.push(target_pair);
+            v.push(other_pair);
+        }
+        columns.insert("sourceIPv6Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_ipv6_cidr_filter() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Named("sourceIPv6Address".to_string()),
+            negated: false,
+            value: IpValue::Cidr("2001:db8::/32".to_string()),
+        });
+        let inside: std::net::Ipv6Addr = "2001:db8::abcd".parse().unwrap();
+        let outside: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U128);
+        if let ColumnBuffer::U128(ref mut v) = col {
+            v.push(ipv6_to_pair(inside));
+            v.push(ipv6_to_pair(outside));
+        }
+        columns.insert("sourceIPv6Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_ipv6_ne_filter() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Named("sourceIPv6Address".to_string()),
+            negated: true,
+            value: IpValue::Addr("::".to_string()),
+        });
+        let nonzero: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let zero: std::net::Ipv6Addr = "::".parse().unwrap();
+
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U128);
+        if let ColumnBuffer::U128(ref mut v) = col {
+            v.push(ipv6_to_pair(nonzero));
+            v.push(ipv6_to_pair(zero));
+        }
+        columns.insert("sourceIPv6Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    // -----------------------------------------------------------------------
+    // MAC address string filter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mac_address_string_eq() {
+        let filter = resolve_string_filter(&StringFilterExpr {
+            field: "sourceMacAddress".to_string(),
+            op: StringOp::Eq,
+            value: "aa:bb:cc:dd:ee:ff".to_string(),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::Mac);
+        if let ColumnBuffer::Mac(ref mut v) = col {
+            v.push([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            v.push([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        }
+        columns.insert("sourceMacAddress".to_string(), col);
+
+        let resolved = ResolvedFilter::StringFilter(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_mac_address_string_ne() {
+        let filter = resolve_string_filter(&StringFilterExpr {
+            field: "sourceMacAddress".to_string(),
+            op: StringOp::Ne,
+            value: "00:00:00:00:00:00".to_string(),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::Mac);
+        if let ColumnBuffer::Mac(ref mut v) = col {
+            v.push([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            v.push([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        }
+        columns.insert("sourceMacAddress".to_string(), col);
+
+        let resolved = ResolvedFilter::StringFilter(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_mac_address_case_insensitive() {
+        let filter = resolve_string_filter(&StringFilterExpr {
+            field: "sourceMacAddress".to_string(),
+            op: StringOp::Eq,
+            value: "AA:BB:CC:DD:EE:FF".to_string(),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::Mac);
+        if let ColumnBuffer::Mac(ref mut v) = col {
+            v.push([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        }
+        columns.insert("sourceMacAddress".to_string(), col);
+
+        let resolved = ResolvedFilter::StringFilter(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+    }
+
+    // -----------------------------------------------------------------------
+    // IPv6 prefix mask helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ipv6_prefix_mask() {
+        assert_eq!(ipv6_prefix_mask(0), [0, 0]);
+        assert_eq!(ipv6_prefix_mask(64), [u64::MAX, 0]);
+        assert_eq!(ipv6_prefix_mask(128), [u64::MAX, u64::MAX]);
+        assert_eq!(ipv6_prefix_mask(32), [0xFFFF_FFFF_0000_0000, 0]);
+        assert_eq!(ipv6_prefix_mask(96), [u64::MAX, 0xFFFF_FFFF_0000_0000]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: existing src/dst IP filters still work
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_src_dst_ip_filters_still_work() {
+        // Src direction
+        let src_filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Src,
+            negated: false,
+            value: IpValue::Addr("10.0.0.1".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U32);
+        if let ColumnBuffer::U32(ref mut v) = col {
+            v.push(u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+            v.push(u32::from(std::net::Ipv4Addr::new(10, 0, 0, 2)));
+        }
+        columns.insert("sourceIPv4Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(src_filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+
+        // Dst direction
+        let dst_filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Dst,
+            negated: false,
+            value: IpValue::Addr("192.168.1.1".to_string()),
+        });
+        let mut dst_col = ColumnBuffer::new(StorageType::U32);
+        if let ColumnBuffer::U32(ref mut v) = dst_col {
+            v.push(u32::from(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+            v.push(u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        }
+        columns.insert("destinationIPv4Address".to_string(), dst_col);
+
+        let resolved = ResolvedFilter::Ip(dst_filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
     }
 }

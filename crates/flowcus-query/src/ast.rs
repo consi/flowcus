@@ -126,11 +126,13 @@ pub struct IpFilter {
     pub value: IpValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IpDirection {
     Src,
     Dst,
     Any,
+    /// Explicit column name for fields that aren't src/dst (e.g. NAT, nexthop).
+    Named(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
