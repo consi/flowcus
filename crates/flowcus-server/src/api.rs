@@ -208,6 +208,7 @@ async fn interfaces(State(state): State<AppState>) -> Json<Value> {
 
 async fn info(State(state): State<AppState>) -> Json<Value> {
     let config = state.config();
+    let metrics = state.metrics();
     Json(json!({
         "name": "flowcus",
         "version": env!("CARGO_PKG_VERSION"),
@@ -218,6 +219,12 @@ async fn info(State(state): State<AppState>) -> Json<Value> {
         },
         "storage": {
             "merge_workers": config.storage.merge_workers,
+        },
+        "merge": {
+            "queue_pending": metrics.merge_queue_pending.load(std::sync::atomic::Ordering::Relaxed),
+            "queue_active": metrics.merge_queue_active.load(std::sync::atomic::Ordering::Relaxed),
+            "queue_sealed": metrics.merge_queue_sealed.load(std::sync::atomic::Ordering::Relaxed),
+            "unmerged_parts": metrics.merge_unmerged_parts.load(std::sync::atomic::Ordering::Relaxed),
         }
     }))
 }

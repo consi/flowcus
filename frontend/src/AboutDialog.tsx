@@ -76,7 +76,7 @@ export function AboutDialog({ open, onClose, version }: AboutDialogProps) {
             </svg>
           </div>
           <p className="about-description">
-            Standalone collector and browser for IPFIX network flows.
+            Standalone collector and browser for IPFIX and NetFlow v5/v9 network flows.
             Captures, stores, and queries flow data in a single binary.
           </p>
           {version && <p className="about-version">Version {version}</p>}

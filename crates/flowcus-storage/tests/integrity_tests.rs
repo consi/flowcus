@@ -1279,6 +1279,141 @@ fn test_query_pagination_total_matching_not_capped_by_limit() {
 }
 
 // ---------------------------------------------------------------------------
+// test_merge_consolidates_all_parts_in_hour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_merge_consolidates_all_parts_in_hour() {
+    let dir = test_dir("merge_consolidate");
+    let base_time: u32 = 1_700_000_000;
+
+    // Write 4 parts in the same hour
+    for i in 0..4u8 {
+        let mut writer = tiny_flush_writer(&dir);
+        let records = vec![
+            make_record(
+                Ipv4Addr::new(10, 0, 0, i),
+                Ipv4Addr::new(192, 168, 1, i),
+                (i as u64 + 1) * 1000,
+            ),
+            make_record(
+                Ipv4Addr::new(10, 0, 1, i),
+                Ipv4Addr::new(192, 168, 2, i),
+                (i as u64 + 1) * 2000,
+            ),
+        ];
+        let msg = make_message_with_time(records, base_time + u32::from(i));
+        writer.ingest(&msg);
+        writer.flush_all();
+    }
+
+    let table = Table::open(&dir, "flows").unwrap();
+    let parts = table.list_all_parts().unwrap();
+    assert_eq!(parts.len(), 4, "should have 4 parts before merge");
+
+    let total_before: u64 = parts
+        .iter()
+        .map(|p| {
+            part::read_meta_bin(&p.path.join("meta.bin"))
+                .unwrap()
+                .row_count
+        })
+        .sum();
+    assert_eq!(total_before, 8, "total rows before merge");
+
+    // Find the hour directory
+    let hour_dir = parts[0].path.parent().unwrap().to_path_buf();
+    let table_base = dir.join("flows");
+
+    // Run merge
+    let new_part =
+        flowcus_storage::merge::merge_hour_for_test(&table_base, &hour_dir, 8192, 8192).unwrap();
+
+    // Should now have 1 part
+    let parts_after = table.list_all_parts().unwrap();
+    assert_eq!(parts_after.len(), 1, "should have 1 part after merge");
+
+    // Row count preserved
+    let meta = part::read_meta_bin(&new_part.join("meta.bin")).unwrap();
+    assert_eq!(meta.row_count, 8, "merged part must have all 8 rows");
+
+    // Generation incremented
+    assert!(meta.generation > 0, "generation should be > 0 after merge");
+
+    // Verify column files exist
+    assert!(
+        new_part
+            .join("columns")
+            .join("sourceIPv4Address.col")
+            .exists(),
+        "merged part must have column files"
+    );
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// test_merge_independent_per_hour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_merge_independent_per_hour() {
+    let dir = test_dir("merge_per_hour");
+
+    // Write 2 parts in hour 10 and 2 parts in hour 11
+    let hour10_time: u32 = 1_700_000_000; // some hour
+    let hour11_time: u32 = hour10_time + 3600; // next hour
+
+    for (time, label) in [(hour10_time, 10u8), (hour11_time, 11u8)] {
+        for i in 0..2u8 {
+            let mut writer = tiny_flush_writer(&dir);
+            let records = vec![make_record(
+                Ipv4Addr::new(10, label, 0, i),
+                Ipv4Addr::new(192, 168, label, i),
+                1000,
+            )];
+            let msg = make_message_with_time(records, time + u32::from(i));
+            writer.ingest(&msg);
+            writer.flush_all();
+        }
+    }
+
+    let table = Table::open(&dir, "flows").unwrap();
+    let parts = table.list_all_parts().unwrap();
+    assert_eq!(parts.len(), 4, "should have 4 parts total across 2 hours");
+
+    // Find distinct hour directories
+    let mut hour_dirs: Vec<PathBuf> = parts
+        .iter()
+        .map(|p| p.path.parent().unwrap().to_path_buf())
+        .collect();
+    hour_dirs.sort();
+    hour_dirs.dedup();
+    assert_eq!(hour_dirs.len(), 2, "parts should span 2 hour directories");
+
+    let table_base = dir.join("flows");
+
+    // Merge first hour only
+    flowcus_storage::merge::merge_hour_for_test(&table_base, &hour_dirs[0], 8192, 8192).unwrap();
+
+    // First hour: 1 part. Second hour: still 2 parts.
+    let parts_after = table.list_all_parts().unwrap();
+    assert_eq!(
+        parts_after.len(),
+        3,
+        "should have 3 parts (1 merged + 2 untouched)"
+    );
+
+    // Merge second hour
+    flowcus_storage::merge::merge_hour_for_test(&table_base, &hour_dirs[1], 8192, 8192).unwrap();
+
+    let parts_final = table.list_all_parts().unwrap();
+    assert_eq!(parts_final.len(), 2, "should have 2 parts (1 per hour)");
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // test_inprogress_cleanup_on_recovery
 // ---------------------------------------------------------------------------
 

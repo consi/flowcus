@@ -266,6 +266,45 @@ pub fn validate(config: &AppConfig) -> ValidationResult {
             "Must be between 60 and 86400 seconds",
         ));
     }
+    if config.storage.compression_level < 1 {
+        r.errors.push(err(
+            "storage",
+            "compression_level",
+            "Must be at least 1 (zstd minimum)",
+        ));
+    } else if config.storage.compression_level > 6 {
+        r.warnings.push(err(
+            "storage",
+            "compression_level",
+            "High compression levels may slow ingestion under heavy load",
+        ));
+    }
+    if config.storage.merge_min_parts < 2 {
+        r.errors.push(err(
+            "storage",
+            "merge_min_parts",
+            "Must be at least 2; merging requires at least two source parts",
+        ));
+    } else if config.storage.merge_min_parts > 8 {
+        r.warnings.push(err(
+            "storage",
+            "merge_min_parts",
+            "Many small parts will accumulate between merges, which may degrade query performance",
+        ));
+    }
+    if config.storage.max_aggregate_rows == 0 {
+        r.errors.push(err(
+            "storage",
+            "max_aggregate_rows",
+            "Must be greater than 0",
+        ));
+    } else if config.storage.max_aggregate_rows > 50_000_000 {
+        r.warnings.push(err(
+            "storage",
+            "max_aggregate_rows",
+            "Very high limit; aggregation queries may use multiple GB of memory",
+        ));
+    }
 
     // --- logging ---
     if config.logging.filter.trim().is_empty() {
@@ -522,6 +561,36 @@ pub fn schema() -> SettingsSchema {
                         default_value: dj["storage"]["storage_cache_bytes"].clone(),
                         restart_required: true,
                     },
+                    SettingDescriptor {
+                        section: "storage",
+                        key: "compression_level",
+                        label: "Compression Level",
+                        description: "Zstd compression level for new parts.",
+                        guidance: "Lower levels write faster at the cost of larger files. Higher levels compress better but slow down ingestion flushes. Level 3 is recommended for most workloads.",
+                        control: ControlType::Number {
+                            min: Some(1.0),
+                            max: None,
+                            step: Some(1.0),
+                            unit: "",
+                        },
+                        default_value: dj["storage"]["compression_level"].clone(),
+                        restart_required: true,
+                    },
+                    SettingDescriptor {
+                        section: "storage",
+                        key: "max_aggregate_rows",
+                        label: "Max Aggregate Rows",
+                        description: "Maximum rows matched during an aggregation query before it is rejected.",
+                        guidance: "Higher values allow larger aggregations but risk high memory use. 10M rows ≈ 120 MB.",
+                        control: ControlType::Number {
+                            min: Some(1.0),
+                            max: None,
+                            step: Some(100_000.0),
+                            unit: "rows",
+                        },
+                        default_value: dj["storage"]["max_aggregate_rows"].clone(),
+                        restart_required: false,
+                    },
                 ],
             },
             SectionDescriptor {
@@ -589,17 +658,32 @@ pub fn schema() -> SettingsSchema {
                     },
                     SettingDescriptor {
                         section: "storage",
-                        key: "merge_max_batch_size",
-                        label: "Merge Batch Size",
-                        description: "Maximum number of parts merged in a single batch.",
-                        guidance: "Limits memory during merge. Lower values reduce peak memory but require more merge rounds to converge.",
+                        key: "merge_queue_length",
+                        label: "Merge Queue Length",
+                        description: "Maximum number of merge jobs queued at once.",
+                        guidance: "Controls how many hours can be queued for merge simultaneously. Higher values allow more batching but use more memory for tracking.",
+                        control: ControlType::Number {
+                            min: Some(1.0),
+                            max: Some(64.0),
+                            step: Some(1.0),
+                            unit: "jobs",
+                        },
+                        default_value: dj["storage"]["merge_queue_length"].clone(),
+                        restart_required: true,
+                    },
+                    SettingDescriptor {
+                        section: "storage",
+                        key: "merge_min_parts",
+                        label: "Min Parts to Merge",
+                        description: "Minimum number of parts in an hour before a merge is triggered.",
+                        guidance: "Higher values batch more parts per merge, reducing merge overhead but leaving data fragmented longer.",
                         control: ControlType::Number {
                             min: Some(2.0),
-                            max: Some(64.0),
+                            max: None,
                             step: Some(1.0),
                             unit: "parts",
                         },
-                        default_value: dj["storage"]["merge_max_batch_size"].clone(),
+                        default_value: dj["storage"]["merge_min_parts"].clone(),
                         restart_required: true,
                     },
                     SettingDescriptor {

@@ -98,6 +98,10 @@ impl AppState {
         self.inner.config.storage.granule_size
     }
 
+    pub fn max_aggregate_rows(&self) -> usize {
+        self.inner.config.storage.max_aggregate_rows
+    }
+
     /// Access the query result cache.
     pub fn query_cache(&self) -> &QueryCache {
         &self.inner.query_cache

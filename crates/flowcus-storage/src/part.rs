@@ -635,7 +635,7 @@ pub struct PartMetadataHeader {
 
 // ---- Column file writing ----
 
-fn write_column_file(
+pub(crate) fn write_column_file(
     path: &Path,
     def: &ColumnDef,
     encoded: &EncodedColumn,
@@ -890,7 +890,19 @@ impl PartWriter {
         })
     }
 
+    /// Path to the columns subdirectory inside the in-progress staging dir.
+    pub fn col_dir(&self) -> &Path {
+        &self.col_dir
+    }
+
+    /// Add a pre-written column's metadata to the index (for parallel column writes
+    /// where each thread writes files directly, then registers the index entry).
+    pub fn add_index_entry(&mut self, def: ColumnDef, encoded: EncodedColumn) {
+        self.index_entries.push((def, encoded));
+    }
+
     /// Write a single column (data, marks, bloom filter) to the in-progress directory.
+    #[allow(dead_code)]
     pub fn write_column(
         &mut self,
         data: &ColumnWriteData,

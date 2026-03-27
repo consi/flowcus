@@ -98,6 +98,7 @@ async fn main() -> Result<()> {
         initial_row_capacity: config.storage.initial_row_capacity,
         partition_duration_secs: config.storage.partition_duration_secs,
         channel_capacity: config.storage.channel_capacity,
+        compression_level: config.storage.compression_level,
     };
 
     let storage_dir = Path::new(&config.storage.dir);
@@ -143,7 +144,9 @@ async fn main() -> Result<()> {
         partition_duration_secs: config.storage.partition_duration_secs,
         granule_size: config.storage.granule_size,
         bloom_bits: config.storage.bloom_bits_per_granule,
-        max_batch_size: config.storage.merge_max_batch_size,
+        queue_length: config.storage.merge_queue_length,
+        compression_level: config.storage.compression_level,
+        min_parts: config.storage.merge_min_parts,
     };
     let part_locks = flowcus_storage::part_locks::PartLocks::new();
     flowcus_storage::merge::start(

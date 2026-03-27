@@ -37,13 +37,12 @@ use crate::table::{PartEntry, Table};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Maximum aggregate matching rows before the query is rejected to prevent OOM.
-const AGG_MAX_MATCHING_ROWS: usize = 10_000_000;
-
 /// The query executor: reads parts from disk and evaluates queries.
 pub struct QueryExecutor {
     table_base: PathBuf,
     granule_size: usize,
+    /// Maximum rows matched during an aggregation before the query is rejected.
+    max_aggregate_rows: usize,
     cache: Arc<StorageCache>,
     part_locks: crate::part_locks::PartLocks,
 }
@@ -1863,11 +1862,15 @@ fn deduplicate_parts(parts: &mut Vec<PartEntry>, plan: &mut ExecutionPlan) {
 // ---------------------------------------------------------------------------
 
 impl QueryExecutor {
+    /// Default maximum aggregate rows (10M ≈ 120 MB).
+    pub const DEFAULT_MAX_AGGREGATE_ROWS: usize = 10_000_000;
+
     /// Create a new executor for the given storage directory.
     pub fn new(storage_dir: &Path, granule_size: usize) -> Self {
         Self {
             table_base: storage_dir.join("flows"),
             granule_size,
+            max_aggregate_rows: Self::DEFAULT_MAX_AGGREGATE_ROWS,
             cache: Arc::new(StorageCache::default()),
             part_locks: crate::part_locks::PartLocks::new(),
         }
@@ -1876,12 +1879,14 @@ impl QueryExecutor {
     pub fn with_cache(
         storage_dir: &Path,
         granule_size: usize,
+        max_aggregate_rows: usize,
         cache: Arc<StorageCache>,
         part_locks: crate::part_locks::PartLocks,
     ) -> Self {
         Self {
             table_base: storage_dir.join("flows"),
             granule_size,
+            max_aggregate_rows,
             cache,
             part_locks,
         }
@@ -2313,14 +2318,14 @@ impl QueryExecutor {
             }
 
             // Guard: cap aggregate memory to prevent OOM on huge time ranges.
-            // 10M matching indices ≈ ~120 MB; beyond this is likely a mistake.
-            if agg_matching_indices.len() > AGG_MAX_MATCHING_ROWS {
+            if agg_matching_indices.len() > self.max_aggregate_rows {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!(
-                        "Aggregate query matched {} rows, exceeding limit of {AGG_MAX_MATCHING_ROWS}. \
+                        "Aggregate query matched {} rows, exceeding limit of {}. \
                          Narrow the time range or add filters.",
-                        agg_matching_indices.len()
+                        agg_matching_indices.len(),
+                        self.max_aggregate_rows
                     ),
                 ));
             }

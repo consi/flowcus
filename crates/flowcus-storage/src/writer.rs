@@ -36,6 +36,8 @@ pub struct WriterConfig {
     pub partition_duration_secs: u32,
     /// Ingestion channel capacity.
     pub channel_capacity: usize,
+    /// Zstd compression level for new parts (1-22, default 3).
+    pub compression_level: i32,
 }
 
 impl Default for WriterConfig {
@@ -46,6 +48,7 @@ impl Default for WriterConfig {
             initial_row_capacity: 65536,
             partition_duration_secs: 3600, // 1 hour
             channel_capacity: 8192,
+            compression_level: crate::codec::DEFAULT_ZSTD_LEVEL,
         }
     }
 }
@@ -324,7 +327,7 @@ impl StorageWriter {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let base_dir = self.table.base_dir().to_path_buf();
 
-        match flush_schema_buffer(buf, &base_dir, seq) {
+        match flush_schema_buffer(buf, &base_dir, seq, self.config.compression_level) {
             Ok(path) => {
                 let rows = buf.row_count;
                 let bytes = buf.mem_size();
@@ -425,12 +428,17 @@ const INGESTION_GRANULE_SIZE: usize = 8192;
 const INGESTION_BLOOM_BITS: usize = 8192;
 
 /// Encode columns, compute granules, and write a part to disk.
-fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io::Result<PathBuf> {
+fn flush_schema_buffer(
+    buf: &SchemaBuffer,
+    base_dir: &Path,
+    seq: u32,
+    compression_level: i32,
+) -> std::io::Result<PathBuf> {
     let mut column_data = Vec::with_capacity(buf.schema.columns.len());
     let mut disk_bytes: u64 = 0;
 
     for (def, col_buf) in buf.schema.columns.iter().zip(buf.columns.iter()) {
-        let encoded = codec::encode_v2(col_buf, def);
+        let encoded = codec::encode_v2_level(col_buf, def, compression_level);
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
         let (marks, blooms) = crate::granule::compute_granules(

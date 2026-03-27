@@ -96,9 +96,9 @@ pub struct StorageConfig {
     /// Maximum system memory usage fraction (0.0-1.0) before throttling merges.
     #[serde(default = "default_merge_mem_throttle")]
     pub merge_mem_throttle: f64,
-    /// Maximum parts per merge batch. Limits memory during merge. Default 8.
-    #[serde(default = "default_merge_max_batch_size")]
-    pub merge_max_batch_size: usize,
+    /// Maximum number of merge jobs in the queue. Default 8.
+    #[serde(default = "default_merge_queue_length", alias = "merge_max_batch_size")]
+    pub merge_queue_length: usize,
     /// Granule size in rows. Marks and bloom filters are computed per granule.
     /// Smaller = more precise seeking but more index overhead.
     #[serde(default = "default_granule_size")]
@@ -117,6 +117,15 @@ pub struct StorageConfig {
     /// How often the retention worker scans for expired parts (seconds).
     #[serde(default = "default_retention_scan_interval_secs")]
     pub retention_scan_interval_secs: u64,
+    /// Zstd compression level for new parts. Lower = faster writes, higher = smaller files.
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
+    /// Minimum number of parts in an hour before a merge is triggered.
+    #[serde(default = "default_merge_min_parts")]
+    pub merge_min_parts: usize,
+    /// Maximum rows matched during an aggregation query before rejection.
+    #[serde(default = "default_max_aggregate_rows")]
+    pub max_aggregate_rows: usize,
 }
 
 fn default_storage_dir() -> String {
@@ -159,7 +168,7 @@ const fn default_merge_mem_throttle() -> f64 {
     0.85
 }
 
-const fn default_merge_max_batch_size() -> usize {
+const fn default_merge_queue_length() -> usize {
     8
 }
 
@@ -183,6 +192,18 @@ const fn default_retention_scan_interval_secs() -> u64 {
     900 // 15 minutes
 }
 
+const fn default_compression_level() -> i32 {
+    3
+}
+
+const fn default_merge_min_parts() -> usize {
+    2
+}
+
+const fn default_max_aggregate_rows() -> usize {
+    10_000_000
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -196,12 +217,15 @@ impl Default for StorageConfig {
             merge_scan_interval_secs: default_merge_scan_interval_secs(),
             merge_cpu_throttle: default_merge_cpu_throttle(),
             merge_mem_throttle: default_merge_mem_throttle(),
-            merge_max_batch_size: default_merge_max_batch_size(),
+            merge_queue_length: default_merge_queue_length(),
             granule_size: default_granule_size(),
             bloom_bits_per_granule: default_bloom_bits_per_granule(),
             storage_cache_bytes: default_storage_cache_bytes(),
             retention_hours: default_retention_hours(),
             retention_scan_interval_secs: default_retention_scan_interval_secs(),
+            compression_level: default_compression_level(),
+            merge_min_parts: default_merge_min_parts(),
+            max_aggregate_rows: default_max_aggregate_rows(),
         }
     }
 }
@@ -223,7 +247,7 @@ fn default_frontend_proxy() -> String {
 }
 
 fn default_ipfix_host() -> String {
-    "0.0.0.0".to_string()
+    "::".to_string()
 }
 
 const fn default_ipfix_port() -> u16 {

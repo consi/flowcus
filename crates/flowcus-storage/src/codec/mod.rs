@@ -329,17 +329,27 @@ fn hint_for_data_type(dt: DataType) -> Option<CodecHint> {
 /// rarely read (bloom/mark skipping), so we favour smaller disk footprint.
 const COMPRESS_MIN_SIZE: usize = 32;
 
-/// Zstd compression level — level 3 provides good ratio with fast decode.
-const ZSTD_LEVEL: i32 = 3;
+/// Default zstd compression level — level 3 provides good ratio with fast decode.
+/// Used when no explicit level is provided (e.g. migration path).
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 /// Encode a column buffer for v1 parts (LZ4 compression).
 pub fn encode(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
-    encode_with_version(buffer, col, 1)
+    encode_with_level(buffer, col, 1, DEFAULT_ZSTD_LEVEL)
 }
 
-/// Encode a column buffer for v2 parts (zstd compression).
+/// Encode a column buffer for v2 parts (zstd compression) at the default level.
 pub fn encode_v2(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
-    encode_with_version(buffer, col, 2)
+    encode_with_level(buffer, col, 2, DEFAULT_ZSTD_LEVEL)
+}
+
+/// Encode a column buffer for v2 parts with a configurable zstd compression level.
+pub fn encode_v2_level(
+    buffer: &ColumnBuffer,
+    col: &ColumnDef,
+    compression_level: i32,
+) -> EncodedColumn {
+    encode_with_level(buffer, col, 2, compression_level)
 }
 
 /// Encode a column buffer, selecting codec via static hint or heuristic fallback.
@@ -347,7 +357,12 @@ pub fn encode_v2(buffer: &ColumnBuffer, col: &ColumnDef) -> EncodedColumn {
 /// When `col` provides a known IPFIX field, the optimal codec is selected
 /// statically (no data sampling). Unknown fields fall back to heuristic analysis.
 /// `part_version` determines whether LZ4 (v1) or zstd (v2+) compression is used.
-fn encode_with_version(buffer: &ColumnBuffer, col: &ColumnDef, part_version: u32) -> EncodedColumn {
+fn encode_with_level(
+    buffer: &ColumnBuffer,
+    col: &ColumnDef,
+    part_version: u32,
+    zstd_level: i32,
+) -> EncodedColumn {
     let hint = hint_for_column(col);
 
     let mut encoded = match buffer {
@@ -366,7 +381,7 @@ fn encode_with_version(buffer: &ColumnBuffer, col: &ColumnDef, part_version: u32
         let force = hint.is_some_and(|h| {
             h.compression == CompressionType::Lz4 || h.compression == CompressionType::Zstd
         });
-        encoded = try_compress_zstd(encoded, force);
+        encoded = try_compress_zstd(encoded, force, zstd_level);
     } else {
         let force_lz4 = hint.is_some_and(|h| h.compression == CompressionType::Lz4);
         encoded = try_compress_lz4(encoded, force_lz4);
@@ -446,7 +461,7 @@ fn try_compress_lz4(mut encoded: EncodedColumn, force: bool) -> EncodedColumn {
 }
 
 /// Apply zstd compression if it actually reduces size.
-fn try_compress_zstd(mut encoded: EncodedColumn, force: bool) -> EncodedColumn {
+fn try_compress_zstd(mut encoded: EncodedColumn, force: bool, level: i32) -> EncodedColumn {
     if !force && encoded.data.len() < COMPRESS_MIN_SIZE {
         return encoded;
     }
@@ -455,7 +470,7 @@ fn try_compress_zstd(mut encoded: EncodedColumn, force: bool) -> EncodedColumn {
         return encoded;
     }
 
-    match zstd::bulk::compress(&encoded.data, ZSTD_LEVEL) {
+    match zstd::bulk::compress(&encoded.data, level) {
         Ok(compressed) if compressed.len() < encoded.data.len() => {
             encoded.uncompressed_size = encoded.data.len();
             encoded.data = compressed;

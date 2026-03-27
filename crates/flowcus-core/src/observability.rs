@@ -58,6 +58,18 @@ pub struct Metrics {
     pub merge_active_workers: AtomicI64,
     pub merge_pending_hours: AtomicI64,
     pub merge_throttled_count: AtomicU64,
+    /// Merge jobs queued but not yet started.
+    pub merge_queue_pending: AtomicI64,
+    /// Merge jobs currently executing.
+    pub merge_queue_active: AtomicI64,
+    /// Cumulative hours sealed (converged to 1 part).
+    pub merge_queue_sealed: AtomicU64,
+    /// Total unmerged parts across all dirty hours.
+    pub merge_unmerged_parts: AtomicI64,
+    /// Total columns processed across all merges.
+    pub merge_columns_processed: AtomicU64,
+    /// Cumulative merge job duration in milliseconds.
+    pub merge_job_duration_ms: AtomicU64,
 
     // ---- Storage state ----
     pub storage_parts_total: AtomicI64,
@@ -129,6 +141,12 @@ impl Metrics {
             merge_active_workers: AtomicI64::new(0),
             merge_pending_hours: AtomicI64::new(0),
             merge_throttled_count: AtomicU64::new(0),
+            merge_queue_pending: AtomicI64::new(0),
+            merge_queue_active: AtomicI64::new(0),
+            merge_queue_sealed: AtomicU64::new(0),
+            merge_unmerged_parts: AtomicI64::new(0),
+            merge_columns_processed: AtomicU64::new(0),
+            merge_job_duration_ms: AtomicU64::new(0),
 
             storage_parts_total: AtomicI64::new(0),
             storage_parts_gen0: AtomicI64::new(0),
@@ -264,6 +282,30 @@ impl Metrics {
             (
                 "merge_throttled",
                 self.merge_throttled_count.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_queue_pending",
+                self.merge_queue_pending.load(Ordering::Relaxed),
+            ),
+            (
+                "merge_queue_active",
+                self.merge_queue_active.load(Ordering::Relaxed),
+            ),
+            (
+                "merge_queue_sealed",
+                self.merge_queue_sealed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_unmerged_parts",
+                self.merge_unmerged_parts.load(Ordering::Relaxed),
+            ),
+            (
+                "merge_columns_processed",
+                self.merge_columns_processed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_job_duration_ms",
+                self.merge_job_duration_ms.load(Ordering::Relaxed) as i64,
             ),
             (
                 "storage_parts_total",
@@ -528,6 +570,42 @@ impl Metrics {
             "flowcus_merge_throttled_total",
             "Times merge was throttled by CPU/memory pressure",
             &self.merge_throttled_count,
+        );
+        gauge_i(
+            &mut out,
+            "flowcus_merge_queue_pending",
+            "Merge jobs queued but not yet started",
+            &self.merge_queue_pending,
+        );
+        gauge_i(
+            &mut out,
+            "flowcus_merge_queue_active",
+            "Merge jobs currently executing",
+            &self.merge_queue_active,
+        );
+        counter(
+            &mut out,
+            "flowcus_merge_queue_sealed_total",
+            "Hours sealed (converged to single part)",
+            &self.merge_queue_sealed,
+        );
+        gauge_i(
+            &mut out,
+            "flowcus_merge_unmerged_parts",
+            "Total unmerged parts across all dirty hours",
+            &self.merge_unmerged_parts,
+        );
+        counter(
+            &mut out,
+            "flowcus_merge_columns_processed_total",
+            "Total columns processed by merge operations",
+            &self.merge_columns_processed,
+        );
+        counter(
+            &mut out,
+            "flowcus_merge_job_duration_ms_total",
+            "Cumulative merge job duration in milliseconds",
+            &self.merge_job_duration_ms,
         );
 
         // Storage

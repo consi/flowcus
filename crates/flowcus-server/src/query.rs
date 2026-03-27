@@ -434,6 +434,7 @@ async fn execute_query(
 
     let storage_dir = state.storage_dir().to_string();
     let granule_size = state.granule_size();
+    let max_aggregate_rows = state.max_aggregate_rows();
     let query_clone = query.clone();
 
     let storage_cache = state.storage_cache().clone();
@@ -442,6 +443,7 @@ async fn execute_query(
         let executor = flowcus_storage::executor::QueryExecutor::with_cache(
             Path::new(&storage_dir),
             granule_size,
+            max_aggregate_rows,
             storage_cache,
             part_locks,
         );
@@ -1324,6 +1326,7 @@ async fn get_row_by_id(
 
     let storage_dir = state.storage_dir().to_string();
     let granule_size = state.granule_size();
+    let max_aggregate_rows = state.max_aggregate_rows();
     let storage_cache = state.storage_cache().clone();
     let part_locks = state.part_locks().clone();
 
@@ -1331,6 +1334,7 @@ async fn get_row_by_id(
         let executor = flowcus_storage::executor::QueryExecutor::with_cache(
             Path::new(&storage_dir),
             granule_size,
+            max_aggregate_rows,
             storage_cache,
             part_locks,
         );
@@ -1682,6 +1686,7 @@ async fn stats_histogram(
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let storage_dir = state.storage_dir().to_string();
     let granule_size = state.granule_size();
+    let max_aggregate_rows = state.max_aggregate_rows();
     let storage_cache = state.storage_cache().clone();
     let part_locks = state.part_locks().clone();
     let has_filters = !req.filters.is_empty();
@@ -1762,6 +1767,7 @@ async fn stats_histogram(
         let executor = flowcus_storage::executor::QueryExecutor::with_cache(
             Path::new(&storage_dir),
             granule_size,
+            max_aggregate_rows,
             storage_cache,
             part_locks,
         );
