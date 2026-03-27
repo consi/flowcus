@@ -2,7 +2,7 @@
 
 High-performance NetFlow/IPFIX flow collector with columnar storage and built-in query engine. Single binary, zero external dependencies.
 
-![Flowcus](screenshot.png)
+![Flowcus](screenshot.jpg)
 
 Collects NetFlow (RFC 3954) v5/v9 and IPFIX (RFC 7011) over UDP/TCP, stores flows in a compressed columnar format with automatic compaction, and serves a web UI for real-time analysis.
 
