@@ -90,6 +90,16 @@ pub enum PlanStep {
     PartSkippedMerge {
         path: String,
     },
+    PartSkippedIncomplete {
+        path: String,
+    },
+    PartSkippedMerging {
+        path: String,
+    },
+    PartSkippedSubsumed {
+        path: String,
+        subsumed_by: String,
+    },
 }
 
 /// Query result with rows, columns, and the execution plan.
@@ -1038,6 +1048,60 @@ fn json_f64(v: f64) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// Part deduplication: skip gen-0 parts subsumed by higher-gen parts
+// ---------------------------------------------------------------------------
+
+/// Remove parts whose time range is fully covered by a higher-generation part.
+///
+/// After a merge, a higher-generation part contains all data from the
+/// lower-generation parts it was built from.  If both are visible at query
+/// time we would double-count rows.  This function marks the lower-gen part
+/// as subsumed and removes it from the list, recording skip steps in the
+/// execution plan.
+fn deduplicate_parts(parts: &mut Vec<PartEntry>, plan: &mut ExecutionPlan) {
+    let len = parts.len();
+    let mut to_remove = vec![false; len];
+    let mut subsumed_by: Vec<Option<usize>> = vec![None; len];
+
+    for i in 0..len {
+        if to_remove[i] {
+            continue;
+        }
+        for j in 0..len {
+            if i == j || to_remove[j] {
+                continue;
+            }
+            if parts[j].generation > parts[i].generation
+                && parts[j].time_min <= parts[i].time_min
+                && parts[j].time_max >= parts[i].time_max
+            {
+                to_remove[i] = true;
+                subsumed_by[i] = Some(j);
+                break;
+            }
+        }
+    }
+
+    // Record plan steps before removing
+    for i in 0..len {
+        if to_remove[i] {
+            let by_idx = subsumed_by[i].unwrap_or(0);
+            plan.steps.push(PlanStep::PartSkippedSubsumed {
+                path: parts[i].path.display().to_string(),
+                subsumed_by: parts[by_idx].path.display().to_string(),
+            });
+        }
+    }
+
+    let mut idx = 0;
+    parts.retain(|_| {
+        let keep = !to_remove[idx];
+        idx += 1;
+        keep
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Query Executor implementation
 // ---------------------------------------------------------------------------
 
@@ -1104,13 +1168,25 @@ impl QueryExecutor {
             })
             .collect();
 
-        // Step 5: Process parts
+        // Step 5: Deduplicate parts (skip lower-gen parts subsumed by higher-gen)
+        let mut filtered_parts = filtered_parts;
+        deduplicate_parts(&mut filtered_parts, &mut plan);
+
+        // Step 6: Process parts
         let mut all_rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
         let mut total_rows_scanned: u64 = 0;
         let mut parts_skipped_by_index: usize = 0;
         let mut parts_skipped_by_merge: usize = 0;
 
         for part_entry in &filtered_parts {
+            // Skip parts with .merging marker (merge output being staged)
+            if part_entry.path.join(".merging").exists() {
+                parts_skipped_by_merge += 1;
+                plan.steps.push(PlanStep::PartSkippedMerging {
+                    path: part_entry.path.display().to_string(),
+                });
+                continue;
+            }
             let part_result = self.process_part(
                 part_entry,
                 &filters,
@@ -1128,11 +1204,25 @@ impl QueryExecutor {
                     all_rows.extend(rows);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug!(
-                        error = %e,
-                        part = %part_entry.path.display(),
-                        "Part not found (likely merged away), skipping"
-                    );
+                    // Check if a higher-gen part subsumes this one (data is safe)
+                    let subsumed = filtered_parts.iter().any(|other| {
+                        other.generation > part_entry.generation
+                            && other.time_min <= part_entry.time_min
+                            && other.time_max >= part_entry.time_max
+                    });
+                    if subsumed {
+                        debug!(
+                            error = %e,
+                            part = %part_entry.path.display(),
+                            "Part not found but subsumed by higher-gen part, skipping"
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            part = %part_entry.path.display(),
+                            "Part not found and no higher-gen part covers it — data may be temporarily unavailable during merge"
+                        );
+                    }
                     parts_skipped_by_merge += 1;
                     plan.steps.push(PlanStep::PartSkippedMerge {
                         path: part_entry.path.display().to_string(),
@@ -1610,6 +1700,23 @@ impl QueryExecutor {
         let meta = part::read_meta_bin(&part_dir.join("meta.bin"))?;
         let row_count = meta.row_count as usize;
 
+        // Skip incomplete parts (directory created but columns not yet written)
+        match part::list_columns(part_dir) {
+            Ok(cols) if cols.is_empty() => {
+                plan.steps.push(PlanStep::PartSkippedIncomplete {
+                    path: part_dir.display().to_string(),
+                });
+                return Ok(ProcessPartResult::Skipped);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                plan.steps.push(PlanStep::PartSkippedIncomplete {
+                    path: part_dir.display().to_string(),
+                });
+                return Ok(ProcessPartResult::Skipped);
+            }
+            _ => {} // has columns or other error — proceed
+        }
+
         // Read schema to know column types
         let schema = match part::read_schema_bin(&part_dir.join("schema.bin")) {
             Ok(s) => s,
@@ -1830,5 +1937,155 @@ impl QueryExecutor {
             rows: matching_rows,
             rows_scanned: row_count as u64,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_part(generation: u32, time_min: u32, time_max: u32, seq: u32) -> PartEntry {
+        PartEntry {
+            path: PathBuf::from(format!(
+                "/tmp/test/{generation:05}_{time_min}_{time_max}_{seq:06}"
+            )),
+            generation,
+            time_min,
+            time_max,
+            seq,
+        }
+    }
+
+    fn empty_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            steps: Vec::new(),
+            parts_total: 0,
+            parts_skipped_by_time: 0,
+            parts_skipped_by_index: 0,
+            granules_total: 0,
+            granules_skipped_by_bloom: 0,
+            granules_skipped_by_marks: 0,
+            columns_to_read: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_removes_subsumed_parts() {
+        // gen-0 part fully covered by gen-1 part -> gen-0 removed
+        let mut parts = vec![
+            make_part(0, 1000, 2000, 1),
+            make_part(0, 2000, 3000, 2),
+            make_part(1, 1000, 3000, 3), // covers both gen-0 parts
+        ];
+        let mut plan = empty_plan();
+        deduplicate_parts(&mut parts, &mut plan);
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].generation, 1);
+        assert_eq!(parts[0].seq, 3);
+        // Two subsumed steps recorded
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|s| matches!(s, PlanStep::PartSkippedSubsumed { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_keeps_non_overlapping() {
+        // gen-0 part NOT covered by gen-1 -> both kept
+        let mut parts = vec![
+            make_part(0, 5000, 6000, 1), // outside gen-1's range
+            make_part(1, 1000, 3000, 2),
+        ];
+        let mut plan = empty_plan();
+        deduplicate_parts(&mut parts, &mut plan);
+
+        assert_eq!(parts.len(), 2);
+        assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_partial_overlap_kept() {
+        // gen-0 part partially overlaps gen-1 -> both kept
+        let mut parts = vec![
+            make_part(0, 2500, 4000, 1), // extends beyond gen-1's max
+            make_part(1, 1000, 3000, 2),
+        ];
+        let mut plan = empty_plan();
+        deduplicate_parts(&mut parts, &mut plan);
+
+        assert_eq!(parts.len(), 2);
+        assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_same_generation_not_removed() {
+        // Two gen-0 parts with overlapping ranges — neither should be removed
+        let mut parts = vec![make_part(0, 1000, 2000, 1), make_part(0, 1000, 2000, 2)];
+        let mut plan = empty_plan();
+        deduplicate_parts(&mut parts, &mut plan);
+
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_exact_time_match() {
+        // gen-1 has exact same time range as gen-0 -> gen-0 subsumed
+        let mut parts = vec![make_part(0, 1000, 2000, 1), make_part(1, 1000, 2000, 2)];
+        let mut plan = empty_plan();
+        deduplicate_parts(&mut parts, &mut plan);
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].generation, 1);
+    }
+
+    #[test]
+    fn test_empty_part_skipped() {
+        // Create a temporary part directory with meta.bin but no columns
+        let tmp = std::env::temp_dir().join("flowcus_test_empty_part_skipped");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let part_dir = tmp.join("00000_1000_2000_000001");
+        std::fs::create_dir_all(part_dir.join("columns")).unwrap();
+
+        // Write a minimal meta.bin (256 bytes) with valid CRC
+        let mut meta = vec![0u8; 256];
+        meta[0..4].copy_from_slice(b"FMTA");
+        meta[4] = 1; // version
+        meta[8..16].copy_from_slice(&100u64.to_le_bytes()); // row_count
+        meta[16..20].copy_from_slice(&0u32.to_le_bytes()); // generation
+        meta[20..24].copy_from_slice(&1000u32.to_le_bytes()); // time_min
+        meta[24..28].copy_from_slice(&2000u32.to_le_bytes()); // time_max
+        // CRC32-C of bytes 0..80 stored at bytes 80..84
+        let crc = crate::crc::crc32c(&meta[..80]);
+        meta[80..84].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(part_dir.join("meta.bin"), &meta).unwrap();
+
+        // No column files in columns/ — part should be skipped as incomplete
+        let executor = QueryExecutor::new(&tmp, 8192);
+        let part_entry = PartEntry {
+            path: part_dir.clone(),
+            generation: 0,
+            time_min: 1000,
+            time_max: 2000,
+            seq: 1,
+        };
+
+        let mut plan = empty_plan();
+        let result = executor.process_part(&part_entry, &[], &[], false, &mut plan);
+        assert!(matches!(result, Ok(ProcessPartResult::Skipped)));
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::PartSkippedIncomplete { .. }))
+        );
     }
 }

@@ -41,7 +41,11 @@
       "Bash(find frontend/src/ -name *.ts -o -name *.tsx)",
       "Bash(git -C /home/consi/Devel/flowcus status crates/flowcus-query/)",
       "Bash(echo \"exit: $?\")",
-      "Bash(grep -r \"flowcus.worker\\\\|WorkerPool\\\\|WorkerPoolHandle\" crates/ --include=*.rs --include=*.toml)"
+      "Bash(grep -r \"flowcus.worker\\\\|WorkerPool\\\\|WorkerPoolHandle\" crates/ --include=*.rs --include=*.toml)",
+      "Bash(curl -s -X POST http://localhost:2137/api/query -H 'Content-Type: application/json' -d '{\"\"\"\"query\"\"\"\":\"\"\"\"last 1h | top 10 by sum\\(bytes\\)\"\"\"\"}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST http://localhost:2137/api/query -H 'Content-Type: application/json' -d \"{\"\"query\"\":\"\"last 1h | top 10 by sum\\(bytes\\)\"\"}\")",
+      "Bash(python3 -c \":*)"
     ]
   }
 }
