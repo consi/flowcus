@@ -10,11 +10,6 @@
 # port = 2137
 # dev_mode = false
 
-[worker]
-# async_workers = <num_cpus>
-# cpu_workers = <num_cpus>
-# queue_capacity = 1024
-
 [ipfix]
 # host = "0.0.0.0"
 # port = 4739

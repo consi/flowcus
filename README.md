@@ -4,13 +4,12 @@ IPFIX collector with columnar storage and a query system for network flow analys
 
 ## Architecture
 
-Six Rust crates, single-binary deployment:
+Five Rust crates, single-binary deployment:
 
 ```
 flowcus/
 ├── crates/
 │   ├── flowcus-core/       # Config, error types, telemetry, observability, profiling
-│   ├── flowcus-worker/     # CPU (rayon) + async (tokio) worker pools
 │   ├── flowcus-ipfix/      # IPFIX protocol: wire parsing, IE registry, templates, listener
 │   ├── flowcus-storage/    # Columnar storage engine: codecs, parts, merge, granule indexes
 │   ├── flowcus-server/     # Axum web server, API routes, embedded frontend assets
@@ -22,9 +21,8 @@ flowcus/
 ### Threading Model
 
 - **Tokio runtime** handles all async I/O (HTTP, IPFIX listeners, merge coordination)
-- **Rayon thread pool** handles CPU-bound work (column encoding, merge operations)
-- **Crossbeam channels** bridge async-to-sync boundaries
-- **Tokio semaphore** bounds async task concurrency
+- **`tokio::task::spawn_blocking`** handles CPU-bound work (column encoding, merge operations)
+- **Tokio semaphore** bounds concurrent merge task count
 
 ## Storage Engine
 
@@ -59,7 +57,7 @@ storage/flows/{YYYY}/{MM}/{DD}/{HH}/{gen}_{min_ts}_{max_ts}_{seq}/
 
 Parts are immutable once written. The background merge system compacts parts within time partitions:
 - Coordinator (async task) scans hour directories, builds merge plans, dispatches work
-- Workers (rayon pool) execute CPU-bound column merges
+- Workers (tokio spawn_blocking) execute CPU-bound column merges
 - Throttle monitors system CPU/memory load to avoid starving ingestion
 - Generation increments on each merge: `00000` -> `00001` -> ... (max 65535)
 - Current hour: merge same-generation parts into fewer larger parts
@@ -127,11 +125,6 @@ When `dev_mode = true`, captures 10-second performance snapshots to `profiling/`
 # host = "0.0.0.0"
 # port = 2137
 # dev_mode = false
-
-[worker]
-# async_workers = <num_cpus>
-# cpu_workers = <num_cpus>
-# queue_capacity = 1024
 
 [ipfix]
 # host = "0.0.0.0"

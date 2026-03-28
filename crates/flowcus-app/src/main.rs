@@ -10,7 +10,6 @@ use flowcus_core::{AppConfig, LogFormat, observability, profiling, telemetry};
 use flowcus_ipfix::IpfixListener;
 use flowcus_server::state::AppState;
 use flowcus_storage::{MergeConfig, WriterConfig};
-use flowcus_worker::WorkerPool;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -84,13 +83,6 @@ async fn main() -> Result<()> {
     let profiler = Arc::new(std::sync::Mutex::new(profiler));
     profiling::start(Arc::clone(&profiler));
 
-    // Worker pool
-    let pool = WorkerPool::new(&config.worker)?;
-    let handle = pool.handle();
-    std::thread::Builder::new()
-        .name("cpu-dispatch".into())
-        .spawn(move || pool.run_cpu_dispatch())?;
-
     // Storage
     let writer_config = WriterConfig {
         flush_bytes: config.storage.flush_bytes,
@@ -151,7 +143,7 @@ async fn main() -> Result<()> {
     );
 
     // HTTP server with observability endpoint
-    let state = AppState::new(config.clone(), handle, metrics);
+    let state = AppState::new(config.clone(), metrics);
     flowcus_server::serve(&config.server, state).await?;
 
     Ok(())

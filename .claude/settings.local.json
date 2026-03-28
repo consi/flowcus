@@ -40,7 +40,8 @@
       "Bash(find crates/flowcus-query/ crates/flowcus-server/src/query.rs -name *.rs)",
       "Bash(find frontend/src/ -name *.ts -o -name *.tsx)",
       "Bash(git -C /home/consi/Devel/flowcus status crates/flowcus-query/)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(grep -r \"flowcus.worker\\\\|WorkerPool\\\\|WorkerPoolHandle\" crates/ --include=*.rs --include=*.toml)"
     ]
   }
 }

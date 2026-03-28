@@ -1,5 +1,5 @@
 # Threading Model
 **Context:** How concurrency is structured in Flowcus
-**Decision/Pattern:** Two-tier worker pool: Tokio async runtime for I/O-bound work (HTTP, network), Rayon thread pool for CPU-bound work. A dedicated dispatch thread bridges crossbeam channels to rayon. Async concurrency is bounded by a tokio Semaphore.
-**Rationale:** Prevents CPU-heavy tasks from blocking the async runtime. Rayon provides work-stealing for CPU tasks. Semaphore prevents async task explosion.
+**Decision/Pattern:** Tokio async runtime for all I/O-bound work (HTTP, IPFIX listeners, merge coordination). CPU-bound work (column encoding, merge operations) runs via `tokio::task::spawn_blocking`. Concurrent merge tasks are bounded by a tokio Semaphore.
+**Rationale:** Keeps the architecture simple with a single runtime. `spawn_blocking` moves CPU-heavy work off the async executor threads without needing a separate thread pool.
 **Last verified:** 2026-03-23

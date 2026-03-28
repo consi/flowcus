@@ -3,7 +3,7 @@
 //! Architecture:
 //! - **Coordinator** (single async task): scans hour directories, builds merge plans,
 //!   dispatches column-level work to the worker pool, manages atomic part swaps.
-//! - **Workers** (rayon thread pool): execute CPU-bound column merges (read, concat,
+//! - **Workers** (tokio spawn_blocking): execute CPU-bound column merges (read, concat,
 //!   re-encode). Run at low priority relative to ingestion.
 //! - **Throttle** (fair scheduler): monitors system load and limits concurrent merges
 //!   to avoid starving ingestion.

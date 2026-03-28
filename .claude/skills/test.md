@@ -17,9 +17,9 @@ Tests within each crate's source files. Fast, no I/O.
 
 ### Integration Tests
 ```bash
-cargo test --test worker_integration
+cargo test -p flowcus-storage --test integrity_tests
 ```
-Tests in `tests/integration/`. Test cross-crate behavior.
+Tests in `tests/`. Test cross-crate behavior.
 
 ### E2E Tests
 ```bash
@@ -38,12 +38,12 @@ cargo test --workspace
 ```bash
 just bench
 # or
-cargo bench -p flowcus-worker
+cargo bench --workspace
 ```
 
 ## When to run what
 - Changed core types/config -> unit tests
-- Changed worker pool -> unit + integration + benchmarks
+- Changed storage engine -> unit + integration + benchmarks
 - Changed server/API -> unit + e2e
 - Changed frontend -> `just frontend-typecheck` + e2e
 - Before commit -> `just check` (fmt + lint + all tests)

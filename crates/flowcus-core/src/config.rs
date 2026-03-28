@@ -10,8 +10,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
-    pub worker: WorkerConfig,
-    #[serde(default)]
     pub ipfix: IpfixConfig,
     #[serde(default)]
     pub storage: StorageConfig,
@@ -35,16 +33,6 @@ pub struct ServerConfig {
     pub dev_mode: bool,
     #[serde(default = "default_frontend_proxy")]
     pub frontend_proxy: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerConfig {
-    #[serde(default = "default_async_workers")]
-    pub async_workers: usize,
-    #[serde(default = "default_cpu_workers")]
-    pub cpu_workers: usize,
-    #[serde(default = "default_queue_capacity")]
-    pub queue_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,18 +204,6 @@ fn default_frontend_proxy() -> String {
     "http://localhost:5173".to_string()
 }
 
-fn default_async_workers() -> usize {
-    num_cpus()
-}
-
-fn default_cpu_workers() -> usize {
-    num_cpus()
-}
-
-const fn default_queue_capacity() -> usize {
-    1024
-}
-
 fn default_ipfix_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -260,12 +236,6 @@ const fn default_unprocessed_scan_interval_secs() -> u64 {
     10
 }
 
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
-}
-
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -282,16 +252,6 @@ impl Default for ServerConfig {
             port: default_server_port(),
             dev_mode: false,
             frontend_proxy: default_frontend_proxy(),
-        }
-    }
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            async_workers: default_async_workers(),
-            cpu_workers: default_cpu_workers(),
-            queue_capacity: default_queue_capacity(),
         }
     }
 }

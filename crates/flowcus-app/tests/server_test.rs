@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use flowcus_core::AppConfig;
 use flowcus_server::state::AppState;
-use flowcus_worker::WorkerPool;
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -19,12 +18,8 @@ async fn spawn_server() -> u16 {
     config.server.port = port;
     config.server.host = "127.0.0.1".to_string();
 
-    let pool = WorkerPool::new(&config.worker).unwrap();
-    let handle = pool.handle();
-    std::thread::spawn(move || pool.run_cpu_dispatch());
-
     let metrics = flowcus_core::observability::Metrics::new();
-    let state = AppState::new(config.clone(), handle, metrics);
+    let state = AppState::new(config.clone(), metrics);
     let server_config = config.server.clone();
     tokio::spawn(async move {
         flowcus_server::serve(&server_config, state).await.unwrap();
@@ -57,5 +52,5 @@ async fn info_returns_structured_response() {
         .unwrap();
     assert_eq!(body["name"], "flowcus");
     assert!(body["version"].is_string());
-    assert!(body["workers"]["cpu"].is_number());
+    assert!(body["storage"]["merge_workers"].is_number());
 }

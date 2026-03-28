@@ -61,10 +61,6 @@ pub struct Metrics {
     pub storage_parts_gen1_plus: AtomicI64,
     pub storage_disk_bytes: AtomicI64,
 
-    // ---- Worker pool ----
-    pub workerpool_cpu_queue_depth: AtomicI64,
-    pub workerpool_async_permits_available: AtomicI64,
-
     // ---- Process ----
     pub process_start_time_secs: AtomicU64,
 }
@@ -112,9 +108,6 @@ impl Metrics {
             storage_parts_gen0: AtomicI64::new(0),
             storage_parts_gen1_plus: AtomicI64::new(0),
             storage_disk_bytes: AtomicI64::new(0),
-
-            workerpool_cpu_queue_depth: AtomicI64::new(0),
-            workerpool_async_permits_available: AtomicI64::new(0),
 
             process_start_time_secs: AtomicU64::new(now),
         })
@@ -342,20 +335,6 @@ impl Metrics {
             "flowcus_storage_disk_bytes",
             "Estimated total storage disk usage",
             &self.storage_disk_bytes,
-        );
-
-        // Worker pool
-        gauge_i(
-            &mut out,
-            "flowcus_workerpool_cpu_queue_depth",
-            "CPU worker pool queue depth",
-            &self.workerpool_cpu_queue_depth,
-        );
-        gauge_i(
-            &mut out,
-            "flowcus_workerpool_async_permits",
-            "Available async worker permits",
-            &self.workerpool_async_permits_available,
         );
 
         // Process

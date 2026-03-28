@@ -44,9 +44,8 @@ async fn info(State(state): State<AppState>) -> Json<Value> {
             "port": config.server.port,
             "dev_mode": config.server.dev_mode,
         },
-        "workers": {
-            "async": config.worker.async_workers,
-            "cpu": config.worker.cpu_workers,
+        "storage": {
+            "merge_workers": config.storage.merge_workers,
         }
     }))
 }
@@ -59,13 +58,11 @@ mod tests {
     use tower::ServiceExt;
 
     use flowcus_core::AppConfig;
-    use flowcus_worker::WorkerPool;
 
     fn test_state() -> AppState {
         let config = AppConfig::default();
-        let pool = WorkerPool::new(&config.worker).unwrap();
         let metrics = flowcus_core::observability::Metrics::new();
-        AppState::new(config, pool.handle(), metrics)
+        AppState::new(config, metrics)
     }
 
     #[tokio::test]

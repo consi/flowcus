@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 flowcus-core = { workspace = true }
-flowcus-worker = { workspace = true }
+
 flowcus-ipfix = { workspace = true }
 flowcus-storage = { workspace = true }
 flowcus-server = { workspace = true }

@@ -84,7 +84,7 @@ test-unit:
 
 # Run integration tests
 test-integration:
-    cargo test -p flowcus-worker --test worker_integration
+    cargo test -p flowcus-storage --test integrity_tests
 
 # Run e2e tests
 test-e2e:
@@ -100,9 +100,9 @@ test-coverage:
 bench:
     cargo bench --workspace
 
-# Run worker pool benchmarks
-bench-worker:
-    cargo bench -p flowcus-worker
+# Run storage benchmarks
+bench-storage:
+    cargo bench -p flowcus-storage
 
 # --- Quality ---
 

@@ -5,7 +5,6 @@ IPFIX collector, columnar storage, and query system for network flow analysis. R
 
 ## Crate Structure
 - `flowcus-core` - Config (`AppConfig` with 5 sections), error types, telemetry (human/json), observability (Prometheus metrics), profiling (dev-mode snapshots + stack traces)
-- `flowcus-worker` - Thread pool: rayon CPU-bound + tokio semaphore async concurrency
 - `flowcus-ipfix` - IPFIX protocol: wire parsing, IE registry (IANA + 9 vendors), session/template management, decoder, UDP/TCP listener, trace-level pretty printer
 - `flowcus-storage` - Columnar storage engine (see below)
 - `flowcus-server` - Axum on :2137, API routes (`/api/health`, `/api/info`), observability routes (`/observability/metrics`), embedded frontend
@@ -18,7 +17,7 @@ IPFIX collector, columnar storage, and query system for network flow analysis. R
 - `writer.rs` - Buffered writer. Flushes to immutable parts on size/time threshold.
 - `part.rs` - On-disk format: `meta.bin` (256-byte header, magic "FMTA"), `column_index.bin`, `schema.bin`, `columns/{name}.col` with 64-byte headers
 - `granule.rs` - Marks (`.mrk`, magic "FMRK") for byte-offset seeking + bloom filters (`.bloom`, magic "FBLM") for point queries. Default granule = 8192 rows.
-- `merge.rs` - Background merge: coordinator (async) + workers (rayon). Generation-based compaction. Throttled by CPU/memory. Crash-safe (staged writes, source parts untouched on failure).
+- `merge.rs` - Background merge: coordinator (async) + workers (tokio spawn_blocking). Generation-based compaction. Throttled by CPU/memory. Crash-safe (staged writes, source parts untouched on failure).
 - `pending.rs` - Tracks hour directories needing merge. Rebuilt from disk on restart.
 - `table.rs` - Table-level part registry
 - `ingest.rs` - Channel from IPFIX decoder to storage writer (backpressure via bounded channel)

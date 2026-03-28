@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/flowcus-core",
-    "crates/flowcus-worker",
+
     "crates/flowcus-ipfix",
     "crates/flowcus-storage",
     "crates/flowcus-server",
@@ -44,10 +44,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 
-# Worker pool (CPU-bound)
-rayon = "1"
-crossbeam = "0.8"
-
 # Embedding frontend assets
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
@@ -67,7 +63,7 @@ socket2 = "0.5"
 
 # Internal crates
 flowcus-core = { path = "crates/flowcus-core" }
-flowcus-worker = { path = "crates/flowcus-worker" }
+
 flowcus-ipfix = { path = "crates/flowcus-ipfix" }
 flowcus-storage = { path = "crates/flowcus-storage" }
 flowcus-server = { path = "crates/flowcus-server" }
