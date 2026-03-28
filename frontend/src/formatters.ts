@@ -881,17 +881,26 @@ export function getColumnLabel(name: string): string {
 // Key columns — shown in compact table view
 // ──────────────────────────────────────────────
 
-/** Columns always shown in compact view, in display order. */
-const KEY_COLUMNS_ORDERED = [
+/** Default columns for new users — shown in this exact order. */
+export const DEFAULT_COLUMNS = [
   'flowcusExportTime',
-  'sourceIPv4Address', 'sourceIPv6Address',
+  'sourceIPv4Address',
   'sourceTransportPort',
-  'destinationIPv4Address', 'destinationIPv6Address',
+  'destinationIPv4Address',
   'destinationTransportPort',
   'protocolIdentifier',
-  'octetDeltaCount', 'packetDeltaCount',
-  'flowDurationMilliseconds', 'flowcusFlowDuration',
+  'octetDeltaCount',
+  'flowDurationMilliseconds',
   'tcpControlBits',
+];
+
+/** Columns always shown in compact view, in display order. */
+const KEY_COLUMNS_ORDERED = [
+  ...DEFAULT_COLUMNS,
+  'sourceIPv6Address',
+  'destinationIPv6Address',
+  'packetDeltaCount',
+  'flowcusFlowDuration',
 ];
 
 

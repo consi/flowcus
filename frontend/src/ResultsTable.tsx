@@ -33,10 +33,15 @@ export function ResultsTable({
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const [dragCol, setDragCol] = useState<number | null>(null);
+  const [dragOverCol, setDragOverCol] = useState<number | null>(null);
+  const didDrag = useRef(false);
+  const theadRef = useRef<HTMLTableSectionElement>(null);
+  const touchDragRef = useRef(false);
+  const touchStartX = useRef(0);
 
   const visibleIndices = useMemo(() => {
     if (visibleColumns && visibleColumns.length > 0) {
-      // Map visible column names to indices, filtering to those that exist in result
       const nameToIndex = new Map(columns.map((c, i) => [c.name, i]));
       const indices = visibleColumns
         .map((name) => nameToIndex.get(name))
@@ -46,7 +51,6 @@ export function ResultsTable({
     return selectVisibleColumns(columns);
   }, [columns, visibleColumns]);
 
-  // Derive the current visible column names for the config component
   const visibleColumnNames = useMemo(
     () => visibleIndices.map((i) => columns[i].name),
     [visibleIndices, columns],
@@ -54,6 +58,10 @@ export function ResultsTable({
 
   const handleSort = useCallback(
     (colIndex: number) => {
+      if (didDrag.current) {
+        didDrag.current = false;
+        return;
+      }
       if (sortCol === colIndex) {
         if (sortDir === 'asc') setSortDir('desc');
         else if (sortDir === 'desc') {
@@ -97,6 +105,85 @@ export function ResultsTable({
     return () => observer.disconnect();
   }, [onLoadMore, pagination?.has_more, loadingMore]);
 
+  // Commit column reorder
+  const commitColReorder = useCallback((fromIdx: number, toIdx: number) => {
+    if (fromIdx === toIdx || !onColumnConfigChange) return;
+    didDrag.current = true;
+    const next = [...visibleColumnNames];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(toIdx, 0, moved);
+    onColumnConfigChange(next);
+  }, [visibleColumnNames, onColumnConfigChange]);
+
+  // HTML5 drag handlers (desktop)
+  const handleColDragStart = useCallback((e: React.DragEvent, visIdx: number) => {
+    setDragCol(visIdx);
+    didDrag.current = false;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(visIdx));
+  }, []);
+
+  const handleColDragOver = useCallback((e: React.DragEvent, visIdx: number) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (dragCol !== visIdx) setDragOverCol(visIdx);
+  }, [dragCol]);
+
+  const handleColDragEnd = useCallback(() => {
+    if (dragCol !== null && dragOverCol !== null) {
+      commitColReorder(dragCol, dragOverCol);
+    }
+    setDragCol(null);
+    setDragOverCol(null);
+  }, [dragCol, dragOverCol, commitColReorder]);
+
+  const handleColDragLeave = useCallback(() => {
+    setDragOverCol(null);
+  }, []);
+
+  // Touch drag handlers for column headers (mobile)
+  const getVisIdxFromTouchX = useCallback((clientX: number): number | null => {
+    const thead = theadRef.current;
+    if (!thead) return null;
+    const ths = thead.querySelectorAll<HTMLElement>('.results-th[data-visidx]');
+    for (const th of ths) {
+      const rect = th.getBoundingClientRect();
+      if (clientX >= rect.left && clientX <= rect.right) {
+        const idx = parseInt(th.dataset.visidx!, 10);
+        return isNaN(idx) ? null : idx;
+      }
+    }
+    return null;
+  }, []);
+
+  const handleThTouchStart = useCallback((e: React.TouchEvent, visIdx: number) => {
+    touchStartX.current = e.touches[0].clientX;
+    touchDragRef.current = false;
+    setDragCol(visIdx);
+    setDragOverCol(visIdx);
+  }, []);
+
+  const handleThTouchMove = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    // Only enter drag mode after 10px horizontal movement
+    if (!touchDragRef.current && Math.abs(touch.clientX - touchStartX.current) > 10) {
+      touchDragRef.current = true;
+    }
+    if (!touchDragRef.current) return;
+    e.preventDefault();
+    const overIdx = getVisIdxFromTouchX(touch.clientX);
+    if (overIdx !== null) setDragOverCol(overIdx);
+  }, [getVisIdxFromTouchX]);
+
+  const handleThTouchEnd = useCallback(() => {
+    if (touchDragRef.current && dragCol !== null && dragOverCol !== null) {
+      commitColReorder(dragCol, dragOverCol);
+    }
+    touchDragRef.current = false;
+    setDragCol(null);
+    setDragOverCol(null);
+  }, [dragCol, dragOverCol, commitColReorder]);
+
   if (columns.length === 0) {
     return <div className="results-empty">No results to display.</div>;
   }
@@ -119,7 +206,7 @@ export function ResultsTable({
   return (
     <div className="results-table-wrapper">
       <table className="results-table">
-        <thead>
+        <thead ref={theadRef}>
           <tr>
             {onColumnConfigChange && (
               <th className="results-th results-th-config">
@@ -130,14 +217,28 @@ export function ResultsTable({
                 />
               </th>
             )}
-            {visibleIndices.map((ci) => {
+            {visibleIndices.map((ci, visIdx) => {
               const col = columns[ci];
+              const isDragging = dragCol === visIdx;
+              const isDragOver = dragOverCol === visIdx && dragCol !== visIdx;
+              const dropSide = isDragOver && dragCol !== null
+                ? (dragCol < visIdx ? 'right' : 'left')
+                : null;
               return (
                 <th
                   key={col.name}
+                  data-visidx={visIdx}
                   onClick={() => handleSort(ci)}
-                  className="results-th"
+                  className={`results-th${isDragging ? ' th-dragging' : ''}${dropSide ? ` drag-over-${dropSide}` : ''}`}
                   title={`${col.name} (${col.type}) \u2014 click to sort`}
+                  draggable={!!onColumnConfigChange}
+                  onDragStart={(e) => handleColDragStart(e, visIdx)}
+                  onDragOver={(e) => handleColDragOver(e, visIdx)}
+                  onDragEnd={handleColDragEnd}
+                  onDragLeave={handleColDragLeave}
+                  onTouchStart={onColumnConfigChange ? (e) => handleThTouchStart(e, visIdx) : undefined}
+                  onTouchMove={onColumnConfigChange ? handleThTouchMove : undefined}
+                  onTouchEnd={onColumnConfigChange ? handleThTouchEnd : undefined}
                 >
                   {getColumnLabel(col.name)}
                   <span className="sort-indicator">{sortIndicator(ci)}</span>

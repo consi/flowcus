@@ -25,7 +25,7 @@ import {
   type StructuredQueryRequest,
   type SchemaResponse,
 } from './api';
-import { setInterfaceNames, getTimezone, setTimezone, getAvailableTimezones, selectVisibleColumns } from './formatters';
+import { setInterfaceNames, getTimezone, setTimezone, getAvailableTimezones, selectVisibleColumns, DEFAULT_COLUMNS } from './formatters';
 import { formatCache } from './formatCache';
 import type { SchemaField } from './api';
 
@@ -332,12 +332,14 @@ export function App() {
     setFiltersKeepLimitLast((prev) => [...prev, { field, op, value: strValue }]);
   }, [filters, setFiltersKeepLimitLast]);
 
-  // Column visibility (persisted in localStorage)
+  // Column visibility (persisted in localStorage, defaults for new users)
   const [visibleColumns, setVisibleColumns] = useState<string[] | null>(() => {
     try {
       const saved = localStorage.getItem('flowcus:columns');
-      return saved ? JSON.parse(saved) : null;
-    } catch { return null; }
+      if (saved) return JSON.parse(saved);
+    } catch { /* ignore */ }
+    localStorage.setItem('flowcus:columns', JSON.stringify(DEFAULT_COLUMNS));
+    return DEFAULT_COLUMNS;
   });
 
   // Timezone

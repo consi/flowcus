@@ -551,6 +551,74 @@ export function TimeHistogram({
     [brushStart, canvasWidth, buckets.length, onTimeRangeChange, getCanvasX],
   );
 
+  // ── Touch event handlers (mobile brush) ─────────────────────
+
+  const handleTouchStart = useCallback(
+    (e: React.TouchEvent) => {
+      const touch = e.touches[0];
+      const x = getCanvasX(touch.clientX);
+      const clampedX = Math.max(PADDING_LEFT, Math.min(x, canvasWidth - PADDING_RIGHT));
+      brushingRef.current = true;
+      setBrushStart(clampedX);
+      setBrushEnd(clampedX);
+    },
+    [getCanvasX, canvasWidth],
+  );
+
+  const handleTouchMove = useCallback(
+    (e: React.TouchEvent) => {
+      if (!brushingRef.current) return;
+      e.preventDefault(); // prevent scroll while brushing
+      const touch = e.touches[0];
+      const x = getCanvasX(touch.clientX);
+      const clampedX = Math.max(PADDING_LEFT, Math.min(x, canvasWidth - PADDING_RIGHT));
+      setBrushEnd(clampedX);
+
+      const idx = getBucketIndexAtX(touch.clientX);
+      setHoverIndex(idx);
+      setMousePos({ x: getCanvasX(touch.clientX), y: getCanvasY(touch.clientY) });
+    },
+    [getCanvasX, getCanvasY, getBucketIndexAtX, canvasWidth],
+  );
+
+  const handleTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      if (!brushingRef.current) return;
+      brushingRef.current = false;
+
+      const touch = e.changedTouches[0];
+      const x = getCanvasX(touch.clientX);
+      const clampedX = Math.max(PADDING_LEFT, Math.min(x, canvasWidth - PADDING_RIGHT));
+      const startX = brushStart ?? clampedX;
+      const endX = clampedX;
+
+      setHoverIndex(null);
+      setMousePos(null);
+      setBrushStart(null);
+      setBrushEnd(null);
+
+      if (Math.abs(endX - startX) < 5) return;
+      if (buckets.length === 0) return;
+
+      const chartW = canvasWidth - PADDING_LEFT - PADDING_RIGHT;
+      const frac1 = (Math.min(startX, endX) - PADDING_LEFT) / chartW;
+      const frac2 = (Math.max(startX, endX) - PADDING_LEFT) / chartW;
+
+      const [winStart, winEnd] = windowBoundsRef.current;
+      const windowMs = winEnd - winStart;
+
+      const t1 = winStart + frac1 * windowMs;
+      const t2 = winStart + frac2 * windowMs;
+
+      onTimeRangeChange({
+        type: 'absolute',
+        start: new Date(Math.floor(t1)).toISOString(),
+        end: new Date(Math.ceil(t2)).toISOString(),
+      });
+    },
+    [brushStart, canvasWidth, buckets.length, onTimeRangeChange, getCanvasX],
+  );
+
   const handleContextMenu = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
@@ -583,6 +651,9 @@ export function TimeHistogram({
         onMouseLeave={handleMouseLeave}
         onMouseDown={handleMouseDown}
         onMouseUp={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
         onContextMenu={handleContextMenu}
       />
       <div className="time-histogram-footer">
