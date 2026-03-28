@@ -19,6 +19,8 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 pub struct QueryRequest {
     pub query: String,
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -28,6 +30,15 @@ pub struct QueryResponse {
     pub rows: Vec<Vec<serde_json::Value>>,
     pub stats: QueryStats,
     pub explain: Vec<serde_json::Value>,
+    pub pagination: Pagination,
+}
+
+#[derive(Serialize)]
+pub struct Pagination {
+    pub offset: u64,
+    pub limit: u64,
+    pub total: u64,
+    pub has_more: bool,
 }
 
 #[derive(Serialize)]
@@ -132,12 +143,22 @@ async fn execute_query(
                         .filter_map(|step| serde_json::to_value(step).ok())
                         .collect();
 
-                    let rows_returned = result.rows.len() as u64;
+                    // Pagination: apply offset/limit to result rows
+                    let req_offset = req.offset.unwrap_or(0);
+                    let req_limit = req.limit.unwrap_or(100).min(10_000);
+                    let total = result.rows.len() as u64;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let start = (req_offset as usize).min(result.rows.len());
+                    #[allow(clippy::cast_possible_truncation)]
+                    let end = (start + req_limit as usize).min(result.rows.len());
+                    let paginated_rows: Vec<Vec<serde_json::Value>> =
+                        result.rows[start..end].to_vec();
+                    let rows_returned = paginated_rows.len() as u64;
 
                     let response = QueryResponse {
                         parsed,
                         columns: result.columns,
-                        rows: result.rows,
+                        rows: paginated_rows,
                         stats: QueryStats {
                             parse_time_us: u64::try_from(parse_time.as_micros())
                                 .unwrap_or(u64::MAX),
@@ -149,6 +170,12 @@ async fn execute_query(
                             parts_skipped: result.parts_skipped,
                         },
                         explain,
+                        pagination: Pagination {
+                            offset: req_offset,
+                            limit: req_limit,
+                            total,
+                            has_more: req_offset + req_limit < total,
+                        },
                     };
 
                     (
@@ -177,6 +204,12 @@ async fn execute_query(
                             "type": "Error",
                             "message": io_err.to_string()
                         })],
+                        pagination: Pagination {
+                            offset: 0,
+                            limit: 0,
+                            total: 0,
+                            has_more: false,
+                        },
                     };
 
                     (

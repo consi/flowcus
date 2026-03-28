@@ -1,14 +1,27 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { QueryEditor } from './QueryEditor';
 import { ResultsTable } from './ResultsTable';
 import { StatsBar } from './StatsBar';
-import { executeQuery, fetchInfo, type QueryError, type QueryResult, type ServerInfo } from './api';
+import {
+  executeQuery,
+  fetchInfo,
+  type Pagination,
+  type QueryError,
+  type QueryStats,
+  type QueryColumn,
+  type ServerInfo,
+} from './api';
 
 export function App() {
   const [info, setInfo] = useState<ServerInfo | null>(null);
-  const [result, setResult] = useState<QueryResult | null>(null);
+  const [columns, setColumns] = useState<QueryColumn[]>([]);
+  const [allRows, setAllRows] = useState<unknown[][]>([]);
+  const [stats, setStats] = useState<QueryStats | null>(null);
+  const [pagination, setPagination] = useState<Pagination | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [queryError, setQueryError] = useState<QueryError | null>(null);
+  const lastQuery = useRef<string>('');
 
   useEffect(() => {
     fetchInfo().then(setInfo).catch(() => {});
@@ -17,10 +30,18 @@ export function App() {
   const handleExecute = useCallback(async (query: string) => {
     setLoading(true);
     setQueryError(null);
-    setResult(null);
+    setAllRows([]);
+    setColumns([]);
+    setStats(null);
+    setPagination(null);
+    lastQuery.current = query;
+
     try {
-      const res = await executeQuery(query);
-      setResult(res);
+      const res = await executeQuery(query, 0);
+      setColumns(res.columns);
+      setAllRows(res.rows);
+      setStats(res.stats);
+      setPagination(res.pagination);
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'error' in err) {
         setQueryError(err as QueryError);
@@ -31,6 +52,23 @@ export function App() {
       setLoading(false);
     }
   }, []);
+
+  const loadMore = useCallback(async () => {
+    if (!pagination?.has_more || loadingMore || !lastQuery.current) return;
+
+    setLoadingMore(true);
+    try {
+      const nextOffset = pagination.offset + pagination.limit;
+      const res = await executeQuery(lastQuery.current, nextOffset);
+      setAllRows((prev) => [...prev, ...res.rows]);
+      setPagination(res.pagination);
+      setStats(res.stats);
+    } catch {
+      // silently fail on scroll-load errors
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [pagination, loadingMore]);
 
   return (
     <div className="app">
@@ -48,20 +86,25 @@ export function App() {
         <QueryEditor onExecute={handleExecute} loading={loading} error={queryError} />
       </section>
 
-      {result && (
+      {(allRows.length > 0 || loading) && (
         <>
           <section className="results-section">
-            <ResultsTable columns={result.columns} rows={result.rows} />
+            <ResultsTable
+              columns={columns}
+              rows={allRows}
+              pagination={pagination}
+              onLoadMore={loadMore}
+              loadingMore={loadingMore}
+            />
           </section>
-          <StatsBar stats={result.stats} />
+          {stats && <StatsBar stats={stats} />}
         </>
       )}
 
       <footer className="app-footer">
         {info && (
           <span>
-            {info.name} v{info.version} &mdash; {info.server.host}:{info.server.port} &mdash;
-            {' '}{info.workers.cpu} CPU + {info.workers.async} async workers
+            {info.name} v{info.version} &mdash; {info.server.host}:{info.server.port}
           </span>
         )}
       </footer>

@@ -381,6 +381,33 @@
   border-bottom: none;
 }
 
+/* === Infinite Scroll === */
+.results-scroll-status {
+  padding: 0.5rem 0.75rem;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.scroll-loading {
+  padding: 0.5rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.scroll-info {
+  color: var(--text-secondary);
+}
+
+.scroll-hint {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.scroll-sentinel {
+  height: 1px;
+}
+
 /* === Stats Bar === */
 .stats-bar {
   display: flex;

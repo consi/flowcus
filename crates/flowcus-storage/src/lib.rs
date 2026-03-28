@@ -38,7 +38,8 @@
     clippy::too_many_lines,
     clippy::unused_self,
     clippy::collapsible_if,
-    clippy::single_match
+    clippy::single_match,
+    clippy::unnested_or_patterns
 )]
 
 pub mod codec;

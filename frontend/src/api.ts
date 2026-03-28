@@ -28,10 +28,18 @@ export interface QueryStats {
   parts_skipped: number;
 }
 
+export interface Pagination {
+  offset: number;
+  limit: number;
+  total: number;
+  has_more: boolean;
+}
+
 export interface QueryResult {
   columns: QueryColumn[];
   rows: unknown[][];
   stats: QueryStats;
+  pagination: Pagination;
 }
 
 export interface QueryError {
@@ -58,11 +66,15 @@ export async function fetchHealth(): Promise<{ status: string }> {
   return res.json();
 }
 
-export async function executeQuery(query: string): Promise<QueryResult> {
+export async function executeQuery(
+  query: string,
+  offset?: number,
+  limit?: number,
+): Promise<QueryResult> {
   const res = await fetch('/api/query', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, offset, limit }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));

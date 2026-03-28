@@ -1,29 +1,35 @@
-import { useCallback, useMemo, useState } from 'react';
-import type { QueryColumn } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Pagination, QueryColumn } from './api';
 
 interface ResultsTableProps {
   columns: QueryColumn[];
   rows: unknown[][];
+  pagination?: Pagination | null;
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
 }
 
 type SortDir = 'asc' | 'desc' | null;
 
-export function ResultsTable({ columns, rows }: ResultsTableProps) {
+export function ResultsTable({
+  columns,
+  rows,
+  pagination,
+  onLoadMore,
+  loadingMore,
+}: ResultsTableProps) {
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
 
   const handleSort = useCallback(
     (colIndex: number) => {
       if (sortCol === colIndex) {
-        // Cycle: asc -> desc -> none
-        if (sortDir === 'asc') {
-          setSortDir('desc');
-        } else if (sortDir === 'desc') {
+        if (sortDir === 'asc') setSortDir('desc');
+        else if (sortDir === 'desc') {
           setSortCol(null);
           setSortDir(null);
-        } else {
-          setSortDir('asc');
-        }
+        } else setSortDir('asc');
       } else {
         setSortCol(colIndex);
         setSortDir('asc');
@@ -41,12 +47,27 @@ export function ResultsTable({ columns, rows }: ResultsTableProps) {
       const vb = b[col];
       if (va === null || va === undefined) return dir;
       if (vb === null || vb === undefined) return -dir;
-      if (typeof va === 'number' && typeof vb === 'number') {
-        return (va - vb) * dir;
-      }
+      if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir;
       return String(va).localeCompare(String(vb)) * dir;
     });
   }, [rows, sortCol, sortDir]);
+
+  // Infinite scroll: observe sentinel element at bottom of table
+  useEffect(() => {
+    if (!sentinelRef.current || !onLoadMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && pagination?.has_more && !loadingMore) {
+          onLoadMore();
+        }
+      },
+      { threshold: 0.1 },
+    );
+
+    observer.observe(sentinelRef.current);
+    return () => observer.disconnect();
+  }, [onLoadMore, pagination?.has_more, loadingMore]);
 
   if (columns.length === 0) {
     return <div className="results-empty">No results to display.</div>;
@@ -95,6 +116,21 @@ export function ResultsTable({ columns, rows }: ResultsTableProps) {
           ))}
         </tbody>
       </table>
+
+      {/* Infinite scroll sentinel + status */}
+      <div className="results-scroll-status">
+        {loadingMore && <div className="scroll-loading">Loading more rows...</div>}
+        {pagination && (
+          <div className="scroll-info">
+            Showing {rows.length.toLocaleString()} of {pagination.total.toLocaleString()} rows
+            {pagination.has_more && !loadingMore && (
+              <span className="scroll-hint"> — scroll down for more</span>
+            )}
+          </div>
+        )}
+        {/* Invisible sentinel that triggers loading when scrolled into view */}
+        <div ref={sentinelRef} className="scroll-sentinel" />
+      </div>
     </div>
   );
 }
@@ -102,7 +138,6 @@ export function ResultsTable({ columns, rows }: ResultsTableProps) {
 function formatCell(value: unknown): string {
   if (value === null || value === undefined) return '\u2014';
   if (typeof value === 'number') {
-    // Format large numbers with locale separators
     if (Number.isInteger(value) && Math.abs(value) >= 1000) {
       return value.toLocaleString();
     }

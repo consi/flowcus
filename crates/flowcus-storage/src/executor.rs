@@ -87,6 +87,9 @@ pub enum PlanStep {
         function: String,
         groups: usize,
     },
+    PartSkippedMerge {
+        path: String,
+    },
 }
 
 /// Query result with rows, columns, and the execution plan.
@@ -1105,6 +1108,7 @@ impl QueryExecutor {
         let mut all_rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
         let mut total_rows_scanned: u64 = 0;
         let mut parts_skipped_by_index: usize = 0;
+        let mut parts_skipped_by_merge: usize = 0;
 
         for part_entry in &filtered_parts {
             let part_result = self.process_part(
@@ -1123,6 +1127,17 @@ impl QueryExecutor {
                     total_rows_scanned += rows_scanned;
                     all_rows.extend(rows);
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(
+                        error = %e,
+                        part = %part_entry.path.display(),
+                        "Part not found (likely merged away), skipping"
+                    );
+                    parts_skipped_by_merge += 1;
+                    plan.steps.push(PlanStep::PartSkippedMerge {
+                        path: part_entry.path.display().to_string(),
+                    });
+                }
                 Err(e) => {
                     debug!(error = %e, part = %part_entry.path.display(), "Error processing part, skipping");
                 }
@@ -1134,7 +1149,38 @@ impl QueryExecutor {
         // Step 6: Determine output columns
         let output_columns = self.determine_output_columns(query, &all_rows);
 
-        // Step 7: Apply aggregation if present
+        // Step 7: Check if query has an aggregate stage or explicit limit
+        let has_aggregate = query.stages.iter().any(|s| {
+            matches!(
+                s,
+                Stage::Aggregate(AggExpr::GroupBy { .. })
+                    | Stage::Aggregate(AggExpr::TopN { .. })
+                    | Stage::Aggregate(AggExpr::Sort { .. })
+            )
+        });
+        let has_explicit_limit = query
+            .stages
+            .iter()
+            .any(|s| matches!(s, Stage::Aggregate(AggExpr::Limit(_))));
+
+        // Step 7b: Apply default sort + limit for raw (non-aggregate) queries
+        if !has_aggregate && !has_explicit_limit {
+            // Find flowcusExportTime column index to sort by time descending
+            let time_col = "flowcusExportTime";
+            let has_time_col = all_rows
+                .first()
+                .map(|r| r.contains_key(time_col))
+                .unwrap_or(false);
+            if has_time_col {
+                all_rows.sort_by(|a, b| {
+                    let va = a.get(time_col).and_then(|v| v.as_u64()).unwrap_or(0);
+                    let vb = b.get(time_col).and_then(|v| v.as_u64()).unwrap_or(0);
+                    vb.cmp(&va) // descending
+                });
+            }
+        }
+
+        // Step 8: Apply aggregation if present
         let (result_columns, result_rows) =
             self.apply_aggregation(query, &output_columns, &all_rows);
 
@@ -1144,8 +1190,11 @@ impl QueryExecutor {
             rows_after: all_rows.len(),
         });
 
-        let total_parts_skipped = (plan.parts_skipped_by_time + parts_skipped_by_index) as u64;
-        let total_parts_scanned = parts_after_time.saturating_sub(parts_skipped_by_index) as u64;
+        let total_parts_skipped =
+            (plan.parts_skipped_by_time + parts_skipped_by_index + parts_skipped_by_merge) as u64;
+        let total_parts_scanned = parts_after_time
+            .saturating_sub(parts_skipped_by_index)
+            .saturating_sub(parts_skipped_by_merge) as u64;
 
         Ok(QueryResult {
             columns: result_columns,
@@ -1266,7 +1315,8 @@ impl QueryExecutor {
                 }
             }
         } else {
-            let lim = limit.unwrap_or(10_000) as usize;
+            // Default limit: 100 rows for non-aggregate queries without explicit limit
+            let lim = limit.unwrap_or(100) as usize;
             let result_rows = rows
                 .iter()
                 .take(lim)
@@ -1542,6 +1592,10 @@ enum ProcessPartResult {
 
 impl QueryExecutor {
     /// Process a single part: read column index, check filters, decode, evaluate.
+    ///
+    /// If any I/O operation fails with `NotFound`, we propagate it so the caller
+    /// can treat it as a merge-race skip (the part was merged away between
+    /// `list_parts` and now).
     fn process_part(
         &self,
         part_entry: &PartEntry,
@@ -1552,16 +1606,18 @@ impl QueryExecutor {
     ) -> std::io::Result<ProcessPartResult> {
         let part_dir = &part_entry.path;
 
-        // Read metadata
+        // Read metadata — NotFound propagates to caller for merge-race handling
         let meta = part::read_meta_bin(&part_dir.join("meta.bin"))?;
         let row_count = meta.row_count as usize;
 
         // Read schema to know column types
-        let schema = part::read_schema_bin(&part_dir.join("schema.bin")).unwrap_or_else(|_| {
-            crate::schema::Schema {
+        let schema = match part::read_schema_bin(&part_dir.join("schema.bin")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(_) => crate::schema::Schema {
                 columns: Vec::new(),
-            }
-        });
+            },
+        };
 
         // Build column name -> storage type map
         let col_types: HashMap<String, StorageType> = schema
@@ -1573,7 +1629,11 @@ impl QueryExecutor {
         // Read column index for min/max pruning
         let index_path = part_dir.join("column_index.bin");
         let col_index = if index_path.exists() {
-            part::read_column_index(&index_path).unwrap_or_default()
+            match part::read_column_index(&index_path) {
+                Ok(idx) => idx,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+                Err(_) => Vec::new(),
+            }
         } else {
             Vec::new()
         };
@@ -1603,10 +1663,10 @@ impl QueryExecutor {
         }
 
         // Determine which columns to actually read
+        // list_columns does readdir — NotFound propagates for merge-race handling
         let columns_to_read: Vec<String> = if needs_all_columns {
             part::list_columns(part_dir)?
         } else {
-            // Read referenced columns + filter columns
             let available = part::list_columns(part_dir)?;
             referenced_cols
                 .iter()
@@ -1632,7 +1692,16 @@ impl QueryExecutor {
 
         for (col_name, value_bytes) in &bloom_lookups {
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
-            if let Ok((_bits, blooms)) = granule::read_blooms(&bloom_path) {
+            let bloom_result = granule::read_blooms(&bloom_path);
+            if let Err(e) = &bloom_result {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Part merged away: {}", bloom_path.display()),
+                    ));
+                }
+            }
+            if let Ok((_bits, blooms)) = bloom_result {
                 let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
                 let mut skipped = 0usize;
                 for (gi, bloom) in blooms.iter().enumerate() {
@@ -1657,7 +1726,16 @@ impl QueryExecutor {
         // Mark-based seeking for range predicates
         for col_name in &columns_to_read {
             let marks_path = part_dir.join("columns").join(format!("{col_name}.mrk"));
-            if let Ok((_gs, marks)) = granule::read_marks(&marks_path) {
+            let marks_result = granule::read_marks(&marks_path);
+            if let Err(e) = &marks_result {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Part merged away: {}", marks_path.display()),
+                    ));
+                }
+            }
+            if let Ok((_gs, marks)) = marks_result {
                 let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
                 let mut mark_skipped = 0usize;
 
@@ -1711,6 +1789,9 @@ impl QueryExecutor {
                         bytes,
                     });
                     decoded.insert(col_name.clone(), buf);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(e);
                 }
                 Err(e) => {
                     trace!(error = %e, column = col_name, "Failed to decode column");
