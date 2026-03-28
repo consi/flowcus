@@ -79,6 +79,11 @@ pub fn is_known(element_id: u16, enterprise_id: u32) -> bool {
     REGISTRY.contains_key(&(element_id, enterprise_id))
 }
 
+/// Iterate over all registered Information Elements.
+pub fn all() -> impl Iterator<Item = &'static InformationElement> {
+    REGISTRY.values()
+}
+
 /// Total number of registered Information Elements.
 pub fn registry_size() -> usize {
     REGISTRY.len()

@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/QueryEditor.tsx","./src/ResultsTable.tsx","./src/StatsBar.tsx","./src/api.ts","./src/main.tsx","./src/tokenizer.ts","./src/useCompletions.ts","./src/vite-env.d.ts"],"version":"5.8.3"}

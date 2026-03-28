@@ -7,6 +7,7 @@ members = [
     "crates/flowcus-storage",
     "crates/flowcus-server",
     "crates/flowcus-app",
+    "crates/flowcus-query",
 ]
 
 [workspace.package]
@@ -70,6 +71,7 @@ flowcus-worker = { path = "crates/flowcus-worker" }
 flowcus-ipfix = { path = "crates/flowcus-ipfix" }
 flowcus-storage = { path = "crates/flowcus-storage" }
 flowcus-server = { path = "crates/flowcus-server" }
+flowcus-query = { path = "crates/flowcus-query" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

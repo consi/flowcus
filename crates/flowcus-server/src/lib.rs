@@ -1,5 +1,6 @@
 pub mod api;
 pub mod assets;
+pub mod query;
 pub mod state;
 
 use std::net::SocketAddr;
@@ -15,7 +16,7 @@ use crate::state::AppState;
 
 /// Build the full application router.
 pub fn build_router(state: AppState) -> Router {
-    let api_routes = api::routes();
+    let api_routes = api::routes().merge(query::routes());
     let obs_routes = api::observability_routes();
 
     Router::new()

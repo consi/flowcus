@@ -1,0 +1,5 @@
+# Flowcus Query Language (FQL)
+**Context:** How queries are structured for IPFIX flow analysis
+**Decision/Pattern:** Pipeline model: `time | filter | select | aggregate`. Time first (defaults to last 1h), then filters (CIDR-native, port ranges, regex on strings), then field selection (columnar projection), then aggregation (group by, top-N, percentiles). Inspired by nfdump (tcpdump-like filters), SiLK (port ranges, wildcards), PromQL (duration syntax), ClickHouse (time bucketing, topK). Key ergonomics: direction-agnostic `ip`/`port`, named ports (`dns`, `http`), short aliases (`src`, `dst`, `bytes`), human byte suffixes (`1M`, `10G`), CIDR as first-class operator not function, RE2 regex on string fields.
+**Rationale:** Network engineers type queries all day — every keystroke matters. Pipeline model maps directly to storage engine scan-limiting: time → directory prune, filter → bloom/mark skip, select → column projection, aggregate → parallel reduction. SIEM-style recurring windows enable pattern analysis. String field regex needed because IPFIX has ~30+ string-typed IEs (applicationName, dnsQueryName, TLS SNI, etc).
+**Last verified:** 2026-03-23
