@@ -1,0 +1,636 @@
+//! Data integrity tests for the ingestion and merge pipelines.
+//!
+//! These integration tests verify that data written through the storage engine
+//! survives flush, has valid binary structure, and maintains consistency across
+//! all metadata and column files. Designed to catch regressions in data loss
+//! scenarios.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::case_sensitive_file_extension_comparisons
+)]
+
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+
+use flowcus_ipfix::protocol::*;
+use flowcus_storage::granule;
+use flowcus_storage::part;
+use flowcus_storage::schema::StorageType;
+use flowcus_storage::table::Table;
+use flowcus_storage::writer::{StorageWriter, WriterConfig};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Create a unique temp directory for each test to ensure isolation.
+fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir()
+        .join("flowcus_integrity_tests")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Clean up a test directory (best-effort).
+fn cleanup(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn make_record(src: Ipv4Addr, dst: Ipv4Addr, bytes: u64) -> DataRecord {
+    DataRecord {
+        fields: vec![
+            DataField {
+                spec: FieldSpecifier {
+                    element_id: 8,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "sourceIPv4Address".into(),
+                value: FieldValue::Ipv4(src),
+            },
+            DataField {
+                spec: FieldSpecifier {
+                    element_id: 12,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "destinationIPv4Address".into(),
+                value: FieldValue::Ipv4(dst),
+            },
+            DataField {
+                spec: FieldSpecifier {
+                    element_id: 1,
+                    field_length: 8,
+                    enterprise_id: 0,
+                },
+                name: "octetDeltaCount".into(),
+                value: FieldValue::Unsigned64(bytes),
+            },
+        ],
+    }
+}
+
+fn make_message(records: Vec<DataRecord>) -> IpfixMessage {
+    make_message_with_time(records, 1_700_000_000)
+}
+
+fn make_message_with_time(records: Vec<DataRecord>, export_time: u32) -> IpfixMessage {
+    IpfixMessage {
+        header: MessageHeader {
+            version: 0x000a,
+            length: 0,
+            export_time,
+            sequence_number: 1,
+            observation_domain_id: 1,
+        },
+        exporter: "10.0.0.1:4739".parse().unwrap(),
+        sets: vec![Set {
+            set_id: 256,
+            contents: SetContents::Data(DataSet {
+                template_id: 256,
+                records,
+            }),
+        }],
+    }
+}
+
+/// Create a writer that flushes on every ingest (1-byte threshold).
+fn tiny_flush_writer(dir: &Path) -> StorageWriter {
+    let table = Table::open(dir, "flows").unwrap();
+    let config = WriterConfig {
+        flush_bytes: 1,
+        flush_interval_secs: 0,
+        initial_row_capacity: 64,
+        ..WriterConfig::default()
+    };
+    StorageWriter::new(table, config, None)
+}
+
+/// Find the first (and usually only) part directory under the table.
+fn find_first_part(dir: &Path) -> PathBuf {
+    let table = Table::open(dir, "flows").unwrap();
+    let parts = table.list_all_parts().unwrap();
+    assert!(!parts.is_empty(), "expected at least one part on disk");
+    parts[0].path.clone()
+}
+
+/// Ingest records and force-flush, returning the part directory path.
+fn ingest_and_flush(dir: &Path, records: Vec<DataRecord>) -> PathBuf {
+    let mut writer = tiny_flush_writer(dir);
+    let msg = make_message(records);
+    writer.ingest(&msg);
+    writer.flush_all();
+    find_first_part(dir)
+}
+
+// ---------------------------------------------------------------------------
+// 1. test_ingested_data_survives_flush
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ingested_data_survives_flush() {
+    let dir = test_dir("survives_flush");
+
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            1500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            2500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 3),
+            Ipv4Addr::new(192, 168, 1, 3),
+            3500,
+        ),
+    ];
+
+    let mut writer = tiny_flush_writer(&dir);
+    let msg = make_message(records);
+    let ingested = writer.ingest(&msg);
+    assert_eq!(ingested, 3);
+    let flushed = writer.flush_ready();
+    assert_eq!(flushed, 1);
+
+    let part_dir = find_first_part(&dir);
+
+    // Part directory exists
+    assert!(part_dir.exists(), "part directory must exist after flush");
+
+    // meta.bin row_count matches
+    let meta = part::read_meta_bin(&part_dir.join("meta.bin")).unwrap();
+    assert_eq!(
+        meta.row_count, 3,
+        "meta.bin row_count must match ingested records"
+    );
+    // 4 system columns + 3 template columns = 7
+    assert_eq!(
+        meta.column_count, 7,
+        "meta.bin column_count must match schema (4 system + 3 template)"
+    );
+
+    // Each .col file header row_count matches
+    let col_dir = part_dir.join("columns");
+    let expected_columns = [
+        "flowcusExporterIPv4",
+        "flowcusExporterPort",
+        "flowcusExportTime",
+        "flowcusObservationDomainId",
+        "sourceIPv4Address",
+        "destinationIPv4Address",
+        "octetDeltaCount",
+    ];
+    for col_name in &expected_columns {
+        let col_path = col_dir.join(format!("{col_name}.col"));
+        assert!(col_path.exists(), "column file {col_name}.col must exist");
+        let header = part::read_column_header(&col_path).unwrap();
+        assert_eq!(
+            header.row_count, 3,
+            "column {col_name} row_count must match ingested records"
+        );
+    }
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 2. test_part_files_have_valid_structure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_part_files_have_valid_structure() {
+    let dir = test_dir("valid_structure");
+
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            100,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            200,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+
+    // meta.bin starts with "FMTA"
+    let meta_bytes = std::fs::read(part_dir.join("meta.bin")).unwrap();
+    assert_eq!(
+        &meta_bytes[..4],
+        b"FMTA",
+        "meta.bin must start with FMTA magic"
+    );
+    assert_eq!(meta_bytes.len(), 256, "meta.bin must be exactly 256 bytes");
+
+    // column_index.bin starts with "FCIX"
+    let cix_bytes = std::fs::read(part_dir.join("column_index.bin")).unwrap();
+    assert_eq!(
+        &cix_bytes[..4],
+        b"FCIX",
+        "column_index.bin must start with FCIX magic"
+    );
+
+    // schema.bin starts with "FSCH"
+    let schema_bytes = std::fs::read(part_dir.join("schema.bin")).unwrap();
+    assert_eq!(
+        &schema_bytes[..4],
+        b"FSCH",
+        "schema.bin must start with FSCH magic"
+    );
+
+    // Each .col file starts with "FCOL"
+    let col_dir = part_dir.join("columns");
+    for entry in std::fs::read_dir(&col_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".col") {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            assert!(bytes.len() >= 64, "{name} must be at least 64 bytes");
+            assert_eq!(&bytes[..4], b"FCOL", "{name} must start with FCOL magic");
+        }
+    }
+
+    // Each .mrk file starts with "FMRK"
+    for entry in std::fs::read_dir(&col_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".mrk") {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            assert!(bytes.len() >= 16, "{name} must be at least 16 bytes");
+            assert_eq!(&bytes[..4], b"FMRK", "{name} must start with FMRK magic");
+        }
+    }
+
+    // Each .bloom file starts with "FBLM"
+    for entry in std::fs::read_dir(&col_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".bloom") {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            assert!(bytes.len() >= 16, "{name} must be at least 16 bytes");
+            assert_eq!(&bytes[..4], b"FBLM", "{name} must start with FBLM magic");
+        }
+    }
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 3. test_merge_preserves_row_count (structural: multiple parts, total rows)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_merge_preserves_row_count() {
+    let dir = test_dir("merge_row_count");
+
+    // Write 3 separate parts with known row counts by using 3 different export times
+    // in the same hour so they land in the same hour directory.
+    let counts: [usize; 3] = [2, 3, 5];
+    let base_time: u32 = 1_700_000_000;
+
+    for (i, &count) in counts.iter().enumerate() {
+        let mut writer = tiny_flush_writer(&dir);
+        let records: Vec<DataRecord> = (0..count)
+            .map(|j| {
+                make_record(
+                    Ipv4Addr::new(10, 0, i as u8, j as u8),
+                    Ipv4Addr::new(192, 168, i as u8, j as u8),
+                    (i * 1000 + j) as u64,
+                )
+            })
+            .collect();
+        // Use slightly different export times within the same hour partition
+        let msg = make_message_with_time(records, base_time + i as u32);
+        writer.ingest(&msg);
+        writer.flush_all();
+    }
+
+    let table = Table::open(&dir, "flows").unwrap();
+    let parts = table.list_all_parts().unwrap();
+    assert_eq!(parts.len(), 3, "should have 3 parts on disk");
+
+    let total_rows: u64 = parts
+        .iter()
+        .map(|p| {
+            let meta = part::read_meta_bin(&p.path.join("meta.bin")).unwrap();
+            meta.row_count
+        })
+        .sum();
+
+    let expected: u64 = counts.iter().map(|c| *c as u64).sum();
+    assert_eq!(
+        total_rows, expected,
+        "total row count across all parts must equal sum of ingested records"
+    );
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 4. test_column_file_not_truncated
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_column_file_not_truncated() {
+    let dir = test_dir("not_truncated");
+
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            1500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            2500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 3),
+            Ipv4Addr::new(192, 168, 1, 3),
+            3500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 4),
+            Ipv4Addr::new(192, 168, 1, 4),
+            4500,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+
+    let col_dir = part_dir.join("columns");
+    for entry in std::fs::read_dir(&col_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".col") {
+            continue;
+        }
+
+        let header = part::read_column_header(&entry.path()).unwrap();
+        let file_len = std::fs::metadata(entry.path()).unwrap().len();
+        // File = 64-byte header + encoded data + 4-byte CRC32 trailing checksum
+        let expected_len = 64 + header.encoded_size + 4;
+
+        assert_eq!(
+            file_len, expected_len,
+            "column file {name}: actual size ({file_len}) must equal header (64) + encoded_size ({}) + CRC (4)",
+            header.encoded_size
+        );
+    }
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 5. test_meta_row_count_matches_column_row_count
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_meta_row_count_matches_column_row_count() {
+    let dir = test_dir("meta_col_match");
+
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            100,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            200,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 3),
+            Ipv4Addr::new(192, 168, 1, 3),
+            300,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 4),
+            Ipv4Addr::new(192, 168, 1, 4),
+            400,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(192, 168, 1, 5),
+            500,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+
+    let meta = part::read_meta_bin(&part_dir.join("meta.bin")).unwrap();
+    let meta_rows = meta.row_count;
+
+    let col_dir = part_dir.join("columns");
+    for entry in std::fs::read_dir(&col_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".col") {
+            continue;
+        }
+
+        let header = part::read_column_header(&entry.path()).unwrap();
+        assert_eq!(
+            header.row_count, meta_rows,
+            "column {name} row_count ({}) must match meta.bin row_count ({meta_rows})",
+            header.row_count
+        );
+    }
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 6. test_schema_bin_roundtrip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_bin_roundtrip() {
+    let dir = test_dir("schema_roundtrip");
+
+    // Write a part so schema.bin is produced
+    let records = vec![make_record(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        100,
+    )];
+    let part_dir = ingest_and_flush(&dir, records);
+
+    let schema = part::read_schema_bin(&part_dir.join("schema.bin")).unwrap();
+
+    // 4 system columns + 3 template columns = 7
+    assert_eq!(schema.columns.len(), 7);
+
+    // System columns come first
+    assert_eq!(schema.columns[0].name, "flowcusExporterIPv4");
+    assert_eq!(schema.columns[1].name, "flowcusExporterPort");
+    assert_eq!(schema.columns[2].name, "flowcusExportTime");
+    assert_eq!(schema.columns[3].name, "flowcusObservationDomainId");
+
+    // Template columns follow
+    let src_col = &schema.columns[4];
+    assert_eq!(src_col.name, "sourceIPv4Address");
+    assert_eq!(src_col.element_id, 8);
+    assert_eq!(src_col.enterprise_id, 0);
+    assert_eq!(src_col.data_type, DataType::Ipv4Address);
+    assert_eq!(src_col.storage_type, StorageType::U32);
+
+    let dst_col = &schema.columns[5];
+    assert_eq!(dst_col.name, "destinationIPv4Address");
+    assert_eq!(dst_col.element_id, 12);
+
+    let bytes_col = &schema.columns[6];
+    assert_eq!(bytes_col.name, "octetDeltaCount");
+    assert_eq!(bytes_col.data_type, DataType::Unsigned64);
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 7. test_column_index_matches_actual_columns
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_column_index_matches_actual_columns() {
+    let dir = test_dir("index_matches_columns");
+
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            100,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            200,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+
+    // Read the column index
+    let index_entries = part::read_column_index(&part_dir.join("column_index.bin")).unwrap();
+
+    // List actual .col files on disk
+    let col_names = part::list_columns(&part_dir).unwrap();
+
+    assert_eq!(
+        index_entries.len(),
+        col_names.len(),
+        "column_index.bin entry count ({}) must match number of .col files ({})",
+        index_entries.len(),
+        col_names.len()
+    );
+
+    // Verify each index entry has a matching .col file by name_hash
+    let col_dir = part_dir.join("columns");
+    for col_name in &col_names {
+        let col_path = col_dir.join(format!("{col_name}.col"));
+        assert!(
+            col_path.exists(),
+            "column file {col_name}.col must exist on disk"
+        );
+
+        // Verify the name_hash for this column appears in the index
+        let expected_hash = part::column_name_hash(col_name);
+        let found = index_entries.iter().any(|e| e.name_hash == expected_hash);
+        assert!(
+            found,
+            "column_index.bin must contain an entry with name_hash for {col_name}"
+        );
+    }
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 8. test_marks_granule_coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_marks_granule_coverage() {
+    let dir = test_dir("marks_granule_coverage");
+
+    // Generate enough records to span multiple granules (default granule_size = 8192).
+    // We need > 8192 rows. Let's do 20000.
+    let total_rows = 20_000usize;
+    let records: Vec<DataRecord> = (0..total_rows)
+        .map(|i| {
+            let b3 = ((i >> 8) & 0xFF) as u8;
+            let b4 = (i & 0xFF) as u8;
+            make_record(
+                Ipv4Addr::new(10, 0, b3, b4),
+                Ipv4Addr::new(192, 168, b3, b4),
+                i as u64,
+            )
+        })
+        .collect();
+
+    let part_dir = ingest_and_flush(&dir, records);
+
+    // Pick any column's .mrk file
+    let mrk_path = part_dir.join("columns").join("sourceIPv4Address.mrk");
+    assert!(mrk_path.exists(), ".mrk file must exist");
+
+    let (granule_size, marks) = granule::read_marks(&mrk_path).unwrap();
+    assert_eq!(
+        granule_size, 8192,
+        "granule_size must be the ingestion default"
+    );
+
+    // Expected: ceil(20000 / 8192) = 3 granules
+    let expected_granules = total_rows.div_ceil(8192);
+    assert_eq!(
+        marks.len(),
+        expected_granules,
+        "number of granule marks must equal ceil(total_rows / granule_size)"
+    );
+
+    // Verify marks cover all rows
+    let mark_total_rows: u64 = marks.iter().map(|m| m.row_count as u64).sum();
+    assert_eq!(
+        mark_total_rows, total_rows as u64,
+        "sum of mark row_counts must equal total rows"
+    );
+
+    // Verify data_offsets are monotonically increasing
+    for i in 1..marks.len() {
+        assert!(
+            marks[i].data_offset >= marks[i - 1].data_offset,
+            "data_offsets must be monotonically increasing (mark[{}]={} < mark[{}]={})",
+            i - 1,
+            marks[i - 1].data_offset,
+            i,
+            marks[i].data_offset
+        );
+    }
+
+    // Verify no gaps: mark[i+1].row_start == mark[i].row_start + mark[i].row_count
+    for i in 0..marks.len() - 1 {
+        let expected_next_start = marks[i].row_start + marks[i].row_count;
+        assert_eq!(
+            marks[i + 1].row_start,
+            expected_next_start,
+            "granule marks must be contiguous: mark[{}].row_start ({}) != mark[{}].row_start + mark[{}].row_count ({})",
+            i + 1,
+            marks[i + 1].row_start,
+            i,
+            i,
+            expected_next_start
+        );
+    }
+
+    // First mark starts at row 0
+    assert_eq!(marks[0].row_start, 0, "first granule must start at row 0");
+
+    cleanup(&dir);
+}

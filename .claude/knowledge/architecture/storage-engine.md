@@ -1,0 +1,5 @@
+# Storage Engine Architecture
+**Context:** How columnar storage works in Flowcus
+**Decision/Pattern:** ClickHouse/Druid-inspired columnar storage with immutable parts in a time-partitioned directory tree: `{table}/{YYYY}/{MM}/{DD}/{HH}/g{gen}_{mintime}_{maxtime}_{seq}/columns/{name}.col` + `meta.bin`. Binary metadata (256-byte header, 4 cache lines) replaces JSON for fast ser/de. Part directory names encode generation (merge level) + min/max unix timestamps for scan-limiting by readdir alone. Two-layer encoding: transform codec (Plain/Delta/DeltaDelta/GCD auto-selected) + LZ4 compression. Write path: IPFIX records -> mpsc channel -> columnar buffer transpose -> flush on size/time/hour-boundary threshold -> part to disk (no fsync).
+**Rationale:** Nested time directories enable filesystem-level partition pruning. Binary metadata avoids JSON parse overhead. Generation in name enables merge-level grouping. Min/max in name enables time-range skip without opening any file. All decisions follow the scan-limiting principle: every layer should help skip irrelevant data.
+**Last verified:** 2026-03-23

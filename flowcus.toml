@@ -1,0 +1,40 @@
+# Flowcus configuration
+# All values shown are defaults
+
+[logging]
+# format = "human"                   # "human" or "json"
+# filter = "info,tower_http=debug"
+
+[server]
+# host = "0.0.0.0"
+# port = 2137
+# dev_mode = false
+
+[worker]
+# async_workers = <num_cpus>
+# cpu_workers = <num_cpus>
+# queue_capacity = 1024
+
+[ipfix]
+# host = "0.0.0.0"
+# port = 4739
+# udp = true
+# tcp = false
+# udp_recv_buffer = 65535
+# template_expiry_secs = 1800
+
+[storage]
+# dir = "storage"
+# flush_bytes = 1048576              # 1 MB
+# flush_interval_secs = 1
+# partition_duration_secs = 3600     # 1 hour
+# channel_capacity = 4096
+# initial_row_capacity = 8192
+# merge_workers = 8
+# merge_scan_interval_secs = 5
+# merge_cpu_throttle = 0.80
+# merge_mem_throttle = 0.85
+# granule_size = 8192
+# bloom_bits_per_granule = 8192      # 1 KB per granule
+# mark_cache_bytes = 1073741824      # 1 GB
+# bloom_cache_bytes = 1073741824     # 1 GB

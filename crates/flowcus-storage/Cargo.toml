@@ -1,0 +1,24 @@
+[package]
+name = "flowcus-storage"
+description = "Columnar storage engine for IPFIX flow data"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+flowcus-core = { workspace = true }
+flowcus-ipfix = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+lz4_flex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

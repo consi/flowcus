@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Claude knowledge (auto-generated, track selectively)
+.claude/knowledge/**/*.auto.md
+
+# Storage data (dev)
+/storage/
+
+# Performance profiling dumps (dev mode)
+/profiling/
+
+# Test artifacts
+/coverage/
+/test-results/
+*.profraw
+*.profdata

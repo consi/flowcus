@@ -1,0 +1,5 @@
+# Scan-Limiting Design Principle
+**Context:** Every structural decision in storage, indexing, or query planning
+**Decision/Pattern:** Always design data structures and naming so that operations can skip irrelevant data without opening files or reading bytes. Encode filterable metadata (time range, generation, min/max values) in directory names, file headers, and in-memory indexes. Every layer should enable pruning: filesystem directory structure (YYYY/MM/DD/HH), part directory name (generation + min/max timestamps), column file header (min/max values), and eventually bloom filters and granule mark caches.
+**Rationale:** Read/analysis workers must be CPU-bound on actual data processing, not I/O-bound on scanning metadata. A query for "last 5 minutes" should never touch last month's directories. A merge at generation 1 should find candidates by listing a single hour directory, not walking the full tree. This principle applies to every future feature: bloom filters, mark caches, retention policies, rebalancing.
+**Last verified:** 2026-03-23

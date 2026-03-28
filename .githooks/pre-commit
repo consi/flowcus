@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Pre-commit hook: format check, clippy, fast tests
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+echo "Running pre-commit checks..."
+
+echo -n "  Formatting... "
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo -e "${RED}FAIL${NC} (run: cargo fmt --all)"
+    exit 1
+fi
+echo -e "${GREEN}OK${NC}"
+
+echo -n "  Clippy... "
+if ! cargo clippy --workspace --all-targets -- -D warnings >/dev/null 2>&1; then
+    echo -e "${RED}FAIL${NC} (run: cargo clippy --workspace --all-targets -- -D warnings)"
+    exit 1
+fi
+echo -e "${GREEN}OK${NC}"
+
+echo -n "  Unit tests... "
+if ! cargo test --workspace --lib >/dev/null 2>&1; then
+    echo -e "${RED}FAIL${NC}"
+    exit 1
+fi
+echo -e "${GREEN}OK${NC}"
+
+echo -e "${GREEN}All pre-commit checks passed.${NC}"
