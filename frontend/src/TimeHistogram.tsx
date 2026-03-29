@@ -39,16 +39,16 @@ function formatAxisTime(ts: number, windowMs: number, tz: string): string {
     return d.toLocaleDateString(undefined, { timeZone: tz, month: 'short', day: 'numeric' });
   }
   if (windowMs > 86_400_000) {
-    return d.toLocaleString(undefined, { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleString(undefined, { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
   }
-  return d.toLocaleTimeString(undefined, { timeZone: tz, hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleTimeString(undefined, { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 function formatTooltipTime(ts: number, bucketMs: number, tz: string): string {
   const d = new Date(ts);
   const end = new Date(ts + bucketMs);
   const fmt = (dt: Date) => dt.toLocaleTimeString(undefined, {
-    timeZone: tz, hour: '2-digit', minute: '2-digit', second: bucketMs < 60_000 ? '2-digit' : undefined,
+    timeZone: tz, hour: '2-digit', minute: '2-digit', second: bucketMs < 60_000 ? '2-digit' : undefined, hour12: false,
   });
   return `${fmt(d)} - ${fmt(end)}`;
 }

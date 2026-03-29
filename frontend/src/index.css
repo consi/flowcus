@@ -1870,6 +1870,26 @@
   border-color: var(--accent);
 }
 
+.time-range-abs-row {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.time-range-abs-date {
+  flex: 1;
+  min-width: 0;
+  color-scheme: dark;
+}
+
+[data-theme="light"] .time-range-abs-date {
+  color-scheme: light;
+}
+
+.time-range-abs-time {
+  width: 6.5em;
+  flex-shrink: 0;
+}
+
 
 /* === Column Config === */
 .column-config-trigger {

@@ -46,20 +46,37 @@ function durationToMs(dur: string): number {
   }
 }
 
-/** Format a Date to the datetime-local input value (YYYY-MM-DDTHH:mm:ss.sss). */
-function toLocalInputValue(d: Date): string {
-  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+
+function toDateValue(d: Date): string {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** Resolve a StructuredTimeRange to absolute local datetime-local strings. */
-function resolveToAbsInputs(range: StructuredTimeRange): [string, string] {
+function toTimeValue(d: Date): string {
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function parseDateTime(date: string, time: string): Date | null {
+  const dm = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!dm) return null;
+  const tm = time.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!tm) return null;
+  const d = new Date(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2], +(tm[3] ?? 0));
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function resolveToAbsInputs(range: StructuredTimeRange): { startDate: string; startTime: string; endDate: string; endTime: string } {
+  let s: Date, e: Date;
   if (range.type === 'absolute' && range.start && range.end) {
-    return [toLocalInputValue(new Date(range.start)), toLocalInputValue(new Date(range.end))];
+    s = new Date(range.start);
+    e = new Date(range.end);
+  } else {
+    const now = Date.now();
+    const ms = durationToMs(range.duration ?? '1h');
+    s = new Date(now - ms);
+    e = new Date(now);
   }
-  const now = Date.now();
-  const ms = durationToMs(range.duration ?? '1h');
-  return [toLocalInputValue(new Date(now - ms)), toLocalInputValue(new Date(now))];
+  return { startDate: toDateValue(s), startTime: toTimeValue(s), endDate: toDateValue(e), endTime: toTimeValue(e) };
 }
 
 function formatTimeRange(range: StructuredTimeRange): string {
@@ -71,7 +88,7 @@ function formatTimeRange(range: StructuredTimeRange): string {
       const d = new Date(iso);
       return d.toLocaleString(undefined, {
         month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
       });
     };
     return `${fmt(range.start)} \u2014 ${fmt(range.end)}`;
@@ -85,8 +102,10 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
   const [mode, setMode] = useState<'relative' | 'absolute'>(value.type);
   const [customAmount, setCustomAmount] = useState('1');
   const [customUnit, setCustomUnit] = useState('h');
-  const [absStart, setAbsStart] = useState('');
-  const [absEnd, setAbsEnd] = useState('');
+  const [absStartDate, setAbsStartDate] = useState('');
+  const [absStartTime, setAbsStartTime] = useState('');
+  const [absEndDate, setAbsEndDate] = useState('');
+  const [absEndTime, setAbsEndTime] = useState('');
   const popoverRef = useRef<HTMLDivElement>(null);
   const refreshRef = useRef<HTMLDivElement>(null);
 
@@ -142,16 +161,19 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
     }
   }, [customAmount, customUnit, onChange]);
 
+  const absStartValid = parseDateTime(absStartDate, absStartTime);
+  const absEndValid = parseDateTime(absEndDate, absEndTime);
+
   const applyAbsolute = useCallback(() => {
-    if (absStart && absEnd) {
+    if (absStartValid && absEndValid) {
       onChange({
         type: 'absolute',
-        start: new Date(absStart).toISOString(),
-        end: new Date(absEnd).toISOString(),
+        start: absStartValid.toISOString(),
+        end: absEndValid.toISOString(),
       });
       setOpen(false);
     }
-  }, [absStart, absEnd, onChange]);
+  }, [absStartValid, absEndValid, onChange]);
 
   const activeRefresh = REFRESH_OPTIONS.find((r) => r.seconds === refreshInterval);
 
@@ -162,9 +184,11 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
         className="time-range-trigger"
         onClick={() => {
           if (!open) {
-            const [s, e] = resolveToAbsInputs(value);
-            setAbsStart(s);
-            setAbsEnd(e);
+            const r = resolveToAbsInputs(value);
+            setAbsStartDate(r.startDate);
+            setAbsStartTime(r.startTime);
+            setAbsEndDate(r.endDate);
+            setAbsEndTime(r.endTime);
           }
           setOpen(!open);
           setRefreshOpen(false);
@@ -237,28 +261,48 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
             <div className="time-range-absolute">
               <label className="time-range-abs-label">
                 Start
-                <input
-                  type="datetime-local"
-                  step="0.001"
-                  value={absStart}
-                  onChange={(e) => setAbsStart(e.target.value)}
-                  className="time-range-abs-input"
-                />
+                <div className="time-range-abs-row">
+                  <input
+                    type="date"
+                    value={absStartDate}
+                    onChange={(e) => setAbsStartDate(e.target.value)}
+                    className="time-range-abs-input time-range-abs-date"
+                  />
+                  <input
+                    type="text"
+                    placeholder="HH:mm:ss"
+                    value={absStartTime}
+                    onChange={(e) => setAbsStartTime(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') applyAbsolute(); }}
+                    className="time-range-abs-input time-range-abs-time"
+                    spellCheck={false}
+                  />
+                </div>
               </label>
               <label className="time-range-abs-label">
                 End
-                <input
-                  type="datetime-local"
-                  step="0.001"
-                  value={absEnd}
-                  onChange={(e) => setAbsEnd(e.target.value)}
-                  className="time-range-abs-input"
-                />
+                <div className="time-range-abs-row">
+                  <input
+                    type="date"
+                    value={absEndDate}
+                    onChange={(e) => setAbsEndDate(e.target.value)}
+                    className="time-range-abs-input time-range-abs-date"
+                  />
+                  <input
+                    type="text"
+                    placeholder="HH:mm:ss"
+                    value={absEndTime}
+                    onChange={(e) => setAbsEndTime(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') applyAbsolute(); }}
+                    className="time-range-abs-input time-range-abs-time"
+                    spellCheck={false}
+                  />
+                </div>
               </label>
               <button
                 className="time-range-apply"
                 onClick={applyAbsolute}
-                disabled={!absStart || !absEnd}
+                disabled={!absStartValid || !absEndValid}
               >Apply</button>
             </div>
           )}
