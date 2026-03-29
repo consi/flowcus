@@ -9,6 +9,7 @@ interface FlowSidebarProps {
   onClose: () => void;
   onNavigate: (index: number) => void;
   totalRows: number;
+  onAddFilter?: (field: string, value: unknown, negated: boolean) => void;
 }
 
 export function FlowSidebar({
@@ -18,6 +19,7 @@ export function FlowSidebar({
   onClose,
   onNavigate,
   totalRows,
+  onAddFilter,
 }: FlowSidebarProps) {
   const row = rows[selectedIndex];
   if (!row) return null;
@@ -117,10 +119,20 @@ export function FlowSidebar({
                 {getColumnLabel(col.name)}
                 <span className="sidebar-field-name">{col.name}</span>
               </div>
-              <div className={`sidebar-field-value ${isNull ? 'null-value' : ''}`}>
-                {formatted}
-                {!isNull && formatted !== String(raw) && (
-                  <span className="sidebar-field-raw">{String(raw)}</span>
+              <div className="sidebar-field-value-row">
+                <div className={`sidebar-field-value ${isNull ? 'null-value' : ''}`}>
+                  {formatted}
+                  {!isNull && formatted !== String(raw) && (
+                    <span className="sidebar-field-raw">{String(raw)}</span>
+                  )}
+                </div>
+                {onAddFilter && !isNull && (
+                  <div className="sidebar-filter-actions">
+                    <button className="sidebar-filter-btn include" title={`Filter by ${col.name} = ${String(raw)}`}
+                      onClick={() => onAddFilter(col.name, raw, false)}>+</button>
+                    <button className="sidebar-filter-btn exclude" title={`Filter out ${col.name} = ${String(raw)}`}
+                      onClick={() => onAddFilter(col.name, raw, true)}>{'\u2212'}</button>
+                  </div>
                 )}
               </div>
             </div>

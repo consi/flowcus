@@ -8,8 +8,6 @@ import type { StructuredFilter, SchemaResponse, SchemaField } from './api';
 interface SearchBarProps {
   filters: StructuredFilter[];
   onChange: (filters: StructuredFilter[]) => void;
-  logic: 'and' | 'or';
-  onLogicChange: (logic: 'and' | 'or') => void;
   schema: SchemaResponse | null;
   onExecute: () => void;
   onCancel: () => void;
@@ -21,7 +19,6 @@ type EditTarget = { index: number; part: 'field' | 'op' | 'value' } | null;
 
 interface HistoryEntry {
   filters: StructuredFilter[];
-  logic: 'and' | 'or';
 }
 
 interface SuggestionItem {
@@ -57,12 +54,273 @@ const OP_FROM_LABEL = Object.fromEntries(
   Object.entries(OP_LABELS).map(([k, v]) => [v, k]),
 );
 
-const COMMON_PROTOCOLS = ['tcp', 'udp', 'icmp', 'gre', 'sctp', 'esp', 'ah'];
-const COMMON_SERVICES = [
-  'http', 'https', 'dns', 'ssh', 'ftp', 'smtp', 'snmp',
-  'telnet', 'ntp', 'imap', 'pop3', 'ldap', 'rdp', 'mysql',
-  'postgresql', 'redis', 'syslog', 'bgp', 'netflow',
+const COMMON_PROTOCOLS: { name: string; num: number }[] = [
+  { name: 'tcp', num: 6 }, { name: 'udp', num: 17 }, { name: 'icmp', num: 1 },
+  { name: 'gre', num: 47 }, { name: 'sctp', num: 132 }, { name: 'esp', num: 50 },
+  { name: 'ah', num: 51 },
 ];
+const COMMON_SERVICES: { name: string; port: number }[] = [
+  { name: 'http', port: 80 }, { name: 'https', port: 443 }, { name: 'dns', port: 53 },
+  { name: 'ssh', port: 22 }, { name: 'ftp', port: 21 }, { name: 'smtp', port: 25 },
+  { name: 'snmp', port: 161 }, { name: 'telnet', port: 23 }, { name: 'ntp', port: 123 },
+  { name: 'imap', port: 143 }, { name: 'pop3', port: 110 }, { name: 'ldap', port: 389 },
+  { name: 'rdp', port: 3389 }, { name: 'mysql', port: 3306 }, { name: 'postgresql', port: 5432 },
+  { name: 'redis', port: 6379 }, { name: 'syslog', port: 514 }, { name: 'bgp', port: 179 },
+  { name: 'netflow', port: 2055 },
+];
+
+const TCP_FLAGS: { label: string; detail: string; value: number }[] = [
+  { label: 'SYN', detail: '0x02 (2)', value: 2 },
+  { label: 'ACK', detail: '0x10 (16)', value: 16 },
+  { label: 'FIN', detail: '0x01 (1)', value: 1 },
+  { label: 'RST', detail: '0x04 (4)', value: 4 },
+  { label: 'PSH', detail: '0x08 (8)', value: 8 },
+  { label: 'URG', detail: '0x20 (32)', value: 32 },
+  { label: 'SYN+ACK', detail: '0x12 (18)', value: 18 },
+  { label: 'FIN+ACK', detail: '0x11 (17)', value: 17 },
+  { label: 'RST+ACK', detail: '0x14 (20)', value: 20 },
+  { label: 'PSH+ACK', detail: '0x18 (24)', value: 24 },
+];
+
+const ICMP_TYPES: { label: string; value: number }[] = [
+  { label: 'Echo Reply', value: 0 },
+  { label: 'Destination Unreachable', value: 3 },
+  { label: 'Redirect', value: 5 },
+  { label: 'Echo Request', value: 8 },
+  { label: 'Time Exceeded', value: 11 },
+  { label: 'Timestamp', value: 13 },
+];
+
+const DSCP_VALUES: { label: string; value: number }[] = [
+  { label: 'Best Effort (BE)', value: 0 },
+  { label: 'EF (Expedited)', value: 46 },
+  { label: 'AF11', value: 10 }, { label: 'AF12', value: 12 }, { label: 'AF13', value: 14 },
+  { label: 'AF21', value: 18 }, { label: 'AF22', value: 20 }, { label: 'AF23', value: 22 },
+  { label: 'AF31', value: 26 }, { label: 'AF32', value: 28 }, { label: 'AF33', value: 30 },
+  { label: 'AF41', value: 34 }, { label: 'AF42', value: 36 }, { label: 'AF43', value: 38 },
+  { label: 'CS1', value: 8 }, { label: 'CS2', value: 16 }, { label: 'CS3', value: 24 },
+  { label: 'CS4', value: 32 }, { label: 'CS5', value: 40 }, { label: 'CS6', value: 48 },
+  { label: 'CS7', value: 56 },
+];
+
+const DURATION_SHORTCUTS: { label: string; detail: string; data: string }[] = [
+  { label: '1s', detail: '1 second', data: '1000' },
+  { label: '5s', detail: '5 seconds', data: '5000' },
+  { label: '10s', detail: '10 seconds', data: '10000' },
+  { label: '30s', detail: '30 seconds', data: '30000' },
+  { label: '1m', detail: '1 minute', data: '60000' },
+  { label: '5m', detail: '5 minutes', data: '300000' },
+  { label: '10m', detail: '10 minutes', data: '600000' },
+];
+
+const COUNTER_MAGNITUDES: { label: string; detail: string; data: string }[] = [
+  { label: '1K', detail: '1,000', data: '1000' },
+  { label: '10K', detail: '10,000', data: '10000' },
+  { label: '100K', detail: '100,000', data: '100000' },
+  { label: '1M', detail: '1,000,000', data: '1000000' },
+  { label: '10M', detail: '10,000,000', data: '10000000' },
+  { label: '100M', detail: '100,000,000', data: '100000000' },
+  { label: '1G', detail: '1,000,000,000', data: '1000000000' },
+];
+
+function filterByQuery(items: SuggestionItem[], query: string): SuggestionItem[] {
+  if (!query) return items;
+  return items.filter((it) =>
+    it.label.toLowerCase().includes(query) || it.detail.toLowerCase().includes(query),
+  );
+}
+
+function getValueSuggestions(field: SchemaField, op: string, query: string): SuggestionItem[] {
+  const q = query.toLowerCase();
+  const hint = field.semantic_hint ?? '';
+  const ft = field.filter_type ?? '';
+
+  // TCP flags
+  if (hint === 'tcp_flags') {
+    return filterByQuery(TCP_FLAGS.map((f) => ({
+      key: `flag-${f.value}`, label: f.label, detail: f.detail, data: String(f.value),
+    })), q);
+  }
+
+  // ICMP types
+  if (hint === 'icmp_type') {
+    return filterByQuery(ICMP_TYPES.map((t) => ({
+      key: `icmp-${t.value}`, label: t.label, detail: String(t.value), data: String(t.value),
+    })), q);
+  }
+
+  // DSCP
+  if (hint === 'dscp') {
+    return filterByQuery(DSCP_VALUES.map((d) => ({
+      key: `dscp-${d.value}`, label: d.label, detail: String(d.value), data: String(d.value),
+    })), q);
+  }
+
+  // Timestamps
+  if (hint === 'timestamp_s' || hint === 'timestamp_ms') {
+    const mul = hint === 'timestamp_ms' ? 1000 : 1;
+    const nowS = Math.floor(Date.now() / 1000);
+    const items: SuggestionItem[] = [
+      { key: 'ts-now', label: 'now', detail: 'Current time', data: String(nowS * mul), group: 'Time shortcuts' },
+      { key: 'ts-1h', label: '1h ago', detail: '1 hour ago', data: String((nowS - 3600) * mul) },
+      { key: 'ts-24h', label: '24h ago', detail: '24 hours ago', data: String((nowS - 86400) * mul) },
+      { key: 'ts-7d', label: '7d ago', detail: '7 days ago', data: String((nowS - 604800) * mul) },
+    ];
+    return filterByQuery(items, q);
+  }
+
+  // Duration
+  if (hint === 'duration_ms') {
+    return filterByQuery(DURATION_SHORTCUTS.map((d) => ({
+      key: `dur-${d.data}`, label: d.label, detail: d.detail, data: d.data,
+    })), q);
+  }
+
+  // Boolean
+  if (ft === 'boolean') {
+    return filterByQuery([
+      { key: 'bool-true', label: 'true', detail: 'True', data: 'true' },
+      { key: 'bool-false', label: 'false', detail: 'False', data: 'false' },
+    ], q);
+  }
+
+  // Protocol
+  if (ft === 'protocol') {
+    return filterByQuery(COMMON_PROTOCOLS.map((p) => ({
+      key: `proto-${p.name}`,
+      label: p.name,
+      detail: `protocol ${p.num}`,
+      data: op === 'named' ? p.name : String(p.num),
+    })), q);
+  }
+
+  // Port (for eq, ne, in, named)
+  if (ft === 'port' && ['eq', 'ne', 'in', 'named'].includes(op)) {
+    return filterByQuery(COMMON_SERVICES.map((s) => ({
+      key: `svc-${s.name}`,
+      label: s.name,
+      detail: `port ${s.port}`,
+      data: op === 'named' ? s.name : String(s.port),
+    })), q);
+  }
+
+  // Counter magnitudes
+  if (hint === 'counter' && ['gt', 'ge', 'lt', 'le', 'between'].includes(op)) {
+    return filterByQuery(COUNTER_MAGNITUDES.map((m) => ({
+      key: `mag-${m.data}`, label: m.label, detail: m.detail, data: m.data,
+    })), q);
+  }
+
+  return [];
+}
+
+function getValuePlaceholder(field: SchemaField, op: string): string {
+  const hint = field.semantic_hint ?? '';
+  const ft = field.filter_type ?? '';
+
+  // Semantic hints take priority
+  if (hint === 'timestamp_s') return 'epoch seconds or shortcut';
+  if (hint === 'timestamp_ms') return 'epoch ms or shortcut';
+  if (hint === 'duration_ms') {
+    if (op === 'between') return 'e.g. 5s,1m or 5000,60000';
+    return 'e.g. 5s, 1m, 5000';
+  }
+  if (hint === 'tcp_flags') return 'e.g. SYN, 0x02, 2';
+  if (hint === 'icmp_type') return 'e.g. Echo Request, 8';
+  if (hint === 'dscp') return 'e.g. EF, AF11, 46';
+
+  // Filter type + op combinations
+  if (ft === 'boolean') return 'true or false';
+
+  if (ft === 'ipv4') {
+    if (op === 'eq') return 'e.g. 10.0.0.1';
+    if (op === 'cidr') return 'e.g. 10.0.0.0/24';
+    if (op === 'wildcard') return 'e.g. 10.*.*.1';
+    if (op === 'ip_range') return 'e.g. 10.0.0.1-10.0.0.255';
+    if (op === 'in' || op === 'not_in') return 'e.g. 10.0.0.1,10.0.0.2';
+  }
+  if (ft === 'ipv6') {
+    if (op === 'eq') return 'e.g. 2001:db8::1';
+    if (op === 'cidr') return 'e.g. 2001:db8::/32';
+    if (op === 'in' || op === 'not_in') return 'e.g. 2001:db8::1,2001:db8::2';
+  }
+  if (ft === 'port') {
+    if (op === 'eq') return 'e.g. 443 or https';
+    if (op === 'port_range') return 'e.g. 1024,65535';
+    if (op === 'named') return 'e.g. https, ssh, dns';
+    if (op === 'in' || op === 'not_in') return 'e.g. 80,443,8080';
+  }
+  if (ft === 'protocol') {
+    if (op === 'eq') return 'e.g. 6 or tcp';
+    if (op === 'named') return 'e.g. tcp, udp, icmp';
+  }
+  if (ft === 'mac') {
+    if (op === 'eq') return 'e.g. aa:bb:cc:dd:ee:ff';
+    if (op === 'prefix') return 'e.g. aa:bb:cc';
+  }
+  if (ft === 'string') {
+    if (op === 'eq') return 'e.g. SSH';
+    if (op === 'regex') return 'e.g. ^HTTP.*';
+    if (op === 'contains') return 'e.g. HTTP';
+    if (op === 'in' || op === 'not_in') return 'e.g. SSH,HTTP,DNS';
+  }
+  if (ft === 'numeric') {
+    if (op === 'eq') return 'e.g. 1000, 1K, 1M';
+    if (op === 'between') return 'e.g. 100,1000';
+    if (op === 'in' || op === 'not_in') return 'e.g. 100,200,300';
+    if (op === 'gt' || op === 'ge' || op === 'lt' || op === 'le') return 'e.g. 1000';
+  }
+
+  return `value for ${field.name}...`;
+}
+
+function getOpPriority(filterType: string, semanticHint: string, op: string): number {
+  const hint = semanticHint ?? '';
+  const ft = filterType ?? '';
+
+  if (ft === 'ipv4' || ft === 'ipv6') {
+    const m: Record<string, number> = { cidr: 0, eq: 1, ne: 2, in: 3, not_in: 4, wildcard: 5, ip_range: 6 };
+    return m[op] ?? 99;
+  }
+  if (ft === 'port') {
+    const m: Record<string, number> = { eq: 0, named: 1, ne: 2, port_range: 3, gt: 4, ge: 5, lt: 6, le: 7, in: 8, not_in: 9 };
+    return m[op] ?? 99;
+  }
+  if (ft === 'protocol') {
+    const m: Record<string, number> = { named: 0, eq: 1, ne: 2, in: 3, not_in: 4 };
+    return m[op] ?? 99;
+  }
+  if (ft === 'boolean') {
+    return op === 'eq' ? 0 : 99;
+  }
+  if (ft === 'mac') {
+    const m: Record<string, number> = { eq: 0, prefix: 1, ne: 2, in: 3, not_in: 4 };
+    return m[op] ?? 99;
+  }
+  if (ft === 'string') {
+    const m: Record<string, number> = {
+      contains: 0, eq: 1, ne: 2, starts_with: 3, ends_with: 4,
+      regex: 5, not_regex: 6, not_contains: 7, in: 8, not_in: 9,
+    };
+    return m[op] ?? 99;
+  }
+  if (ft === 'numeric') {
+    if (hint === 'counter') {
+      const m: Record<string, number> = { gt: 0, ge: 1, lt: 2, le: 3, between: 4, eq: 5, ne: 6, in: 7, not_in: 8 };
+      return m[op] ?? 99;
+    }
+    if (hint === 'timestamp_s' || hint === 'timestamp_ms') {
+      const m: Record<string, number> = { gt: 0, lt: 1, ge: 2, le: 3, between: 4, eq: 8, ne: 9 };
+      return m[op] ?? 99;
+    }
+    if (hint === 'duration_ms') {
+      const m: Record<string, number> = { gt: 0, lt: 1, between: 2, ge: 3, le: 4, eq: 5, ne: 6 };
+      return m[op] ?? 99;
+    }
+  }
+
+  return 99; // default: preserve schema order
+}
 
 // Aliases ordered by network engineer workflow:
 // 1. 5-tuple identity (what you always filter on)
@@ -154,27 +412,22 @@ function saveHistory(entry: HistoryEntry): void {
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(filtered)); } catch { /* full */ }
 }
 
-function filtersToText(filters: StructuredFilter[], logic: 'and' | 'or'): string {
+function filtersToText(filters: StructuredFilter[]): string {
   if (filters.length === 0) return '';
   return filters
     .map((f) => isLimitFilter(f) ? `limit ${String(f.value)}` : `${f.field} ${OP_LABELS[f.op] ?? f.op} ${String(f.value)}`)
-    .join(` ${logic} `);
+    .join(' and ');
 }
 
-function textToFilters(text: string): { filters: StructuredFilter[]; logic: 'and' | 'or' } | null {
+function textToFilters(text: string): { filters: StructuredFilter[] } | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
-  let logic: 'and' | 'or' = 'and';
+  // Split on " and " separator
   let parts: string[];
-  // Split on " or " or " and " — detect which is used
-  if (/\s+or\s+/.test(trimmed) && !/\s+and\s+/.test(trimmed)) {
-    logic = 'or';
-    parts = trimmed.split(/\s+or\s+/);
-  } else if (/\s+and\s+/.test(trimmed)) {
+  if (/\s+and\s+/.test(trimmed)) {
     parts = trimmed.split(/\s+and\s+/);
   } else {
-    // Single filter, no logic separator
     parts = [trimmed];
   }
 
@@ -223,7 +476,7 @@ function textToFilters(text: string): { filters: StructuredFilter[]; logic: 'and
     }
   }
 
-  return filters.length > 0 ? { filters, logic } : null;
+  return filters.length > 0 ? { filters } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +484,7 @@ function textToFilters(text: string): { filters: StructuredFilter[]; logic: 'and
 // ---------------------------------------------------------------------------
 
 export function SearchBar({
-  filters, onChange, logic, onLogicChange, schema,
+  filters, onChange, schema,
   onExecute, onCancel, loading,
 }: SearchBarProps) {
   const [inputValue, setInputValue] = useState('');
@@ -242,8 +495,6 @@ export function SearchBar({
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [editTarget, setEditTarget] = useState<EditTarget>(null);
-  const lastEnterTime = useRef(0);
-
   const inputRef = useRef<HTMLInputElement>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -371,10 +622,11 @@ export function SearchBar({
         lastGroup = group;
       }
 
-      // Inject "limit" pseudo-field at the end of aliases
+      // Inject "limit" pseudo-field — only when at least one real filter exists
+      const hasRealFilter = filters.some((f) => !isLimitFilter(f));
       const limitLabel = LIMIT_FIELD;
-      if (!query || limitLabel.includes(query)) {
-        const limitField: SchemaField = { name: LIMIT_FIELD, filter_type: 'numeric', data_type: 'limit', description: 'Limit result rows' };
+      if (hasRealFilter && (!query || limitLabel.includes(query))) {
+        const limitField: SchemaField = { name: LIMIT_FIELD, filter_type: 'numeric', data_type: 'limit', description: 'Limit result rows', semantic_hint: '' };
         // Insert after aliases, before Fields header
         const fieldsIdx = items.findIndex((it) => it.group === 'Fields');
         const limitItem: SuggestionItem = { key: LIMIT_FIELD, label: LIMIT_FIELD, detail: 'Limit result rows', data: limitField };
@@ -387,33 +639,33 @@ export function SearchBar({
 
     if (completionState === 'op' && (pendingField || editTarget?.part === 'op')) {
       const ft = pendingField?.filter_type ?? '';
+      const hint = pendingField?.semantic_hint ?? '';
       const ops = schema.filter_types[ft] ?? [];
       return ops
         .filter((op) => {
           if (!query) return true;
           const label = OP_LABELS[op] ?? op;
-          return label.toLowerCase().includes(query) || op.toLowerCase().includes(query);
+          const hintText = schema.op_hints?.[op] ?? '';
+          return label.toLowerCase().includes(query) || op.toLowerCase().includes(query)
+            || hintText.toLowerCase().includes(query);
         })
-        .map((op) => ({ key: op, label: OP_LABELS[op] ?? op, detail: op, data: op }));
+        .sort((a, b) => getOpPriority(ft, hint, a) - getOpPriority(ft, hint, b))
+        .map((op) => ({
+          key: op,
+          label: OP_LABELS[op] ?? op,
+          detail: schema.op_hints?.[op] ?? op,
+          data: op,
+        }));
     }
 
     if (completionState === 'value' && (pendingField || editTarget?.part === 'value')) {
-      const ft = pendingField?.filter_type ?? '';
-      const op = pendingOp ?? '';
-      if (ft === 'protocol' && op === 'named') {
-        return COMMON_PROTOCOLS
-          .filter((p) => !query || p.includes(query))
-          .map((p) => ({ key: p, label: p, detail: 'protocol', data: p }));
-      }
-      if (ft === 'port' && op === 'named') {
-        return COMMON_SERVICES
-          .filter((s) => !query || s.includes(query))
-          .map((s) => ({ key: s, label: s, detail: 'service', data: s }));
+      if (pendingField) {
+        return getValueSuggestions(pendingField, pendingOp ?? '', query);
       }
     }
 
     return [];
-  }, [schema, inputValue, completionState, pendingField, pendingOp, editTarget]);
+  }, [schema, inputValue, completionState, pendingField, pendingOp, editTarget, filters]);
 
   useEffect(() => {
     setActiveIndex((prev) => Math.min(prev, Math.max(0, suggestions.length - 1)));
@@ -433,14 +685,13 @@ export function SearchBar({
 
   const applyHistory = useCallback((entry: HistoryEntry) => {
     onChange(entry.filters);
-    onLogicChange(entry.logic);
     setShowHistory(false);
     inputRef.current?.focus();
-  }, [onChange, onLogicChange]);
+  }, [onChange]);
 
   const saveCurrentToHistory = useCallback(() => {
-    if (filters.length > 0) saveHistory({ filters, logic });
-  }, [filters, logic]);
+    if (filters.length > 0) saveHistory({ filters });
+  }, [filters]);
 
   // ---------------------------------------------------------------------------
   // Copy / Paste
@@ -448,7 +699,7 @@ export function SearchBar({
 
   const [copied, setCopied] = useState(false);
   const copyQueryToClipboard = useCallback(() => {
-    const text = filtersToText(filters, logic);
+    const text = filtersToText(filters);
     if (!text) return;
     // Try modern API first, fall back to execCommand
     if (navigator.clipboard?.writeText) {
@@ -480,7 +731,7 @@ export function SearchBar({
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     }
-  }, [filters, logic]);
+  }, [filters]);
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     if (editTarget) return;
@@ -490,12 +741,11 @@ export function SearchBar({
     if (parsed) {
       e.preventDefault();
       onChange(parsed.filters);
-      onLogicChange(parsed.logic);
       setInputValue('');
       setCompletionState('idle');
       setShowSuggestions(false);
     }
-  }, [editTarget, completionState, onChange, onLogicChange]);
+  }, [editTarget, completionState, onChange]);
 
   // ---------------------------------------------------------------------------
   // Composition actions (new filters)
@@ -540,7 +790,15 @@ export function SearchBar({
     if (!pendingField || !pendingOp) return;
     const trimmed = value.trim();
     if (!trimmed) return;
-    onChange([...filters, { field: pendingField.name, op: pendingOp, value: trimmed }]);
+    const newFilter: StructuredFilter = { field: pendingField.name, op: pendingOp, value: trimmed };
+    // If adding a non-limit filter and limit already exists, keep limit last
+    if (!isLimitFilter(newFilter)) {
+      const nonLimit = filters.filter((f) => !isLimitFilter(f));
+      const limitF = filters.filter((f) => isLimitFilter(f));
+      onChange([...nonLimit, newFilter, ...limitF]);
+    } else {
+      onChange([...filters, newFilter]);
+    }
     resetComposition();
     inputRef.current?.focus();
   }, [editTarget, commitEditValue, pendingField, pendingOp, filters, onChange, resetComposition]);
@@ -612,13 +870,10 @@ export function SearchBar({
       e.preventDefault(); commitFilter(inputValue); return;
     }
 
-    // Double-Enter in idle → execute
+    // Enter in idle → execute immediately
     if (e.key === 'Enter' && completionState === 'idle' && !inputValue.trim() && !showSuggestions && !editTarget) {
       e.preventDefault();
-      const now = Date.now();
-      if (now - lastEnterTime.current < 500) {
-        saveCurrentToHistory(); onExecute(); lastEnterTime.current = 0;
-      } else { lastEnterTime.current = now; }
+      saveCurrentToHistory(); onExecute();
     }
   }, [
     inputValue, showSuggestions, showHistory, suggestions, history, activeIndex,
@@ -663,7 +918,7 @@ export function SearchBar({
   const placeholder = useMemo(() => {
     if (completionState === 'op' && pendingField) return `operator for ${pendingField.name}...`;
     if (completionState === 'value' && pendingField && pendingOp)
-      return `value for ${pendingField.name} ${OP_LABELS[pendingOp] ?? pendingOp}...`;
+      return getValuePlaceholder(pendingField, pendingOp);
     if (filters.length === 0) return 'Type to add filters (e.g. src, proto, dport)...';
     return 'Add filter...';
   }, [completionState, pendingField, pendingOp, filters.length]);
@@ -750,13 +1005,6 @@ export function SearchBar({
         <div className="search-bar-chips">
           {filters.map((f, i) => (
             <span key={i} className="search-chip-group">
-              {i > 0 && (
-                <button className="search-logic-toggle"
-                  onClick={(e) => { e.stopPropagation(); onLogicChange(logic === 'and' ? 'or' : 'and'); }}
-                  title="Toggle AND/OR">
-                  {logic}
-                </button>
-              )}
               {renderChip(f, i, true)}
             </span>
           ))}
@@ -814,7 +1062,7 @@ export function SearchBar({
               e.stopPropagation();
               if (loading) onCancel(); else { saveCurrentToHistory(); onExecute(); }
             }}
-            title={loading ? 'Cancel query' : 'Run query (Enter Enter)'}>
+            title={loading ? 'Cancel query' : 'Run query (Enter)'}>
             {loading ? (
               <span className="search-run-spinner" />
             ) : (
@@ -862,7 +1110,7 @@ export function SearchBar({
               <span className="search-suggestion-label">
                 {entry.filters.map((f, j) => (
                   <span key={j} className="history-filter-group">
-                    {j > 0 && <span className="history-logic">{entry.logic}</span>}
+                    {j > 0 && <span className="history-logic">and</span>}
                     {renderChip(f, null, false)}
                   </span>
                 ))}

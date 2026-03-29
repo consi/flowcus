@@ -32,9 +32,9 @@ interface GanttRow {
 }
 
 const COLORS: Record<string, string> = {
-  prune: '#58a6ff', index: '#d2a8ff', bloom: '#7ee787', seek: '#56d4dd',
-  read: '#ffa657', filter: '#e3b341', aggregate: '#ff7b72',
-  skip: '#8b949e', shortcut: '#7ee787', parallel: '#58a6ff',
+  prune: '#5b7fb8', index: '#7c6ca8', bloom: '#5e9e7a', seek: '#5a8e9e',
+  read: '#c49a5c', filter: '#b8a040', aggregate: '#c46b6b',
+  skip: '#9494a8', shortcut: '#5e9e7a', parallel: '#5b7fb8',
 };
 
 function humanBytes(bytes: number): string {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::schema::DurationSource;
 use flowcus_ipfix::protocol::{DataRecord, IpfixMessage, SetContents};
@@ -179,10 +179,10 @@ impl StorageWriter {
         let export_time = if msg.header.export_time >= 946_684_800 {
             msg.header.export_time
         } else {
-            tracing::debug!(
+            tracing::warn!(
                 original = msg.header.export_time,
                 exporter = %exporter,
-                "Exporter sent invalid export_time, using wall clock"
+                "Exporter sent invalid export_time (epoch zero or pre-2000), using arrival time"
             );
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -309,7 +309,8 @@ impl StorageWriter {
         match flush_schema_buffer(buf, &base_dir, seq) {
             Ok(path) => {
                 let rows = buf.row_count;
-                debug!(part = %path.display(), rows, "Part flushed");
+                let bytes = buf.mem_size();
+                info!(part = %path.display(), rows, bytes, "Part flushed to disk");
 
                 // Mark this hour as needing merge attention
                 if let (Some(pending), Some(hour_dir)) = (&self.pending, path.parent()) {
@@ -403,7 +404,7 @@ fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
         let _t_gran = flowcus_core::profiling::span_timer("storage;writer;flush;compute_granules");
-        let (marks, blooms, stats) = crate::granule::compute_granules(
+        let (marks, blooms) = crate::granule::compute_granules(
             col_buf,
             &encoded.data,
             INGESTION_GRANULE_SIZE,
@@ -416,7 +417,6 @@ fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io
             encoded,
             marks,
             blooms,
-            stats,
         });
     }
 

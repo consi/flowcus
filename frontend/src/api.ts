@@ -151,11 +151,13 @@ export interface SchemaField {
   filter_type: string;
   data_type: string;
   description: string;
+  semantic_hint: string;
 }
 
 export interface SchemaResponse {
   filter_types: Record<string, string[]>;
   fields: SchemaField[];
+  op_hints: Record<string, string>;
 }
 
 export async function executeStructuredQuery(

@@ -27,7 +27,7 @@ rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
-reqwest = { workspace = true }

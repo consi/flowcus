@@ -30,7 +30,7 @@ pub struct Table {
 #[derive(Debug, Clone)]
 pub struct PartEntry {
     pub path: PathBuf,
-    /// Part format version (0 = legacy without `.stats`, 1 = current with `.stats`).
+    /// Part format version (0 = legacy 4-segment dir name, 1 = current 5-segment).
     pub format_version: u32,
     pub generation: u32,
     pub time_min: u32,

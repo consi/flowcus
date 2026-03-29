@@ -46,11 +46,8 @@ use crate::schema::StorageType;
 
 pub const MARK_MAGIC: &[u8; 4] = b"FMRK";
 pub const BLOOM_MAGIC: &[u8; 4] = b"FBLM";
-pub const STATS_MAGIC: &[u8; 4] = b"FSTA";
 pub const MARK_HEADER_SIZE: usize = 16;
 pub const MARK_ENTRY_SIZE: usize = 48;
-pub const STATS_HEADER_SIZE: usize = 16;
-pub const STATS_ENTRY_SIZE: usize = 32;
 /// Number of hash functions for bloom filter.
 pub const BLOOM_NUM_HASHES: u32 = 3;
 
@@ -73,68 +70,6 @@ pub struct GranuleMark {
 #[derive(Debug, Clone)]
 pub struct GranuleBloom {
     pub bits: Vec<u64>,
-}
-
-/// Pre-computed statistics for a single granule within a column.
-///
-/// Enables the query executor to answer aggregation queries (sum, count, min, max)
-/// without reading the column data file. For non-numeric columns (VarLen, Mac, U128),
-/// sum is always 0 and min/max are 0.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GranuleStats {
-    /// Number of rows in this granule.
-    pub row_count: u32,
-    /// Sum of all values as u64 (wrapping for overflow). 0 for non-numeric types.
-    pub sum: u64,
-    /// Minimum value as u64. 0 for non-numeric types.
-    pub min: u64,
-    /// Maximum value as u64. 0 for non-numeric types.
-    pub max: u64,
-}
-
-/// Aggregated statistics across all granules for a column.
-///
-/// Derived at read time from `Vec<GranuleStats>` — not stored on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnStats {
-    /// Total rows (sum of all granule row_counts).
-    pub row_count: u64,
-    /// Sum of all granule sums (wrapping).
-    pub sum: u64,
-    /// Minimum across all granule minimums.
-    pub min: u64,
-    /// Maximum across all granule maximums.
-    pub max: u64,
-}
-
-/// Aggregate per-granule stats into a single column-level summary.
-pub fn aggregate_column_stats(granule_stats: &[GranuleStats]) -> ColumnStats {
-    if granule_stats.is_empty() {
-        return ColumnStats {
-            row_count: 0,
-            sum: 0,
-            min: 0,
-            max: 0,
-        };
-    }
-    let mut total_rows: u64 = 0;
-    let mut total_sum: u64 = 0;
-    let mut global_min: u64 = u64::MAX;
-    let mut global_max: u64 = 0;
-
-    for gs in granule_stats {
-        total_rows += u64::from(gs.row_count);
-        total_sum = total_sum.wrapping_add(gs.sum);
-        global_min = global_min.min(gs.min);
-        global_max = global_max.max(gs.max);
-    }
-
-    ColumnStats {
-        row_count: total_rows,
-        sum: total_sum,
-        min: global_min,
-        max: global_max,
-    }
 }
 
 impl GranuleBloom {
@@ -178,20 +113,20 @@ impl GranuleBloom {
     }
 }
 
-/// Compute marks, bloom filters, and statistics for a column buffer.
+/// Compute marks and bloom filters for a column buffer.
 ///
-/// Called during both ingestion flush and merge. Returns mark entries,
-/// bloom filter data, and per-granule statistics ready for writing to disk.
+/// Called during both ingestion flush and merge. Returns mark entries
+/// and bloom filter data ready for writing to disk.
 pub fn compute_granules(
     buffer: &ColumnBuffer,
     _encoded_data: &[u8],
     granule_size: usize,
     bloom_bits: usize,
     storage_type: StorageType,
-) -> (Vec<GranuleMark>, Vec<GranuleBloom>, Vec<GranuleStats>) {
+) -> (Vec<GranuleMark>, Vec<GranuleBloom>) {
     let row_count = buffer.row_count();
     if row_count == 0 {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new());
     }
 
     let num_granules = row_count.div_ceil(granule_size);
@@ -199,7 +134,6 @@ pub fn compute_granules(
 
     let mut marks = Vec::with_capacity(num_granules);
     let mut blooms = Vec::with_capacity(num_granules);
-    let mut stats = Vec::with_capacity(num_granules);
 
     for g in 0..num_granules {
         let row_start = g * granule_size;
@@ -234,12 +168,9 @@ pub fn compute_granules(
         let mut bloom = GranuleBloom::new(bloom_bits);
         insert_granule_into_bloom(buffer, row_start, row_end, &mut bloom);
         blooms.push(bloom);
-
-        // Compute aggregate stats for this granule
-        stats.push(compute_granule_stats(buffer, row_start, row_end));
     }
 
-    (marks, blooms, stats)
+    (marks, blooms)
 }
 
 /// Write marks to a .mrk file.
@@ -392,109 +323,6 @@ pub fn read_blooms(path: &Path) -> std::io::Result<(u32, Vec<GranuleBloom>)> {
     Ok((bits_per_granule as u32, blooms))
 }
 
-/// Write per-granule statistics to a .stats file.
-///
-/// Format: 16-byte header + 32 bytes per granule + 4-byte trailing CRC32-C.
-pub fn write_stats(
-    path: &Path,
-    stats: &[GranuleStats],
-    storage_type: StorageType,
-) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut w = std::io::BufWriter::with_capacity(32 * 1024, file);
-
-    let mut content = Vec::with_capacity(STATS_HEADER_SIZE + stats.len() * STATS_ENTRY_SIZE);
-
-    // Header (16 bytes)
-    content.extend_from_slice(STATS_MAGIC);
-    content.extend_from_slice(&(stats.len() as u32).to_le_bytes());
-    content.push(storage_type_to_u8(storage_type));
-    content.extend_from_slice(&[0u8; 7]); // reserved
-
-    // Per-granule entries (32 bytes each)
-    for gs in stats {
-        content.extend_from_slice(&gs.row_count.to_le_bytes()); // 4
-        content.extend_from_slice(&0u32.to_le_bytes()); // 4 reserved
-        content.extend_from_slice(&gs.sum.to_le_bytes()); // 8
-        content.extend_from_slice(&gs.min.to_le_bytes()); // 8
-        content.extend_from_slice(&gs.max.to_le_bytes()); // 8
-    }
-
-    // Trailing CRC32-C
-    let crc = crate::crc::crc32c(&content);
-    content.extend_from_slice(&crc.to_le_bytes());
-
-    w.write_all(&content)?;
-    Ok(())
-}
-
-/// Read per-granule statistics from a .stats file.
-///
-/// Returns the granule stats and the storage type stored in the header.
-pub fn read_stats(path: &Path) -> std::io::Result<(Vec<GranuleStats>, StorageType)> {
-    let raw = std::fs::read(path)?;
-    if raw.len() < STATS_HEADER_SIZE + 4 || &raw[..4] != STATS_MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid .stats file",
-        ));
-    }
-
-    // Verify trailing CRC32-C (last 4 bytes)
-    let (buf, crc_bytes) = raw.split_at(raw.len() - 4);
-    let stored_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
-    if !crate::crc::verify_crc32c(buf, stored_crc) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("CRC mismatch in {}", path.display()),
-        ));
-    }
-
-    let num_granules = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    let storage_type = u8_to_storage_type(buf[8]);
-
-    let mut stats = Vec::with_capacity(num_granules);
-    for i in 0..num_granules {
-        let off = STATS_HEADER_SIZE + i * STATS_ENTRY_SIZE;
-        if off + STATS_ENTRY_SIZE > buf.len() {
-            break;
-        }
-        stats.push(GranuleStats {
-            row_count: u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()),
-            // skip reserved at off+4..off+8
-            sum: u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap()),
-            min: u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap()),
-            max: u64::from_le_bytes(buf[off + 24..off + 32].try_into().unwrap()),
-        });
-    }
-
-    Ok((stats, storage_type))
-}
-
-fn storage_type_to_u8(st: StorageType) -> u8 {
-    match st {
-        StorageType::U8 => 0,
-        StorageType::U16 => 1,
-        StorageType::U32 => 2,
-        StorageType::U64 => 3,
-        StorageType::U128 => 4,
-        StorageType::Mac => 5,
-        StorageType::VarLen => 10,
-    }
-}
-
-fn u8_to_storage_type(v: u8) -> StorageType {
-    match v {
-        0 => StorageType::U8,
-        1 => StorageType::U16,
-        2 => StorageType::U32,
-        3 => StorageType::U64,
-        4 => StorageType::U128,
-        5 => StorageType::Mac,
-        _ => StorageType::VarLen,
-    }
-}
-
 // ---- Internal helpers ----
 
 /// Bloom hash function: FNV-1a with seed mixing for multiple hashes.
@@ -560,100 +388,6 @@ fn compute_granule_min_max(
     }
 
     (min_val, max_val)
-}
-
-/// Compute sum, min, max for a range of rows in a column buffer.
-///
-/// For numeric types (U8, U16, U32, U64), computes real statistics.
-/// For non-numeric types (U128, Mac, VarLen), returns zeros.
-/// Compute sum/count/min/max stats for a range of rows in a column buffer.
-pub fn compute_granule_stats(
-    buffer: &ColumnBuffer,
-    row_start: usize,
-    row_end: usize,
-) -> GranuleStats {
-    let rows_in_granule = (row_end - row_start) as u32;
-
-    match buffer {
-        ColumnBuffer::U8(v) => {
-            let slice = &v[row_start..row_end];
-            let mut sum: u64 = 0;
-            let mut mn = u64::MAX;
-            let mut mx: u64 = 0;
-            for &val in slice {
-                let v = u64::from(val);
-                sum = sum.wrapping_add(v);
-                mn = mn.min(v);
-                mx = mx.max(v);
-            }
-            GranuleStats {
-                row_count: rows_in_granule,
-                sum,
-                min: mn,
-                max: mx,
-            }
-        }
-        ColumnBuffer::U16(v) => {
-            let slice = &v[row_start..row_end];
-            let mut sum: u64 = 0;
-            let mut mn = u64::MAX;
-            let mut mx: u64 = 0;
-            for &val in slice {
-                let v = u64::from(val);
-                sum = sum.wrapping_add(v);
-                mn = mn.min(v);
-                mx = mx.max(v);
-            }
-            GranuleStats {
-                row_count: rows_in_granule,
-                sum,
-                min: mn,
-                max: mx,
-            }
-        }
-        ColumnBuffer::U32(v) => {
-            let slice = &v[row_start..row_end];
-            let mut sum: u64 = 0;
-            let mut mn = u64::MAX;
-            let mut mx: u64 = 0;
-            for &val in slice {
-                let v = u64::from(val);
-                sum = sum.wrapping_add(v);
-                mn = mn.min(v);
-                mx = mx.max(v);
-            }
-            GranuleStats {
-                row_count: rows_in_granule,
-                sum,
-                min: mn,
-                max: mx,
-            }
-        }
-        ColumnBuffer::U64(v) => {
-            let slice = &v[row_start..row_end];
-            let mut sum: u64 = 0;
-            let mut mn = u64::MAX;
-            let mut mx: u64 = 0;
-            for &val in slice {
-                sum = sum.wrapping_add(val);
-                mn = mn.min(val);
-                mx = mx.max(val);
-            }
-            GranuleStats {
-                row_count: rows_in_granule,
-                sum,
-                min: mn,
-                max: mx,
-            }
-        }
-        // Non-numeric types: no meaningful sum/min/max
-        _ => GranuleStats {
-            row_count: rows_in_granule,
-            sum: 0,
-            min: 0,
-            max: 0,
-        },
-    }
 }
 
 /// Insert all values in a granule row range into a bloom filter.
@@ -747,12 +481,11 @@ mod tests {
             col.push(&FieldValue::Ipv4(Ipv4Addr::from(i)));
         }
         let encoded = col.as_raw_bytes();
-        let (marks, blooms, stats) = compute_granules(&col, encoded, 8192, 1024, StorageType::U32);
+        let (marks, blooms) = compute_granules(&col, encoded, 8192, 1024, StorageType::U32);
 
         // 20000 rows / 8192 granule = 3 granules (8192, 8192, 3616)
         assert_eq!(marks.len(), 3);
         assert_eq!(blooms.len(), 3);
-        assert_eq!(stats.len(), 3);
         assert_eq!(marks[0].row_start, 0);
         assert_eq!(marks[0].row_count, 8192);
         assert_eq!(marks[1].row_start, 8192);
@@ -772,7 +505,7 @@ mod tests {
             col.push(&FieldValue::Unsigned32(i * 2));
         }
         let encoded = col.as_raw_bytes();
-        let (_, blooms, _) = compute_granules(&col, encoded, 8192, 8192, StorageType::U32);
+        let (_, blooms) = compute_granules(&col, encoded, 8192, 8192, StorageType::U32);
 
         assert_eq!(blooms.len(), 1);
         // Even numbers should be found
@@ -851,149 +584,5 @@ mod tests {
         assert!(!read_blooms[0].may_contain(&99u32.to_le_bytes()));
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn stats_computation_u64() {
-        let mut col = ColumnBuffer::new(StorageType::U64);
-        for i in 1..=100u64 {
-            col.push(&FieldValue::Unsigned64(i));
-        }
-        let encoded = col.as_raw_bytes();
-        let (_, _, stats) = compute_granules(&col, encoded, 8192, 1024, StorageType::U64);
-
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].row_count, 100);
-        assert_eq!(stats[0].sum, 5050); // sum(1..=100)
-        assert_eq!(stats[0].min, 1);
-        assert_eq!(stats[0].max, 100);
-    }
-
-    #[test]
-    fn stats_computation_u32_multi_granule() {
-        let mut col = ColumnBuffer::new(StorageType::U32);
-        // Fill 2 granules: 8192 rows each, values 0..16384
-        for i in 0..16384u32 {
-            col.push(&FieldValue::Unsigned32(i));
-        }
-        let encoded = col.as_raw_bytes();
-        let (_, _, stats) = compute_granules(&col, encoded, 8192, 1024, StorageType::U32);
-
-        assert_eq!(stats.len(), 2);
-        // Granule 0: values 0..8192
-        assert_eq!(stats[0].row_count, 8192);
-        assert_eq!(stats[0].min, 0);
-        assert_eq!(stats[0].max, 8191);
-        let expected_sum_0: u64 = (0..8192u64).sum();
-        assert_eq!(stats[0].sum, expected_sum_0);
-        // Granule 1: values 8192..16384
-        assert_eq!(stats[1].row_count, 8192);
-        assert_eq!(stats[1].min, 8192);
-        assert_eq!(stats[1].max, 16383);
-    }
-
-    #[test]
-    fn stats_computation_non_numeric() {
-        let mut col = ColumnBuffer::new(StorageType::VarLen);
-        col.push(&FieldValue::String("hello".into()));
-        col.push(&FieldValue::String("world".into()));
-        let encoded = col.as_raw_bytes();
-        let (_, _, stats) = compute_granules(&col, encoded, 8192, 1024, StorageType::VarLen);
-
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].row_count, 2);
-        assert_eq!(stats[0].sum, 0);
-        assert_eq!(stats[0].min, 0);
-        assert_eq!(stats[0].max, 0);
-    }
-
-    #[test]
-    fn stats_file_roundtrip() {
-        let stats = vec![
-            GranuleStats {
-                row_count: 8192,
-                sum: 500_000,
-                min: 10,
-                max: 99999,
-            },
-            GranuleStats {
-                row_count: 4000,
-                sum: 200_000,
-                min: 5,
-                max: 80000,
-            },
-        ];
-
-        let dir = std::env::temp_dir().join("flowcus_test_stats");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let path = dir.join("test.stats");
-        write_stats(&path, &stats, StorageType::U64).unwrap();
-
-        let (read_stats, st) = read_stats(&path).unwrap();
-        assert_eq!(st, StorageType::U64);
-        assert_eq!(read_stats.len(), 2);
-        assert_eq!(read_stats[0], stats[0]);
-        assert_eq!(read_stats[1], stats[1]);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn stats_file_crc_detects_corruption() {
-        let stats = vec![GranuleStats {
-            row_count: 100,
-            sum: 5050,
-            min: 1,
-            max: 100,
-        }];
-
-        let dir = std::env::temp_dir().join("flowcus_test_stats_crc");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let path = dir.join("test.stats");
-        write_stats(&path, &stats, StorageType::U32).unwrap();
-
-        // Corrupt a byte in the file
-        let mut data = std::fs::read(&path).unwrap();
-        data[20] ^= 0xFF;
-        std::fs::write(&path, &data).unwrap();
-
-        let result = read_stats(&path);
-        assert!(result.is_err());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn aggregate_column_stats_works() {
-        let granules = vec![
-            GranuleStats {
-                row_count: 8192,
-                sum: 1000,
-                min: 5,
-                max: 200,
-            },
-            GranuleStats {
-                row_count: 4000,
-                sum: 500,
-                min: 10,
-                max: 150,
-            },
-        ];
-        let agg = aggregate_column_stats(&granules);
-        assert_eq!(agg.row_count, 12192);
-        assert_eq!(agg.sum, 1500);
-        assert_eq!(agg.min, 5);
-        assert_eq!(agg.max, 200);
-    }
-
-    #[test]
-    fn aggregate_column_stats_empty() {
-        let agg = aggregate_column_stats(&[]);
-        assert_eq!(agg.row_count, 0);
-        assert_eq!(agg.sum, 0);
     }
 }

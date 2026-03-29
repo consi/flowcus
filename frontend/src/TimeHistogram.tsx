@@ -3,14 +3,15 @@ import {
   type StructuredTimeRange,
   type StructuredFilter,
 } from './api';
+import { getTimezone } from './formatters';
 
 interface TimeHistogramProps {
   timeRange: StructuredTimeRange;
   filters: StructuredFilter[];
-  filterLogic: 'and' | 'or';
   onTimeRangeChange: (range: StructuredTimeRange) => void;
   /** Incremented each time the main query is executed, forces histogram refresh. */
   queryGen: number;
+  timezone?: string;
 }
 
 interface HistogramBucket {
@@ -32,22 +33,22 @@ const TOOLTIP_PADDING = 8;
 
 // ── Time formatting ───────────────────────────────────────────
 
-function formatAxisTime(ts: number, windowSecs: number): string {
+function formatAxisTime(ts: number, windowSecs: number, tz: string): string {
   const d = new Date(ts * 1000);
   if (windowSecs > 86400 * 2) {
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return d.toLocaleDateString(undefined, { timeZone: tz, month: 'short', day: 'numeric' });
   }
   if (windowSecs > 86400) {
-    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleString(undefined, { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleTimeString(undefined, { timeZone: tz, hour: '2-digit', minute: '2-digit' });
 }
 
-function formatTooltipTime(ts: number, bucketSecs: number): string {
+function formatTooltipTime(ts: number, bucketSecs: number, tz: string): string {
   const d = new Date(ts * 1000);
   const end = new Date((ts + bucketSecs) * 1000);
   const fmt = (dt: Date) => dt.toLocaleTimeString(undefined, {
-    hour: '2-digit', minute: '2-digit', second: bucketSecs < 60 ? '2-digit' : undefined,
+    timeZone: tz, hour: '2-digit', minute: '2-digit', second: bucketSecs < 60 ? '2-digit' : undefined,
   });
   return `${fmt(d)} - ${fmt(end)}`;
 }
@@ -84,13 +85,21 @@ function computeYTicks(maxVal: number): number[] {
 export function TimeHistogram({
   timeRange,
   filters,
-  filterLogic,
   onTimeRangeChange,
   queryGen,
+  timezone,
 }: TimeHistogramProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [buckets, setBuckets] = useState<HistogramBucket[]>([]);
+  // Re-draw when theme changes
+  const [themeKey, setThemeKey] = useState(0);
+  useEffect(() => {
+    const obs = new MutationObserver(() => setThemeKey((k) => k + 1));
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    return () => obs.disconnect();
+  }, []);
+
   const [totalRows, setTotalRows] = useState<number>(0);
   const [histLoading, setHistLoading] = useState(false);
   const [canvasWidth, setCanvasWidth] = useState(800);
@@ -100,7 +109,6 @@ export function TimeHistogram({
   const [brushEnd, setBrushEnd] = useState<number | null>(null);
   const brushingRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const bucketDurationRef = useRef(60);
   const windowBoundsRef = useRef<[number, number]>([0, 0]);
 
@@ -108,20 +116,26 @@ export function TimeHistogram({
 
   const hasFilters = filters.some((f) => f.field !== 'limit' && f.field && f.op);
 
+  // Refs to capture current props at fetch time without triggering re-creation
+  const timeRangeRef = useRef(timeRange);
+  const filtersRef = useRef(filters);
+  timeRangeRef.current = timeRange;
+  filtersRef.current = filters;
+
   const applyEvent = useCallback((data: { buckets?: { timestamp: number; count: number }[]; total_rows?: number; time_range?: { start: number; end: number }; bucket_seconds?: number; done?: boolean }) => {
     if (data.bucket_seconds) bucketDurationRef.current = data.bucket_seconds;
     if (data.time_range) windowBoundsRef.current = [data.time_range.start, data.time_range.end];
     if (data.buckets) {
       setBuckets(data.buckets.map((b) => ({ timestamp: b.timestamp, count: b.count })));
     }
-    setTotalRows(data.total_rows ?? 0);
+    if (data.total_rows !== undefined) setTotalRows(data.total_rows);
     if (data.done) setHistLoading(false);
   }, []);
 
   const doFetch = useCallback(() => {
     if (abortRef.current) abortRef.current.abort();
 
-    const realFilters = filters.filter((f) => f.field !== 'limit' && f.field && f.op);
+    const realFilters = filtersRef.current.filter((f) => f.field !== 'limit' && f.field && f.op);
 
     // Clear previous data immediately so stale results never linger
     setBuckets([]);
@@ -135,9 +149,9 @@ export function TimeHistogram({
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
       body: JSON.stringify({
-        time_range: timeRange,
+        time_range: timeRangeRef.current,
         filters: realFilters,
-        logic: filterLogic,
+        logic: 'and',
         buckets: 60,
       }),
       signal: controller.signal,
@@ -213,16 +227,13 @@ export function TimeHistogram({
         setHistLoading(false);
       }
     });
-  }, [timeRange, filters, filterLogic, queryGen, applyEvent]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyEvent]);
 
-  // Debounced fetch on prop changes
+  // Fetch only when queryGen changes (same trigger as the main query)
   useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(doFetch, 150);
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-    };
-  }, [doFetch]);
+    doFetch();
+  }, [queryGen, doFetch]);
 
   // Cleanup abort on unmount
   useEffect(() => {
@@ -248,6 +259,8 @@ export function TimeHistogram({
 
   // ── Canvas drawing ────────────────────────────────────────
 
+  const tz = timezone ?? getTimezone();
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -265,6 +278,14 @@ export function TimeHistogram({
     if (!ctx) return;
     ctx.scale(dpr, dpr);
 
+    // Read theme colors from CSS variables
+    const css = getComputedStyle(document.documentElement);
+    const cssVar = (name: string) => css.getPropertyValue(name).trim();
+    const textMuted = cssVar('--text-secondary') || '#9494a8';
+    const gridColor = cssVar('--border') || '#d4d4de';
+    const accent = cssVar('--accent') || '#7c6ca8';
+    const textPrimary = cssVar('--text-primary') || '#1e1e2e';
+
     // Clear
     ctx.clearRect(0, 0, w, h);
 
@@ -273,7 +294,7 @@ export function TimeHistogram({
 
     if (buckets.length === 0) {
       // "No data" message
-      ctx.fillStyle = '#8b949e';
+      ctx.fillStyle = textMuted;
       ctx.font = '12px system-ui, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -286,7 +307,7 @@ export function TimeHistogram({
     const yMax = yTicks[yTicks.length - 1] || 1;
 
     // ── Grid lines ────────────────────────────────────────
-    ctx.strokeStyle = 'rgba(48, 54, 61, 0.5)';
+    ctx.strokeStyle = gridColor;
     ctx.lineWidth = 1;
     for (const tick of yTicks) {
       const y = PADDING_TOP + chartH - (tick / yMax) * chartH;
@@ -297,7 +318,7 @@ export function TimeHistogram({
     }
 
     // ── Y-axis labels ─────────────────────────────────────
-    ctx.fillStyle = '#8b949e';
+    ctx.fillStyle = textMuted;
     ctx.font = '10px system-ui, sans-serif';
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
@@ -312,12 +333,12 @@ export function TimeHistogram({
 
     // Create gradient
     const grad = ctx.createLinearGradient(0, PADDING_TOP, 0, PADDING_TOP + chartH);
-    grad.addColorStop(0, '#58a6ff');
-    grad.addColorStop(1, '#1f6feb');
+    grad.addColorStop(0, accent);
+    grad.addColorStop(1, cssVar('--purple') || accent);
 
     const hoverGrad = ctx.createLinearGradient(0, PADDING_TOP, 0, PADDING_TOP + chartH);
-    hoverGrad.addColorStop(0, '#79c0ff');
-    hoverGrad.addColorStop(1, '#388bfd');
+    hoverGrad.addColorStop(0, cssVar('--blue') || accent);
+    hoverGrad.addColorStop(1, accent);
 
     for (let i = 0; i < buckets.length; i++) {
       const bucket = buckets[i];
@@ -343,7 +364,7 @@ export function TimeHistogram({
 
     // ── X-axis labels ─────────────────────────────────────
     const windowSecs = windowBoundsRef.current[1] - windowBoundsRef.current[0];
-    ctx.fillStyle = '#8b949e';
+    ctx.fillStyle = textMuted;
     ctx.font = '10px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
@@ -352,7 +373,7 @@ export function TimeHistogram({
     const labelSpacing = Math.max(1, Math.ceil(80 / barTotalW));
     for (let i = 0; i < buckets.length; i += labelSpacing) {
       const x = PADDING_LEFT + i * barTotalW + barW / 2;
-      const label = formatAxisTime(buckets[i].timestamp, windowSecs);
+      const label = formatAxisTime(buckets[i].timestamp, windowSecs, tz);
       ctx.fillText(label, x, PADDING_TOP + chartH + 4);
     }
 
@@ -360,9 +381,9 @@ export function TimeHistogram({
     if (brushStart !== null && brushEnd !== null) {
       const x1 = Math.min(brushStart, brushEnd);
       const x2 = Math.max(brushStart, brushEnd);
-      ctx.fillStyle = 'rgba(88, 166, 255, 0.15)';
+      ctx.fillStyle = cssVar('--accent-light') || 'rgba(124, 108, 168, 0.15)';
       ctx.fillRect(x1, PADDING_TOP, x2 - x1, chartH);
-      ctx.strokeStyle = 'rgba(88, 166, 255, 0.6)';
+      ctx.strokeStyle = accent;
       ctx.lineWidth = 1;
       ctx.strokeRect(x1 + 0.5, PADDING_TOP + 0.5, x2 - x1 - 1, chartH - 1);
     }
@@ -371,7 +392,7 @@ export function TimeHistogram({
     if (hoverIndex !== null && mousePos && !brushingRef.current) {
       const bucket = buckets[hoverIndex];
       if (bucket) {
-        const timeStr = formatTooltipTime(bucket.timestamp, bucketDurationRef.current);
+        const timeStr = formatTooltipTime(bucket.timestamp, bucketDurationRef.current, tz);
         const countStr = bucket.count.toLocaleString();
         const lines = [timeStr, `${countStr} flows`];
 
@@ -387,7 +408,7 @@ export function TimeHistogram({
         if (ty < 0) ty = mousePos.y + 16;
 
         // Background
-        ctx.fillStyle = 'rgba(22, 27, 34, 0.95)';
+        ctx.fillStyle = cssVar('--bg-surface-2') || '#2e2f4a';
         ctx.beginPath();
         const r = 4;
         ctx.moveTo(tx + r, ty);
@@ -401,22 +422,22 @@ export function TimeHistogram({
         ctx.arcTo(tx, ty, tx + r, ty, r);
         ctx.closePath();
         ctx.fill();
-        ctx.strokeStyle = '#30363d';
+        ctx.strokeStyle = gridColor;
         ctx.lineWidth = 1;
         ctx.stroke();
 
         // Text
-        ctx.fillStyle = '#8b949e';
+        ctx.fillStyle = textMuted;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'top';
         ctx.fillText(lines[0], tx + TOOLTIP_PADDING, ty + TOOLTIP_PADDING);
 
-        ctx.fillStyle = '#e6edf3';
+        ctx.fillStyle = textPrimary;
         ctx.font = 'bold 11px system-ui, sans-serif';
         ctx.fillText(lines[1], tx + TOOLTIP_PADDING, ty + TOOLTIP_PADDING + 16);
       }
     }
-  }, [buckets, canvasWidth, hoverIndex, mousePos, brushStart, brushEnd, histLoading]);
+  }, [buckets, canvasWidth, hoverIndex, mousePos, brushStart, brushEnd, histLoading, tz, themeKey]);
 
   // ── Mouse interaction helpers ─────────────────────────────
 

@@ -1,9 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { StructuredTimeRange } from './api';
 
+const REFRESH_OPTIONS: { label: string; seconds: number }[] = [
+  { label: 'Off', seconds: 0 },
+  { label: '5s', seconds: 5 },
+  { label: '15s', seconds: 15 },
+  { label: '30s', seconds: 30 },
+  { label: '1m', seconds: 60 },
+  { label: '3m', seconds: 180 },
+  { label: '5m', seconds: 300 },
+  { label: '10m', seconds: 600 },
+];
+
 interface TimeRangePickerProps {
   value: StructuredTimeRange;
   onChange: (range: StructuredTimeRange) => void;
+  refreshInterval: number;
+  onRefreshIntervalChange: (seconds: number) => void;
 }
 
 const PRESETS: [string, string[]][] = [
@@ -35,14 +48,16 @@ function formatTimeRange(range: StructuredTimeRange): string {
   return 'Custom range';
 }
 
-export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
+export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshIntervalChange }: TimeRangePickerProps) {
   const [open, setOpen] = useState(false);
+  const [refreshOpen, setRefreshOpen] = useState(false);
   const [mode, setMode] = useState<'relative' | 'absolute'>(value.type);
   const [customAmount, setCustomAmount] = useState('1');
   const [customUnit, setCustomUnit] = useState('h');
   const [absStart, setAbsStart] = useState('');
   const [absEnd, setAbsEnd] = useState('');
   const popoverRef = useRef<HTMLDivElement>(null);
+  const refreshRef = useRef<HTMLDivElement>(null);
 
   // Close on outside click or Escape
   useEffect(() => {
@@ -62,6 +77,25 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
       document.removeEventListener('keydown', handleKey);
     };
   }, [open]);
+
+  // Close refresh dropdown on outside click
+  useEffect(() => {
+    if (!refreshOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (refreshRef.current && !refreshRef.current.contains(e.target as Node)) {
+        setRefreshOpen(false);
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setRefreshOpen(false);
+    };
+    document.addEventListener('mousedown', handleClick);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleClick);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [refreshOpen]);
 
   const selectPreset = useCallback((duration: string) => {
     onChange({ type: 'relative', duration });
@@ -88,11 +122,14 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
     }
   }, [absStart, absEnd, onChange]);
 
+  const activeRefresh = REFRESH_OPTIONS.find((r) => r.seconds === refreshInterval);
+
   return (
+    <div className="time-range-group">
     <div className="time-range-picker" ref={popoverRef}>
       <button
         className="time-range-trigger"
-        onClick={() => setOpen(!open)}
+        onClick={() => { setOpen(!open); setRefreshOpen(false); }}
         title="Select time range"
       >
         <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -186,6 +223,37 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
           )}
         </div>
       )}
+    </div>
+
+    <div className="refresh-picker" ref={refreshRef}>
+      <button
+        className={`refresh-trigger${refreshInterval > 0 ? ' active' : ''}`}
+        onClick={() => { setRefreshOpen(!refreshOpen); setOpen(false); }}
+        title={refreshInterval > 0 ? `Auto-refresh every ${activeRefresh?.label}` : 'Auto-refresh off'}
+      >
+        <svg className="refresh-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 2v6h-6"/>
+          <path d="M3 12a9 9 0 0115.36-6.36L21 8"/>
+          <path d="M3 22v-6h6"/>
+          <path d="M21 12a9 9 0 01-15.36 6.36L3 16"/>
+        </svg>
+        {refreshInterval > 0 && <span className="refresh-label">{activeRefresh?.label}</span>}
+      </button>
+
+      {refreshOpen && (
+        <div className="refresh-popover">
+          {REFRESH_OPTIONS.map((opt) => (
+            <button
+              key={opt.seconds}
+              className={`refresh-option${refreshInterval === opt.seconds ? ' active' : ''}`}
+              onClick={() => { onRefreshIntervalChange(opt.seconds); setRefreshOpen(false); }}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
     </div>
   );
 }

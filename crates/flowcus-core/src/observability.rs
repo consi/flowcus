@@ -61,6 +61,25 @@ pub struct Metrics {
     pub storage_parts_gen1_plus: AtomicI64,
     pub storage_disk_bytes: AtomicI64,
 
+    // ---- Query ----
+    pub query_requests: AtomicU64,
+    pub query_errors: AtomicU64,
+    pub query_cache_hits: AtomicU64,
+    pub query_cache_misses: AtomicU64,
+    pub query_rows_scanned: AtomicU64,
+    pub query_rows_returned: AtomicU64,
+    pub query_parts_scanned: AtomicU64,
+    pub query_parts_skipped: AtomicU64,
+    /// Cumulative query execution time in microseconds (divide by requests for avg).
+    pub query_duration_us: AtomicU64,
+
+    // ---- Retention ----
+    pub retention_parts_removed: AtomicU64,
+    pub retention_passes: AtomicU64,
+
+    // ---- IPFIX exporters ----
+    pub ipfix_exporters_active: AtomicI64,
+
     // ---- Process ----
     pub process_start_time_secs: AtomicU64,
 }
@@ -108,6 +127,21 @@ impl Metrics {
             storage_parts_gen0: AtomicI64::new(0),
             storage_parts_gen1_plus: AtomicI64::new(0),
             storage_disk_bytes: AtomicI64::new(0),
+
+            query_requests: AtomicU64::new(0),
+            query_errors: AtomicU64::new(0),
+            query_cache_hits: AtomicU64::new(0),
+            query_cache_misses: AtomicU64::new(0),
+            query_rows_scanned: AtomicU64::new(0),
+            query_rows_returned: AtomicU64::new(0),
+            query_parts_scanned: AtomicU64::new(0),
+            query_parts_skipped: AtomicU64::new(0),
+            query_duration_us: AtomicU64::new(0),
+
+            retention_parts_removed: AtomicU64::new(0),
+            retention_passes: AtomicU64::new(0),
+
+            ipfix_exporters_active: AtomicI64::new(0),
 
             process_start_time_secs: AtomicU64::new(now),
         })
@@ -337,6 +371,84 @@ impl Metrics {
             &self.storage_disk_bytes,
         );
 
+        // Query
+        counter(
+            &mut out,
+            "flowcus_query_requests_total",
+            "Total query requests received",
+            &self.query_requests,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_errors_total",
+            "Total query errors (parse + execution)",
+            &self.query_errors,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_cache_hits_total",
+            "Total query cache hits",
+            &self.query_cache_hits,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_cache_misses_total",
+            "Total query cache misses",
+            &self.query_cache_misses,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_rows_scanned_total",
+            "Total rows scanned across all queries",
+            &self.query_rows_scanned,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_rows_returned_total",
+            "Total rows returned across all queries",
+            &self.query_rows_returned,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_parts_scanned_total",
+            "Total storage parts scanned across all queries",
+            &self.query_parts_scanned,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_parts_skipped_total",
+            "Total storage parts skipped (time pruning, bloom filter)",
+            &self.query_parts_skipped,
+        );
+        counter(
+            &mut out,
+            "flowcus_query_duration_microseconds_total",
+            "Cumulative query execution time in microseconds",
+            &self.query_duration_us,
+        );
+
+        // Retention
+        counter(
+            &mut out,
+            "flowcus_retention_parts_removed_total",
+            "Total parts removed by data retention",
+            &self.retention_parts_removed,
+        );
+        counter(
+            &mut out,
+            "flowcus_retention_passes_total",
+            "Total retention scan passes completed",
+            &self.retention_passes,
+        );
+
+        // IPFIX exporters
+        gauge_i(
+            &mut out,
+            "flowcus_ipfix_exporters_active",
+            "Unique IPFIX exporters with active templates",
+            &self.ipfix_exporters_active,
+        );
+
         // Process
         gauge_u(
             &mut out,
@@ -409,6 +521,12 @@ mod tests {
         assert!(output.contains("flowcus_writer_records_ingested_total 5000"));
         assert!(output.contains("flowcus_merge_active_workers 3"));
         assert!(output.contains("flowcus_process_start_time_seconds"));
+
+        // Verify new metric categories are present
+        assert!(output.contains("flowcus_query_requests_total 0"));
+        assert!(output.contains("flowcus_query_cache_hits_total 0"));
+        assert!(output.contains("flowcus_retention_parts_removed_total 0"));
+        assert!(output.contains("flowcus_ipfix_exporters_active 0"));
     }
 
     #[test]

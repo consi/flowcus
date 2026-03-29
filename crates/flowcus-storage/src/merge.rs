@@ -457,8 +457,8 @@ fn execute_merge(
         let (combined_buf, encoded) = merge_column(col_def, &plan.sources, &source_rows)?;
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
-        // Recompute granule marks + bloom filters + stats for the merged data
-        let (marks, blooms, stats) = crate::granule::compute_granules(
+        // Recompute granule marks + bloom filters for the merged data
+        let (marks, blooms) = crate::granule::compute_granules(
             &combined_buf,
             &encoded.data,
             granule_size,
@@ -471,7 +471,6 @@ fn execute_merge(
             encoded,
             marks,
             blooms,
-            stats,
         });
     }
 

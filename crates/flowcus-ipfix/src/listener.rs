@@ -306,6 +306,9 @@ async fn process_ipfix_packet(
                 metrics
                     .ipfix_templates_active
                     .store(session.template_count() as i64, Relaxed);
+                metrics
+                    .ipfix_exporters_active
+                    .store(session.exporter_count() as i64, Relaxed);
             }
 
             // Check for data sets that could not be decoded (missing template).

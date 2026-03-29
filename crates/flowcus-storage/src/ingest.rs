@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use flowcus_ipfix::listener::MessageSink;
 use flowcus_ipfix::protocol::IpfixMessage;
@@ -24,7 +24,7 @@ pub struct IngestionHandle {
 impl MessageSink for IngestionHandle {
     fn on_message(&self, msg: IpfixMessage) {
         if self.tx.try_send(msg).is_err() {
-            debug!("Storage ingestion channel full, message dropped");
+            warn!("Ingestion channel full, IPFIX message dropped (backpressure)");
         }
     }
 }

@@ -309,6 +309,15 @@ impl SessionStore {
         self.templates.len()
     }
 
+    /// Number of unique exporters (by IP:port) with at least one cached template.
+    pub fn exporter_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for key in self.templates.keys() {
+            seen.insert(key.exporter);
+        }
+        seen.len()
+    }
+
     /// Store an interface name learned from an IPFIX option data record.
     pub fn set_interface_name(
         &mut self,

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { QueryColumn } from './api';
 import { selectVisibleColumns } from './formatters';
 
@@ -11,13 +12,56 @@ interface ColumnConfigProps {
 export function ColumnConfig({ columns, visibleColumns, onChange }: ColumnConfigProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties>({});
+
+  // Position the popover relative to the trigger button, and reposition on scroll
+  useEffect(() => {
+    if (!open || !triggerRef.current) return;
+
+    const reposition = () => {
+      const el = triggerRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const popoverW = 340;
+      const popoverMaxH = 420;
+
+      let left = rect.left;
+      let top = rect.bottom + 4;
+
+      if (left + popoverW > window.innerWidth - 8) {
+        left = window.innerWidth - popoverW - 8;
+      }
+      if (left < 8) left = 8;
+      if (top + popoverMaxH > window.innerHeight - 8) {
+        top = rect.top - popoverMaxH - 4;
+        if (top < 8) top = 8;
+      }
+
+      setPopoverStyle({ top, left });
+    };
+
+    reposition();
+
+    // Reposition on scroll/resize so the popover tracks the trigger
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+    return () => {
+      window.removeEventListener('scroll', reposition, true);
+      window.removeEventListener('resize', reposition);
+    };
+  }, [open]);
 
   // Close on outside click or Escape
   useEffect(() => {
     if (!open) return;
     const handleClick = (e: MouseEvent) => {
-      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        popoverRef.current && !popoverRef.current.contains(target) &&
+        triggerRef.current && !triggerRef.current.contains(target)
+      ) {
         setOpen(false);
       }
     };
@@ -61,15 +105,22 @@ export function ColumnConfig({ columns, visibleColumns, onChange }: ColumnConfig
   }, [columns, onChange]);
 
   return (
-    <div className="column-config" ref={popoverRef}>
+    <>
       <button
+        ref={triggerRef}
         className={`column-config-trigger ${open ? 'active' : ''}`}
-        onClick={() => setOpen(!open)}
+        onClick={() => { setOpen(!open); setSearch(''); }}
         title="Configure visible columns"
       >{'\u2699'}</button>
 
-      {open && (
-        <div className="column-config-popover">
+      {open && createPortal(
+        <div className="column-config-popover" ref={popoverRef} style={popoverStyle}>
+          <div className="column-config-header">
+            <span className="column-config-title">Columns</span>
+            <span className="column-config-count">
+              {visibleColumns.length}/{columns.length}
+            </span>
+          </div>
           <input
             type="text"
             className="column-config-search"
@@ -96,10 +147,11 @@ export function ColumnConfig({ columns, visibleColumns, onChange }: ColumnConfig
           </div>
           <div className="column-config-actions">
             <button onClick={selectAll}>Select all</button>
-            <button onClick={resetToDefault}>Reset to default</button>
+            <button onClick={resetToDefault}>Reset</button>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
-    </div>
+    </>
   );
 }

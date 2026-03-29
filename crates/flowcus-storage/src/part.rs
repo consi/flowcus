@@ -84,7 +84,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::codec::EncodedColumn;
-use crate::granule::{self, GranuleBloom, GranuleMark, GranuleStats};
+use crate::granule::{self, GranuleBloom, GranuleMark};
 use crate::schema::{ColumnDef, Schema, StorageType};
 
 // ---- Constants ----
@@ -101,8 +101,8 @@ pub const COLUMN_INDEX_MAGIC: &[u8; 4] = b"FCIX";
 pub const SCHEMA_MAGIC: &[u8; 4] = b"FSCH";
 
 /// Current part format version. Encoded in directory name as `v{N}_...`.
-/// - v0 (implicit, no prefix): original format without `.stats` files.
-/// - v1: adds per-column `.stats` files with pre-computed granule aggregates.
+/// - v0 (implicit, no prefix): original format (4-segment dir name).
+/// - v1 (current, 5-segment dir name): adds version prefix to directory name.
 pub const PART_FORMAT_VERSION: u32 = 1;
 
 // ---- Part metadata ----
@@ -199,7 +199,6 @@ pub struct ColumnWriteData {
     pub encoded: EncodedColumn,
     pub marks: Vec<GranuleMark>,
     pub blooms: Vec<GranuleBloom>,
-    pub stats: Vec<GranuleStats>,
 }
 
 /// Write a complete part to disk including column data, marks, bloom filters.
@@ -240,11 +239,6 @@ pub fn write_part(
             &col_dir.join(format!("{name}.bloom")),
             &cwd.blooms,
             bloom_bits,
-        )?;
-        granule::write_stats(
-            &col_dir.join(format!("{name}.stats")),
-            &cwd.stats,
-            cwd.def.storage_type,
         )?;
     }
 

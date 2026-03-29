@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use tracing::{info, warn};
+
 use crate::telemetry::LogFormat;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,6 +110,13 @@ pub struct StorageConfig {
     /// Default 1 GB.
     #[serde(default = "default_storage_cache_bytes")]
     pub storage_cache_bytes: usize,
+    /// Data retention period in hours. Parts with max timestamp older than this
+    /// are removed. Default 744 (31 days). Set to 0 to disable retention.
+    #[serde(default = "default_retention_hours")]
+    pub retention_hours: u64,
+    /// How often the retention worker scans for expired parts (seconds).
+    #[serde(default = "default_retention_scan_interval_secs")]
+    pub retention_scan_interval_secs: u64,
 }
 
 fn default_storage_dir() -> String {
@@ -162,6 +171,14 @@ const fn default_storage_cache_bytes() -> usize {
     1024 * 1024 * 1024 // 1 GB
 }
 
+const fn default_retention_hours() -> u64 {
+    744 // 31 days
+}
+
+const fn default_retention_scan_interval_secs() -> u64 {
+    900 // 15 minutes
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -178,6 +195,8 @@ impl Default for StorageConfig {
             granule_size: default_granule_size(),
             bloom_bits_per_granule: default_bloom_bits_per_granule(),
             storage_cache_bytes: default_storage_cache_bytes(),
+            retention_hours: default_retention_hours(),
+            retention_scan_interval_secs: default_retention_scan_interval_secs(),
         }
     }
 }
@@ -280,8 +299,10 @@ impl AppConfig {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
             let config: Self = toml::from_str(&content)?;
+            info!(path = %path.display(), "Configuration loaded from file");
             Ok(config)
         } else {
+            warn!(path = %path.display(), "Configuration file not found, using defaults");
             Ok(Self::default())
         }
     }

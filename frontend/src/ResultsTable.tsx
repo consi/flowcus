@@ -13,6 +13,7 @@ interface ResultsTableProps {
   selectedRow?: number | null;
   visibleColumns?: string[] | null;
   onColumnConfigChange?: (columns: string[]) => void;
+  onAddFilter?: (field: string, value: unknown, negated: boolean) => void;
 }
 
 type SortDir = 'asc' | 'desc' | null;
@@ -27,6 +28,7 @@ export function ResultsTable({
   selectedRow,
   visibleColumns,
   onColumnConfigChange,
+  onAddFilter,
 }: ResultsTableProps) {
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
@@ -160,7 +162,15 @@ export function ResultsTable({
                   const formatter = getFormatter(col.name);
                   return (
                     <td key={ci} className="results-td">
-                      {formatter(row[ci])}
+                      <span className="results-td-content">{formatter(row[ci])}</span>
+                      {onAddFilter && row[ci] != null && (
+                        <span className="results-td-filters">
+                          <button className="td-filter-btn include" title={`Filter by ${col.name}`}
+                            onClick={(e) => { e.stopPropagation(); onAddFilter(col.name, row[ci], false); }}>+</button>
+                          <button className="td-filter-btn exclude" title={`Filter out ${col.name}`}
+                            onClick={(e) => { e.stopPropagation(); onAddFilter(col.name, row[ci], true); }}>{'\u2212'}</button>
+                        </span>
+                      )}
                     </td>
                   );
                 })}

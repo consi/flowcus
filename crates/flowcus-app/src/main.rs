@@ -36,6 +36,7 @@ struct Cli {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -56,6 +57,12 @@ async fn main() -> Result<()> {
 
     // Production metrics — created FIRST, passed to all components
     let metrics = observability::Metrics::new();
+
+    if cli.config.exists() {
+        info!(config_file = %cli.config.display(), "Configuration loaded from file");
+    } else {
+        info!(config_file = %cli.config.display(), "Configuration file not found, using defaults");
+    }
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -111,12 +118,8 @@ async fn main() -> Result<()> {
         "Storage engine ready"
     );
 
-    // Migrate old-format parts in background (v0 → v1: adds .stats files)
-    flowcus_storage::migrate::start_background_migration(
-        table_base.clone(),
-        config.storage.granule_size,
-        config.storage.bloom_bits_per_granule,
-    );
+    // Migrate old-format parts in background (v0 → v1: directory rename)
+    flowcus_storage::migrate::start_background_migration(table_base.clone());
 
     // Background merge
     let merge_config = MergeConfig {
@@ -128,7 +131,20 @@ async fn main() -> Result<()> {
         granule_size: config.storage.granule_size,
         bloom_bits: config.storage.bloom_bits_per_granule,
     };
-    flowcus_storage::merge::start(table_base, merge_config, pending, Arc::clone(&metrics));
+    flowcus_storage::merge::start(
+        table_base.clone(),
+        merge_config,
+        pending,
+        Arc::clone(&metrics),
+    );
+
+    // Data retention
+    flowcus_storage::retention::start(
+        table_base,
+        config.storage.retention_hours,
+        config.storage.retention_scan_interval_secs,
+        Arc::clone(&metrics),
+    );
 
     // IPFIX collector — pass metrics for live counter updates
     let ipfix = IpfixListener::new(
@@ -153,6 +169,8 @@ async fn main() -> Result<()> {
     // HTTP server with observability endpoint (shares IPFIX session for metadata API)
     let state = AppState::with_session_store(config.clone(), metrics, session_store);
     flowcus_server::serve(&config.server, state).await?;
+
+    info!("Flowcus shutting down");
 
     Ok(())
 }

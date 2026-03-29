@@ -16,6 +16,7 @@ use crate::state::AppState;
 
 /// Build the full application router.
 pub fn build_router(state: AppState) -> Router {
+    let dev_mode = state.config().server.dev_mode;
     let api_routes = api::routes().merge(query::routes());
     let obs_routes = api::observability_routes();
 
@@ -24,11 +25,21 @@ pub fn build_router(state: AppState) -> Router {
     // layer.
     let sse_routes = query::sse_routes();
 
-    Router::new()
+    let mut router = Router::new()
         .nest("/api", sse_routes)
         .nest("/api", api_routes.layer(CompressionLayer::new()))
-        .nest("/observability", obs_routes.layer(CompressionLayer::new()))
-        .fallback(assets::static_handler)
+        .nest("/observability", obs_routes.layer(CompressionLayer::new()));
+
+    // In dev mode, proxy frontend requests to the Vite dev server (:5173)
+    // so the browser always gets fresh code with HMR. In production, serve
+    // the embedded frontend assets.
+    router = if dev_mode {
+        router.fallback(assets::dev_proxy_handler)
+    } else {
+        router.fallback(assets::static_handler)
+    };
+
+    router
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

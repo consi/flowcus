@@ -18,7 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::state::{AppState, CachedQueryStats, CachedResult};
 
@@ -161,6 +161,7 @@ pub struct FieldInfo {
 pub struct SchemaResponse {
     pub filter_types: HashMap<String, Vec<String>>,
     pub fields: Vec<SchemaField>,
+    pub op_hints: HashMap<String, String>,
 }
 
 /// A single field with its semantic filter type and data type.
@@ -170,6 +171,7 @@ pub struct SchemaField {
     pub filter_type: String,
     pub data_type: String,
     pub description: String,
+    pub semantic_hint: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,9 +306,19 @@ async fn execute_query(
 ) -> impl IntoResponse {
     let start = Instant::now();
 
+    state
+        .metrics()
+        .query_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let parsed = match parse_request(req) {
         Ok(p) => p,
         Err((error, _duration)) => {
+            warn!(error = %error.error, "Query parse failed");
+            state
+                .metrics()
+                .query_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::to_value(error).unwrap_or_default()),
@@ -338,6 +350,10 @@ async fn execute_query(
 
     if let Some(cached) = state.query_cache().get(cache_key, current_flush_count) {
         debug!("Query cache hit");
+        state
+            .metrics()
+            .query_cache_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let columns = resolve_column_types(&cached.columns);
         let response = QueryResponse {
             parsed: parsed_json,
@@ -369,6 +385,11 @@ async fn execute_query(
         )
             .into_response();
     }
+
+    state
+        .metrics()
+        .query_cache_misses
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let exec_start = Instant::now();
 
@@ -402,6 +423,22 @@ async fn execute_query(
             let rows_returned = result.rows.len() as u64;
             let columns = resolve_column_types(&result.columns);
 
+            // Record query metrics
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let m = state.metrics();
+                m.query_rows_scanned.fetch_add(result.rows_scanned, Relaxed);
+                m.query_rows_returned.fetch_add(rows_returned, Relaxed);
+                m.query_parts_scanned
+                    .fetch_add(result.parts_scanned, Relaxed);
+                m.query_parts_skipped
+                    .fetch_add(result.parts_skipped, Relaxed);
+                m.query_duration_us.fetch_add(
+                    u64::try_from(exec_time.as_micros()).unwrap_or(u64::MAX),
+                    Relaxed,
+                );
+            }
+
             let time_range = TimeRangeBounds {
                 start: result.time_start,
                 end: result.time_end,
@@ -425,6 +462,16 @@ async fn execute_query(
                 time_range: time_range.clone(),
             };
             state.query_cache().put(cache_key, cache_entry);
+
+            debug!(
+                rows_scanned = result.rows_scanned,
+                rows_returned,
+                parts_scanned = result.parts_scanned,
+                parts_skipped = result.parts_skipped,
+                exec_time_us = u64::try_from(exec_time.as_micros()).unwrap_or(u64::MAX),
+                bytes_read = result.plan.bytes_read,
+                "Query executed"
+            );
 
             let response = QueryResponse {
                 parsed: parsed_json,
@@ -458,6 +505,11 @@ async fn execute_query(
                 .into_response()
         }
         Ok(Err(io_err)) => {
+            warn!(error = %io_err, "Query execution failed (storage I/O)");
+            state
+                .metrics()
+                .query_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let response = QueryResponse {
                 parsed: parsed_json,
                 columns: resolve_column_types(&extract_columns(&query)),
@@ -493,6 +545,11 @@ async fn execute_query(
                 .into_response()
         }
         Err(join_err) => {
+            warn!(error = %join_err, "Query execution task panicked");
+            state
+                .metrics()
+                .query_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let response = QueryError {
                 error: format!("Execution failed: {join_err}"),
                 position: None,
@@ -646,9 +703,11 @@ fn resolve_column_type(name: &str) -> String {
 async fn schema() -> Json<SchemaResponse> {
     let filter_types = build_filter_types();
     let fields = build_schema_fields();
+    let op_hints = build_op_hints();
     Json(SchemaResponse {
         filter_types,
         fields,
+        op_hints,
     })
 }
 
@@ -731,6 +790,35 @@ fn build_filter_types() -> HashMap<String, Vec<String>> {
     m
 }
 
+fn build_op_hints() -> HashMap<String, String> {
+    [
+        ("eq", "Exact match"),
+        ("ne", "Not equal"),
+        ("gt", "Greater than"),
+        ("ge", "Greater or equal"),
+        ("lt", "Less than"),
+        ("le", "Less or equal"),
+        ("in", "Match any in list"),
+        ("not_in", "Match none in list"),
+        ("between", "Within range (min-max)"),
+        ("cidr", "Subnet match (e.g. /24)"),
+        ("wildcard", "Wildcard pattern (e.g. 10.*.*.1)"),
+        ("ip_range", "IP range (e.g. .1-.255)"),
+        ("regex", "Regular expression"),
+        ("not_regex", "Not matching regex"),
+        ("contains", "Contains substring"),
+        ("not_contains", "Does not contain"),
+        ("starts_with", "Starts with prefix"),
+        ("ends_with", "Ends with suffix"),
+        ("port_range", "Port range (e.g. 1024-65535)"),
+        ("named", "Well-known name"),
+        ("prefix", "MAC vendor prefix"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_schema_fields() -> Vec<SchemaField> {
     let mut fields = Vec::new();
@@ -738,11 +826,13 @@ fn build_schema_fields() -> Vec<SchemaField> {
     // IPFIX IEs
     for ie in flowcus_ipfix::ie::all() {
         let filter_type = classify_ie_field(ie.name, ie.data_type);
+        let semantic_hint = classify_semantic_hint(ie.name, ie.data_type);
         fields.push(SchemaField {
             name: ie.name.to_string(),
             filter_type,
             data_type: format!("{:?}", ie.data_type),
             description: ie.description.to_string(),
+            semantic_hint,
         });
     }
 
@@ -753,73 +843,84 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "ipv4",
             "Ipv4Address",
             "IPv4 address of the IPFIX exporter",
+            "",
         ),
         (
             "flowcusExporterPort",
             "port",
             "Unsigned16",
             "UDP/TCP port of the IPFIX exporter",
+            "",
         ),
         (
             "flowcusExportTime",
             "numeric",
             "Unsigned32",
             "Export timestamp (Unix epoch)",
+            "timestamp_s",
         ),
         (
             "flowcusObservationDomainId",
             "numeric",
             "Unsigned32",
             "Observation Domain ID",
+            "",
         ),
     ];
-    for (name, ft, dt, desc) in &system {
+    for (name, ft, dt, desc, hint) in &system {
         fields.push(SchemaField {
             name: (*name).to_string(),
             filter_type: (*ft).to_string(),
             data_type: (*dt).to_string(),
             description: (*desc).to_string(),
+            semantic_hint: (*hint).to_string(),
         });
     }
 
     // Aliases — short names familiar to network engineers
-    let aliases: &[(&str, &str, &str, &str)] = &[
+    let aliases: &[(&str, &str, &str, &str, &str)] = &[
         // Core 5-tuple
         (
             "src",
             "ipv4",
             "Ipv4Address",
             "Source IP (sourceIPv4Address)",
+            "",
         ),
         (
             "dst",
             "ipv4",
             "Ipv4Address",
             "Destination IP (destinationIPv4Address)",
+            "",
         ),
         (
             "sport",
             "port",
             "Unsigned16",
             "Source port (sourceTransportPort)",
+            "",
         ),
         (
             "dport",
             "port",
             "Unsigned16",
             "Destination port (destinationTransportPort)",
+            "",
         ),
         (
             "port",
             "port",
             "Unsigned16",
             "Any transport port (src or dst)",
+            "",
         ),
         (
             "proto",
             "protocol",
             "Unsigned8",
             "IP protocol (protocolIdentifier)",
+            "",
         ),
         // Counters
         (
@@ -827,12 +928,14 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "numeric",
             "Unsigned64",
             "Byte count (octetDeltaCount)",
+            "counter",
         ),
         (
             "packets",
             "numeric",
             "Unsigned64",
             "Packet count (packetDeltaCount)",
+            "counter",
         ),
         // QoS / classification
         (
@@ -840,24 +943,28 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "numeric",
             "Unsigned8",
             "Type of Service (ipClassOfService)",
+            "dscp",
         ),
         (
             "dscp",
             "numeric",
             "Unsigned8",
             "DSCP value (ipClassOfService)",
+            "dscp",
         ),
         (
             "flags",
             "numeric",
             "Unsigned16",
             "TCP flags (tcpControlBits)",
+            "tcp_flags",
         ),
         (
             "tcpflags",
             "numeric",
             "Unsigned16",
             "TCP flags (tcpControlBits)",
+            "tcp_flags",
         ),
         // Routing
         (
@@ -865,68 +972,79 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "ipv4",
             "Ipv4Address",
             "Next-hop IPv4 (ipNextHopIPv4Address)",
+            "",
         ),
         (
             "nexthop6",
             "ipv6",
             "Ipv6Address",
             "Next-hop IPv6 (ipNextHopIPv6Address)",
+            "",
         ),
         (
             "bgp_nexthop",
             "ipv4",
             "Ipv4Address",
             "BGP next-hop (bgpNextHopIPv4Address)",
+            "",
         ),
         (
             "src_as",
             "numeric",
             "Unsigned32",
             "Source AS number (bgpSourceAsNumber)",
+            "asn",
         ),
         (
             "dst_as",
             "numeric",
             "Unsigned32",
             "Destination AS number (bgpDestinationAsNumber)",
+            "asn",
         ),
         (
             "srcas",
             "numeric",
             "Unsigned32",
             "Source AS number (bgpSourceAsNumber)",
+            "asn",
         ),
         (
             "dstas",
             "numeric",
             "Unsigned32",
             "Destination AS number (bgpDestinationAsNumber)",
+            "asn",
         ),
         // L2
-        ("vlan", "numeric", "Unsigned16", "VLAN ID (vlanId)"),
+        ("vlan", "numeric", "Unsigned16", "VLAN ID (vlanId)", ""),
         (
             "src_mac",
             "mac",
             "MacAddress",
             "Source MAC (sourceMacAddress)",
+            "",
         ),
         (
             "dst_mac",
             "mac",
             "MacAddress",
             "Destination MAC (destinationMacAddress)",
+            "",
         ),
         (
             "srcmac",
             "mac",
             "MacAddress",
             "Source MAC (sourceMacAddress)",
+            "",
         ),
         (
             "dstmac",
             "mac",
             "MacAddress",
             "Destination MAC (destinationMacAddress)",
+            "",
         ),
         // Interfaces
         (
@@ -934,24 +1052,28 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "numeric",
             "Unsigned32",
             "Ingress interface index (ingressInterface)",
+            "interface",
         ),
         (
             "egress",
             "numeric",
             "Unsigned32",
             "Egress interface index (egressInterface)",
+            "interface",
         ),
         (
             "in_if",
             "numeric",
             "Unsigned32",
             "Ingress interface (ingressInterface)",
+            "interface",
         ),
         (
             "out_if",
             "numeric",
             "Unsigned32",
             "Egress interface (egressInterface)",
+            "interface",
         ),
         // Timing
         (
@@ -959,18 +1081,21 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "numeric",
             "Unsigned32",
             "Flow duration ms (flowDurationMilliseconds)",
+            "duration_ms",
         ),
         (
             "start",
             "numeric",
             "Unsigned64",
             "Flow start time (flowStartMilliseconds)",
+            "timestamp_ms",
         ),
         (
             "end",
             "numeric",
             "Unsigned64",
             "Flow end time (flowEndMilliseconds)",
+            "timestamp_ms",
         ),
         // ICMP
         (
@@ -978,12 +1103,14 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "numeric",
             "Unsigned16",
             "ICMP type/code (icmpTypeCodeIPv4)",
+            "icmp_type",
         ),
         (
             "icmp6_type",
             "numeric",
             "Unsigned16",
             "ICMPv6 type/code (icmpTypeCodeIPv6)",
+            "icmp_type",
         ),
         // Exporter metadata
         (
@@ -991,12 +1118,14 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "ipv4",
             "Ipv4Address",
             "Exporter IP (flowcusExporterIPv4)",
+            "",
         ),
         (
             "domain_id",
             "numeric",
             "Unsigned32",
             "Observation domain (flowcusObservationDomainId)",
+            "",
         ),
         // Application
         (
@@ -1004,14 +1133,16 @@ fn build_schema_fields() -> Vec<SchemaField> {
             "string",
             "String",
             "Application name (applicationName)",
+            "",
         ),
     ];
-    for (name, ft, dt, desc) in aliases {
+    for (name, ft, dt, desc, hint) in aliases {
         fields.push(SchemaField {
             name: (*name).to_string(),
             filter_type: (*ft).to_string(),
             data_type: (*dt).to_string(),
             description: (*desc).to_string(),
+            semantic_hint: (*hint).to_string(),
         });
     }
 
@@ -1068,6 +1199,45 @@ fn classify_ie_field(name: &str, data_type: flowcus_ipfix::protocol::DataType) -
         | DataType::DateTimeMilliseconds
         | DataType::DateTimeMicroseconds
         | DataType::DateTimeNanoseconds => "numeric".to_string(),
+    }
+}
+
+/// Classify an IPFIX IE into a semantic hint for the frontend query builder.
+fn classify_semantic_hint(name: &str, data_type: flowcus_ipfix::protocol::DataType) -> String {
+    use flowcus_ipfix::protocol::DataType;
+
+    let lower = name.to_lowercase();
+
+    // Name-based classification (higher priority)
+    if lower.contains("duration") {
+        return "duration_ms".to_string();
+    }
+    if name == "tcpControlBits" {
+        return "tcp_flags".to_string();
+    }
+    if name.starts_with("icmpTypeCode") {
+        return "icmp_type".to_string();
+    }
+    if name == "ipClassOfService" {
+        return "dscp".to_string();
+    }
+    if lower.contains("asnumber") {
+        return "asn".to_string();
+    }
+    if lower.contains("interface") && (lower.contains("ingress") || lower.contains("egress")) {
+        return "interface".to_string();
+    }
+    if name == "octetDeltaCount" || name == "packetDeltaCount" {
+        return "counter".to_string();
+    }
+
+    // Data-type-based classification
+    match data_type {
+        DataType::DateTimeSeconds => "timestamp_s".to_string(),
+        DataType::DateTimeMilliseconds
+        | DataType::DateTimeMicroseconds
+        | DataType::DateTimeNanoseconds => "timestamp_ms".to_string(),
+        _ => String::new(),
     }
 }
 

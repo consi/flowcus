@@ -4,6 +4,7 @@ import { FlowSidebar } from './FlowSidebar';
 import { TimeRangePicker } from './TimeRangePicker';
 import { SearchBar } from './SearchBar';
 import { ExplainGantt, type PlanStep } from './ExplainGantt';
+import { ThemeSwitcher } from './ThemeSwitcher';
 import { TimeHistogram } from './TimeHistogram';
 import {
   executeStructuredQuery,
@@ -22,6 +23,118 @@ import {
 } from './api';
 import { setInterfaceNames, getTimezone, setTimezone, getAvailableTimezones } from './formatters';
 import { formatCache } from './formatCache';
+import type { SchemaField } from './api';
+
+// ---------------------------------------------------------------------------
+// Value coercion — convert user-friendly strings into JSON the backend expects
+// ---------------------------------------------------------------------------
+
+/** Parse a human-readable duration string to milliseconds. Returns null if not a duration. */
+function parseDurationMs(s: string): number | null {
+  const m = s.trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/i);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  switch (m[2].toLowerCase()) {
+    case 'ms': return n;
+    case 's': return n * 1000;
+    case 'm': return n * 60_000;
+    case 'h': return n * 3_600_000;
+    case 'd': return n * 86_400_000;
+    default: return null;
+  }
+}
+
+/** Parse a number with optional size/magnitude suffix. Returns null if not parseable. */
+function parseNumericWithSuffix(s: string): number | null {
+  const m = s.trim().match(/^(\d+(?:\.\d+)?)\s*(k|m|g|t|kb|mb|gb|tb|ki|mi|gi|ti|kib|mib|gib|tib)?$/i);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!m[2]) return n;
+  switch (m[2].toLowerCase()) {
+    case 'k': case 'kb': return n * 1_000;
+    case 'm': case 'mb': return n * 1_000_000;
+    case 'g': case 'gb': return n * 1_000_000_000;
+    case 't': case 'tb': return n * 1_000_000_000_000;
+    case 'ki': case 'kib': return n * 1024;
+    case 'mi': case 'mib': return n * 1024 * 1024;
+    case 'gi': case 'gib': return n * 1024 * 1024 * 1024;
+    case 'ti': case 'tib': return n * 1024 * 1024 * 1024 * 1024;
+    default: return null;
+  }
+}
+
+/** Coerce a single scalar value based on field semantics. */
+function coerceScalar(raw: string, field: SchemaField | undefined): unknown {
+  const s = raw.trim();
+  if (!field) return s;
+
+  // Duration fields: accept human-readable durations
+  if (field.semantic_hint === 'duration_ms') {
+    const ms = parseDurationMs(s);
+    if (ms !== null) return ms;
+  }
+
+  // Numeric types: try plain number first, then suffixed
+  if (field.filter_type === 'numeric' || field.filter_type === 'port' || field.filter_type === 'protocol') {
+    const plain = Number(s);
+    if (!isNaN(plain) && s.length > 0) return plain;
+    const suffixed = parseNumericWithSuffix(s);
+    if (suffixed !== null) return suffixed;
+  }
+
+  return s;
+}
+
+/** Split a comma-separated value string into individual items. */
+function splitListValue(raw: string): string[] {
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * Coerce a StructuredFilter's value into the JSON shape the backend expects.
+ * - `between`, `port_range`: [low, high] array
+ * - `in`, `not_in`: array of values
+ * - Duration fields: human strings → ms numbers
+ * - Numeric scalars: string → number when possible
+ */
+function coerceFilterValue(
+  filter: StructuredFilter,
+  schema: SchemaResponse | null,
+): StructuredFilter {
+  const field = schema?.fields.find(f => f.name === filter.field);
+  const raw = typeof filter.value === 'string' ? filter.value : String(filter.value);
+
+  switch (filter.op) {
+    case 'between':
+    case 'port_range': {
+      // Accept "low,high" or "low-high" — split into [low, high] array
+      // But only if it's currently a string (not already an array)
+      if (typeof filter.value !== 'string') return filter;
+      const sep = raw.includes(',') ? ',' : '-';
+      const parts = raw.split(sep).map(s => s.trim()).filter(Boolean);
+      if (parts.length === 2) {
+        return { ...filter, value: [coerceScalar(parts[0], field), coerceScalar(parts[1], field)] };
+      }
+      return filter;
+    }
+
+    case 'in':
+    case 'not_in': {
+      // Split comma-separated into array
+      if (typeof filter.value !== 'string') return filter;
+      const items = splitListValue(raw);
+      return { ...filter, value: items.map(s => coerceScalar(s, field)) };
+    }
+
+    default: {
+      // Scalar coercion
+      if (typeof filter.value === 'string') {
+        return { ...filter, value: coerceScalar(raw, field) };
+      }
+      return filter;
+    }
+  }
+}
 
 function formatMicros(us: number): string {
   if (us < 1000) return `${us}\u00B5s`;
@@ -53,8 +166,27 @@ export function App() {
   // Query state
   const [timeRange, setTimeRange] = useState<StructuredTimeRange>({ type: 'relative', duration: '5m' });
   const [filters, setFilters] = useState<StructuredFilter[]>([]);
-  const [filterLogic, setFilterLogic] = useState<'and' | 'or'>('and');
+  const filterLogic: 'and' | 'or' = 'and';
   const [schema, setSchema] = useState<SchemaResponse | null>(null);
+  const [refreshInterval, setRefreshInterval] = useState(0);
+
+  const setFiltersKeepLimitLast = useCallback((filtersOrUpdater: StructuredFilter[] | ((prev: StructuredFilter[]) => StructuredFilter[])) => {
+    setFilters((prev) => {
+      const next = typeof filtersOrUpdater === 'function' ? filtersOrUpdater(prev) : filtersOrUpdater;
+      const nonLimit = next.filter((f) => f.field !== 'limit');
+      const limitF = next.filter((f) => f.field === 'limit');
+      if (limitF.length === 0) return next;
+      return [...nonLimit, ...limitF];
+    });
+  }, []);
+
+  const handleAddFilter = useCallback((field: string, value: unknown, negated: boolean) => {
+    const op = negated ? 'ne' : 'eq';
+    const strValue = String(value);
+    const exists = filters.some((f) => f.field === field && f.op === op && String(f.value) === strValue);
+    if (exists) return;
+    setFiltersKeepLimitLast((prev) => [...prev, { field, op, value: strValue }]);
+  }, [filters, setFiltersKeepLimitLast]);
 
   // Column visibility
   const [visibleColumns, setVisibleColumns] = useState<string[] | null>(() => {
@@ -101,7 +233,9 @@ export function App() {
     // Extract limit from filters if present — pass as aggregate stage
     const limitFilter = filters.find((f) => f.field === 'limit');
     const limitN = limitFilter ? Math.max(1, Math.min(Number(limitFilter.value) || 100, 10000)) : 0;
-    const realFilters = filters.filter((f) => f.field !== 'limit' && f.field && f.op);
+    const realFilters = filters
+      .filter((f) => f.field !== 'limit' && f.field && f.op)
+      .map((f) => coerceFilterValue(f, schema));
 
     const req: StructuredQueryRequest = {
       time_range: timeRange,
@@ -145,7 +279,7 @@ export function App() {
         setLoading(false);
       }
     }
-  }, [timeRange, filters, filterLogic]);
+  }, [timeRange, filters]);
 
   const handleCancel = useCallback(() => {
     if (abortRef.current) {
@@ -189,6 +323,15 @@ export function App() {
     }, 400);
     return () => clearTimeout(timer);
   }, [timeRange, handleExecute]);
+
+  // Auto-refresh timer
+  useEffect(() => {
+    if (refreshInterval <= 0) return;
+    const timer = setInterval(() => {
+      handleExecute();
+    }, refreshInterval * 1000);
+    return () => clearInterval(timer);
+  }, [refreshInterval, handleExecute]);
 
   const loadMore = useCallback(async () => {
     if (!pagination?.has_more || loadingMore || !lastStructuredReq.current) return;
@@ -240,11 +383,17 @@ export function App() {
             {info.server.dev_mode && <span className="dev-badge">DEV</span>}
           </span>
         )}
+        <ThemeSwitcher />
       </header>
 
       <section className="query-section">
         <div className="query-bar">
-          <TimeRangePicker value={timeRange} onChange={setTimeRange} />
+          <TimeRangePicker
+            value={timeRange}
+            onChange={setTimeRange}
+            refreshInterval={refreshInterval}
+            onRefreshIntervalChange={setRefreshInterval}
+          />
 
           <select
             className="tz-select"
@@ -260,9 +409,7 @@ export function App() {
 
         <SearchBar
           filters={filters}
-          onChange={setFilters}
-          logic={filterLogic}
-          onLogicChange={setFilterLogic}
+          onChange={setFiltersKeepLimitLast}
           schema={schema}
           onExecute={handleExecute}
           onCancel={handleCancel}
@@ -336,12 +483,11 @@ export function App() {
           </div>
         )}
         <TimeHistogram
-          key={queryGen}
           timeRange={timeRange}
-          filters={filters}
-          filterLogic={filterLogic}
+          filters={filters.map(f => coerceFilterValue(f, schema))}
           onTimeRangeChange={handleHistogramTimeChange}
           queryGen={queryGen}
+          timezone={timezone}
         />
       </section>
 
@@ -357,6 +503,7 @@ export function App() {
             selectedRow={selectedRow}
             visibleColumns={visibleColumns}
             onColumnConfigChange={setVisibleColumns}
+            onAddFilter={handleAddFilter}
           />
         </section>
       )}
@@ -377,6 +524,7 @@ export function App() {
           onClose={handleSidebarClose}
           onNavigate={handleSidebarNavigate}
           totalRows={pagination?.total ?? allRows.length}
+          onAddFilter={handleAddFilter}
         />
       )}
     </div>

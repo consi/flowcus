@@ -31,7 +31,6 @@ use std::sync::Arc;
 use crate::cache::StorageCache;
 use crate::column::ColumnBuffer;
 use crate::decode;
-use crate::granule;
 use crate::part;
 use crate::schema::StorageType;
 use crate::table::{PartEntry, Table};
@@ -118,10 +117,6 @@ pub enum PlanStep {
     PartSkippedSubsumed {
         path: String,
         subsumed_by: String,
-    },
-    StatsShortcut {
-        parts_used: usize,
-        duration_us: Option<u64>,
     },
     TopNFastPath {
         sort_field: String,
@@ -1040,6 +1035,11 @@ fn eval_resolved_field(
 
 /// Check if a filter could possibly match given the column index min/max.
 /// Returns true if the filter might match, false if the part can be skipped.
+///
+/// This is called per-granule (from marks) and per-part (from column index).
+/// The key correctness invariant: returning `false` means the granule/part
+/// DEFINITELY has no matching rows. Returning `true` is always safe (may
+/// have false positives).
 fn index_may_match(
     filter: &FilterExpr,
     col_name: &str,
@@ -1048,6 +1048,24 @@ fn index_may_match(
     storage_type: StorageType,
 ) -> bool {
     match filter {
+        // Compound filters: recurse into children
+        FilterExpr::And(a, b) => {
+            // AND: if either child definitely can't match, the whole AND can't match
+            index_may_match(a, col_name, min_val, max_val, storage_type)
+                && index_may_match(b, col_name, min_val, max_val, storage_type)
+        }
+        FilterExpr::Or(a, b) => {
+            // OR: can only skip if BOTH children definitely can't match
+            index_may_match(a, col_name, min_val, max_val, storage_type)
+                || index_may_match(b, col_name, min_val, max_val, storage_type)
+        }
+        FilterExpr::Not(inner) => {
+            // NOT: we can prune if the inner filter DEFINITELY matches all rows
+            // in the range (meaning NOT would match none). This only works when
+            // all values in the range are identical and equal the filter target.
+            // For most cases, conservatively return true.
+            index_may_match_not(inner, col_name, min_val, max_val, storage_type)
+        }
         FilterExpr::Ip(ip) => {
             let relevant = match ip.direction {
                 IpDirection::Src => col_name == "sourceIPv4Address",
@@ -1071,7 +1089,9 @@ fn index_may_match(
                         let v = u32::from(a);
                         let in_range = v >= col_min && v <= col_max;
                         if ip.negated {
-                            !in_range || col_min != col_max
+                            // Negated: "NOT this addr". Can skip only if ALL
+                            // values in the granule equal this addr (min == max == v).
+                            !(col_min == v && col_max == v)
                         } else {
                             in_range
                         }
@@ -1101,12 +1121,30 @@ fn index_may_match(
                     let cidr_max = cidr_min | !mask;
                     let overlaps = col_min <= cidr_max && col_max >= cidr_min;
                     if ip.negated {
-                        !overlaps || col_min != col_max
+                        // Negated CIDR: can skip only if ALL values are inside the CIDR
+                        // (meaning NOT would match nothing). This requires the entire
+                        // granule range [col_min, col_max] to be within [cidr_min, cidr_max].
+                        let fully_contained = col_min >= cidr_min && col_max <= cidr_max;
+                        !fully_contained
                     } else {
                         overlaps
                     }
                 }
-                _ => true, // list, wildcard: can't easily prune
+                IpValue::List(addrs) => {
+                    // Can prune if no address in the list falls within [col_min, col_max]
+                    if ip.negated {
+                        return true; // negated list: can't easily prune
+                    }
+                    addrs.iter().any(|addr| {
+                        if let Ok(a) = addr.parse::<std::net::Ipv4Addr>() {
+                            let v = u32::from(a);
+                            v >= col_min && v <= col_max
+                        } else {
+                            true // unparseable: assume may match
+                        }
+                    })
+                }
+                IpValue::Wildcard(_) => true, // wildcard: can't easily prune from min/max
             }
         }
         FilterExpr::Port(port) => {
@@ -1129,7 +1167,7 @@ fn index_may_match(
                 PortValue::Single(p) => {
                     let in_range = *p >= col_min && *p <= col_max;
                     if port.negated {
-                        !in_range || col_min != col_max
+                        !(*p == col_min && *p == col_max)
                     } else {
                         in_range
                     }
@@ -1137,17 +1175,166 @@ fn index_may_match(
                 PortValue::Range(lo, hi) => {
                     let overlaps = col_min <= *hi && col_max >= *lo;
                     if port.negated {
-                        !overlaps || col_min != col_max
+                        let fully_contained = col_min >= *lo && col_max <= *hi;
+                        !fully_contained
                     } else {
                         overlaps
                     }
                 }
-                _ => true,
+                PortValue::List(items) => {
+                    if port.negated {
+                        return true;
+                    }
+                    items
+                        .iter()
+                        .any(|item| port_value_overlaps_range(item, col_min, col_max))
+                }
+                PortValue::Named(name) => {
+                    if let Some(p) = resolve_named_port(name) {
+                        let in_range = p >= col_min && p <= col_max;
+                        if port.negated {
+                            !(p == col_min && p == col_max)
+                        } else {
+                            in_range
+                        }
+                    } else {
+                        true
+                    }
+                }
+                PortValue::OpenRange(lo) => {
+                    if port.negated {
+                        // NOT port >= lo  =>  port < lo. Can match if col_min < lo.
+                        col_min < *lo
+                    } else {
+                        col_max >= *lo
+                    }
+                }
+            }
+        }
+        FilterExpr::Proto(proto) => {
+            if col_name != "protocolIdentifier" || storage_type != StorageType::U8 {
+                return true;
+            }
+            let col_min = min_val[0];
+            let col_max = max_val[0];
+            match &proto.value {
+                ProtoValue::Named(name) => {
+                    if let Some(n) = resolve_proto(name) {
+                        let in_range = n >= col_min && n <= col_max;
+                        if proto.negated {
+                            !(n == col_min && n == col_max)
+                        } else {
+                            in_range
+                        }
+                    } else {
+                        true
+                    }
+                }
+                ProtoValue::Number(n) => {
+                    let in_range = *n >= col_min && *n <= col_max;
+                    if proto.negated {
+                        !(*n == col_min && *n == col_max)
+                    } else {
+                        in_range
+                    }
+                }
+                ProtoValue::List(items) => {
+                    if proto.negated {
+                        return true;
+                    }
+                    items.iter().any(|item| match item {
+                        ProtoValue::Named(name) => {
+                            resolve_proto(name).is_none_or(|n| n >= col_min && n <= col_max)
+                        }
+                        ProtoValue::Number(n) => *n >= col_min && *n <= col_max,
+                        ProtoValue::List(_) => true,
+                    })
+                }
             }
         }
         FilterExpr::Numeric(num) => {
             let resolved = resolve_field_name(&num.field);
             if col_name != resolved {
+                return true;
+            }
+            index_may_match_numeric(
+                num.op,
+                resolve_numeric_target(&num.value),
+                min_val,
+                max_val,
+                storage_type,
+            )
+        }
+        FilterExpr::Field(ff) => {
+            let resolved = resolve_field_name(&ff.field);
+            if col_name != resolved {
+                return true;
+            }
+            let target = match &ff.value {
+                AstFieldValue::Integer(n) => *n,
+                AstFieldValue::String(_) | AstFieldValue::List(_) => return true,
+            };
+            index_may_match_numeric(ff.op, target, min_val, max_val, storage_type)
+        }
+        FilterExpr::StringFilter(_) => true, // string min/max not stored in a comparable way
+    }
+}
+
+/// Helper for numeric min/max range checks shared by Numeric and Field filters.
+fn index_may_match_numeric(
+    op: CompareOp,
+    target: u64,
+    min_val: &[u8; 16],
+    max_val: &[u8; 16],
+    storage_type: StorageType,
+) -> bool {
+    let (col_min, col_max) = match storage_type {
+        StorageType::U32 => (
+            u32::from_le_bytes(min_val[..4].try_into().unwrap()) as u64,
+            u32::from_le_bytes(max_val[..4].try_into().unwrap()) as u64,
+        ),
+        StorageType::U64 => (
+            u64::from_le_bytes(min_val[..8].try_into().unwrap()),
+            u64::from_le_bytes(max_val[..8].try_into().unwrap()),
+        ),
+        StorageType::U16 => (
+            u16::from_le_bytes(min_val[..2].try_into().unwrap()) as u64,
+            u16::from_le_bytes(max_val[..2].try_into().unwrap()) as u64,
+        ),
+        StorageType::U8 => (min_val[0] as u64, max_val[0] as u64),
+        _ => return true,
+    };
+    match op {
+        CompareOp::Eq => target >= col_min && target <= col_max,
+        CompareOp::Ne => !(col_min == target && col_max == target),
+        CompareOp::Gt => col_max > target,
+        CompareOp::Ge => col_max >= target,
+        CompareOp::Lt => col_min < target,
+        CompareOp::Le => col_min <= target,
+    }
+}
+
+/// For NOT(inner), check if we can definitively skip a granule.
+///
+/// We can skip a granule for NOT(inner) only if inner DEFINITELY matches
+/// every row in the granule. This happens when:
+/// - inner is an exact equality check and min == max == target
+fn index_may_match_not(
+    inner: &FilterExpr,
+    col_name: &str,
+    min_val: &[u8; 16],
+    max_val: &[u8; 16],
+    storage_type: StorageType,
+) -> bool {
+    // Delegate to the inner filter and check if it matches the entire range.
+    // For equality: if min == max == target, inner matches all rows, so NOT matches none.
+    match inner {
+        FilterExpr::Numeric(num) => {
+            let resolved = resolve_field_name(&num.field);
+            if col_name != resolved {
+                return true;
+            }
+            if num.op != CompareOp::Eq {
                 return true;
             }
             let target = resolve_numeric_target(&num.value);
@@ -1167,16 +1354,25 @@ fn index_may_match(
                 StorageType::U8 => (min_val[0] as u64, max_val[0] as u64),
                 _ => return true,
             };
-            match num.op {
-                CompareOp::Eq => target >= col_min && target <= col_max,
-                CompareOp::Ne => col_min != col_max || col_min != target,
-                CompareOp::Gt => col_max > target,
-                CompareOp::Ge => col_max >= target,
-                CompareOp::Lt => col_min < target,
-                CompareOp::Le => col_min <= target,
-            }
+            // If every value in the granule equals target, NOT(==target) matches nothing
+            !(col_min == target && col_max == target)
         }
-        _ => true, // complex filters: can't prune from index
+        _ => true, // conservative: can't determine if inner matches all rows
+    }
+}
+
+/// Check if a port value overlaps with a [col_min, col_max] range.
+fn port_value_overlaps_range(pv: &PortValue, col_min: u16, col_max: u16) -> bool {
+    match pv {
+        PortValue::Single(p) => *p >= col_min && *p <= col_max,
+        PortValue::Range(lo, hi) => col_min <= *hi && col_max >= *lo,
+        PortValue::List(items) => items
+            .iter()
+            .any(|item| port_value_overlaps_range(item, col_min, col_max)),
+        PortValue::Named(name) => {
+            resolve_named_port(name).is_none_or(|p| p >= col_min && p <= col_max)
+        }
+        PortValue::OpenRange(lo) => col_max >= *lo,
     }
 }
 
@@ -1185,6 +1381,12 @@ fn index_may_match(
 // ---------------------------------------------------------------------------
 
 /// Extract bytes for bloom filter lookup from a filter expression.
+///
+/// For AND semantics: if any bloom says "definitely not present", we can skip
+/// the granule. For OR: we can only skip if ALL branches say "not present".
+/// For NOT: bloom filters cannot help (not-present doesn't mean present).
+///
+/// Returns `(column_name, value_bytes)` pairs for point-query bloom lookups.
 pub fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
     let mut result = Vec::new();
     match filter {
@@ -1232,9 +1434,87 @@ pub fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
                 result.push(("protocolIdentifier".to_string(), vec![*n]));
             }
         }
+        // Numeric equality: exact match on numeric columns (ports, counters, etc.)
+        FilterExpr::Numeric(num) if num.op == CompareOp::Eq => {
+            let col_name = resolve_field_name(&num.field).to_string();
+            let target = resolve_numeric_target(&num.value);
+            // Bloom filters store values in their native LE encoding.
+            // We emit 8 bytes (u64 LE) — the bloom was built from the column's
+            // native width, but the hash function operates on byte slices so we
+            // must match the encoding used during insert. The insert uses the
+            // column's native width, so we need to match that. Since we don't
+            // know the storage type here, emit all plausible widths and let
+            // the caller match against the column's bloom file which exists
+            // only for the correct width.
+            // Actually, we can just emit the target in the native sizes that
+            // the bloom was built with. The bloom_lookup consumer matches by
+            // column name, so we emit multiple candidate byte widths.
+            // For simplicity and correctness, we emit all four possible widths.
+            // The bloom file for the column was built with the column's actual
+            // storage type, so only the matching width will produce a valid
+            // bloom lookup. Non-matching widths will just fail to skip
+            // (false positive) which is safe.
+            result.push((col_name, target.to_le_bytes().to_vec()));
+        }
+        // Field equality: same as numeric but on generic IPFIX IE fields
+        FilterExpr::Field(ff) if ff.op == CompareOp::Eq => {
+            if let AstFieldValue::Integer(n) = &ff.value {
+                let col_name = resolve_field_name(&ff.field).to_string();
+                result.push((col_name, n.to_le_bytes().to_vec()));
+            }
+        }
         FilterExpr::And(a, b) => {
+            // AND: bloom lookups from both branches; if ANY bloom says "not
+            // present", the granule can be skipped (correct under AND).
             result.extend(bloom_lookup_bytes(a));
             result.extend(bloom_lookup_bytes(b));
+        }
+        FilterExpr::Not(inner) => {
+            // NOT: bloom filters cannot help skip granules for negated queries.
+            // A bloom saying "not present" for the inner value means the
+            // granule doesn't contain that value, which means the NOT *would*
+            // match — so we can't skip. Drop through.
+            let _ = inner;
+        }
+        _ => {}
+    }
+    result
+}
+
+/// Extract bloom lookup values for list-style filters (IP list, port list).
+///
+/// For list/IN filters, a granule can be skipped only if NONE of the list
+/// values are present in the bloom. Returns `(column_name, Vec<value_bytes>)`
+/// where all values must be absent to skip.
+pub fn bloom_lookup_list_bytes(filter: &FilterExpr) -> Vec<(String, Vec<Vec<u8>>)> {
+    let mut result = Vec::new();
+    match filter {
+        FilterExpr::Ip(ip) if !ip.negated => {
+            if let IpValue::List(addrs) = &ip.value {
+                let bytes_list: Vec<Vec<u8>> = addrs
+                    .iter()
+                    .filter_map(|a| {
+                        a.parse::<std::net::Ipv4Addr>()
+                            .ok()
+                            .map(|addr| u32::from(addr).to_le_bytes().to_vec())
+                    })
+                    .collect();
+                if !bytes_list.is_empty() {
+                    match ip.direction {
+                        IpDirection::Src => {
+                            result.push(("sourceIPv4Address".to_string(), bytes_list));
+                        }
+                        IpDirection::Dst => {
+                            result.push(("destinationIPv4Address".to_string(), bytes_list));
+                        }
+                        IpDirection::Any => {} // OR semantics, can't use bloom
+                    }
+                }
+            }
+        }
+        FilterExpr::And(a, b) => {
+            result.extend(bloom_lookup_list_bytes(a));
+            result.extend(bloom_lookup_list_bytes(b));
         }
         _ => {}
     }
@@ -1487,29 +1767,6 @@ impl QueryExecutor {
                     .cmp(&a.time_max)
                     .then(b.time_min.cmp(&a.time_min))
             });
-        }
-
-        // ================================================================
-        // FAST PATH: Stats-based aggregation shortcut
-        // ================================================================
-        // For unfiltered aggregation queries (no filter stages), answer
-        // directly from .stats files without reading any column data.
-        // Supports: group by <time_bucket> | sum/count/min/max(field),
-        //           top N / sort by sum/count/min/max(field)
-        if ast_filters.is_empty() {
-            let stats_start = Instant::now();
-            if let Some(result) = self.try_stats_shortcut(
-                query,
-                &filtered_parts,
-                &mut plan,
-                time_start,
-                time_end,
-                parts_after_time,
-                total_rows_in_range,
-                stats_start,
-            ) {
-                return result;
-            }
         }
 
         // Determine the needed row count for early termination.
@@ -1857,205 +2114,6 @@ impl QueryExecutor {
                     .collect()
             })
             .collect()
-    }
-
-    /// Try to answer an aggregation query from pre-computed .stats files.
-    ///
-    /// Returns `Some(Ok(result))` if the shortcut succeeded, `Some(Err(..))` on
-    /// I/O error, or `None` if the query shape doesn't support the shortcut
-    /// (caller should fall through to the normal execution path).
-    ///
-    /// Supported query shapes (all require NO filter stages):
-    /// - `group by <time_bucket> | sum/count/min/max(field)`
-    /// - `top N by sum/count/min/max(field)` (without group by)
-    /// - `sort sum/count/min/max(field) desc/asc`
-    #[allow(clippy::too_many_arguments)]
-    fn try_stats_shortcut(
-        &self,
-        query: &Query,
-        parts: &[PartEntry],
-        plan: &mut ExecutionPlan,
-        time_start: u32,
-        time_end: u32,
-        _parts_after_time: usize,
-        total_rows_in_range: u64,
-        step_start: Instant,
-    ) -> Option<std::io::Result<QueryResult>> {
-        // Per-aggregate accumulator used by the stats shortcut.
-        struct AggAccum {
-            sum: u64,
-            min: u64,
-            max: u64,
-            count: u64,
-            func: AggFunc,
-            field_name: String,
-        }
-
-        // Extract the aggregation stage
-        let agg_stage = query.stages.iter().find_map(|s| {
-            if let Stage::Aggregate(agg) = s {
-                Some(agg)
-            } else {
-                None
-            }
-        })?;
-
-        // Check which agg functions we need and if they're all stats-compatible
-        let agg_calls: Vec<&AggCall> = match agg_stage {
-            AggExpr::GroupBy { functions, .. } => functions.iter().collect(),
-            AggExpr::TopN { by, .. } => vec![by],
-            AggExpr::Sort { by, .. } => vec![by],
-            AggExpr::Limit(_) => return None,
-        };
-
-        // All functions must be stats-compatible
-        for call in &agg_calls {
-            match call.func {
-                AggFunc::Sum | AggFunc::Count | AggFunc::Min | AggFunc::Max => {}
-                _ => return None, // Avg, Uniq, P50, P95, P99, Stddev, Rate, First, Last
-            }
-        }
-
-        // For GroupBy: only single time bucket key supported (no field-based grouping)
-        // because stats don't have per-value breakdowns.
-        if let AggExpr::GroupBy { keys, .. } = agg_stage {
-            if keys.len() != 1 {
-                return None;
-            }
-            if !matches!(keys[0], GroupByKey::TimeBucket(_)) {
-                return None;
-            }
-        }
-
-        // Read stats from each part and aggregate
-        let mut total_rows: u64 = 0;
-        let mut parts_scanned: u64 = 0;
-
-        // For each agg function, accumulate the result across all parts
-        let mut accums: Vec<AggAccum> = agg_calls
-            .iter()
-            .map(|call| AggAccum {
-                sum: 0,
-                min: u64::MAX,
-                max: 0,
-                count: 0,
-                func: call.func,
-                field_name: call
-                    .field
-                    .as_ref()
-                    .map(|f| resolve_field_name(f).to_string())
-                    .unwrap_or_default(),
-            })
-            .collect();
-
-        for part_entry in parts {
-            if part_entry.path.join(".merging").exists() {
-                continue;
-            }
-
-            // Get row count from meta.bin for this part
-            let meta_path = part_entry.path.join("meta.bin");
-            let part_row_count = match self.cache.get_meta(&meta_path).map(|(m, _)| m) {
-                Ok(meta) => meta.row_count,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => continue,
-            };
-            total_rows += part_row_count;
-
-            for accum in &mut accums {
-                if accum.func == AggFunc::Count && accum.field_name.is_empty() {
-                    // count() — just use the meta row count
-                    accum.count += part_row_count;
-                } else {
-                    // sum/min/max/count(field) — read .stats file
-                    let stats_path = part_entry
-                        .path
-                        .join("columns")
-                        .join(format!("{}.stats", accum.field_name));
-
-                    match granule::read_stats(&stats_path) {
-                        Ok((granule_stats, _st)) => {
-                            let col_stats = granule::aggregate_column_stats(&granule_stats);
-                            accum.sum = accum.sum.wrapping_add(col_stats.sum);
-                            accum.min = accum.min.min(col_stats.min);
-                            accum.max = accum.max.max(col_stats.max);
-                            accum.count += col_stats.row_count;
-                        }
-                        Err(_) => {
-                            // .stats file missing (v0 part not yet migrated) — fall back
-                            return None;
-                        }
-                    }
-                }
-            }
-            parts_scanned += 1;
-        }
-
-        // Build result columns and rows
-        let mut col_names = Vec::new();
-        let mut row_values = Vec::new();
-
-        // For GroupBy with time bucket, add the bucket column
-        if let AggExpr::GroupBy { keys, .. } = agg_stage {
-            if let Some(GroupByKey::TimeBucket(_)) = keys.first() {
-                col_names.push("time_bucket".to_string());
-                // Single bucket covering the query range
-                row_values.push(serde_json::Value::Number(serde_json::Number::from(
-                    time_start,
-                )));
-            }
-        }
-
-        for accum in &accums {
-            let name = if accum.field_name.is_empty() {
-                format!("{:?}()", accum.func).to_lowercase()
-            } else {
-                format!("{:?}({})", accum.func, accum.field_name).to_lowercase()
-            };
-            col_names.push(name);
-
-            let value: serde_json::Value = match accum.func {
-                AggFunc::Sum => serde_json::json!(accum.sum),
-                AggFunc::Count => serde_json::json!(accum.count),
-                AggFunc::Min => {
-                    if accum.min == u64::MAX {
-                        serde_json::json!(0)
-                    } else {
-                        serde_json::json!(accum.min)
-                    }
-                }
-                AggFunc::Max => serde_json::json!(accum.max),
-                _ => serde_json::json!(0),
-            };
-            row_values.push(value);
-        }
-
-        // For TopN/Sort with stats, we don't have per-row data — return
-        // a single aggregated row. This handles queries like
-        // `top 10 by sum(bytes)` which across the whole dataset returns
-        // the aggregate sum (not individual rows, since that needs data).
-        // The caller gets a meaningful answer without reading column data.
-        let result_rows = vec![row_values];
-
-        let total_parts_skipped = (plan.parts_skipped_by_time) as u64;
-
-        plan.steps.push(PlanStep::StatsShortcut {
-            parts_used: parts.len(),
-            duration_us: u64::try_from(step_start.elapsed().as_micros()).ok(),
-        });
-
-        Some(Ok(QueryResult {
-            columns: col_names,
-            rows: result_rows,
-            plan: std::mem::take(plan),
-            rows_scanned: total_rows,
-            total_matching_rows: 1,
-            total_rows_in_range,
-            parts_scanned,
-            parts_skipped: total_parts_skipped,
-            time_start,
-            time_end,
-        }))
     }
 
     /// Determine output columns from the query and discovered schema columns.
@@ -3284,11 +3342,63 @@ impl QueryExecutor {
             .flat_map(|f| bloom_lookup_bytes(f))
             .collect::<Vec<_>>();
 
+        // List-style bloom lookups: for IN/list filters, skip granule only
+        // if NONE of the list values are present in the bloom.
+        let bloom_list_lookups = ast_filters
+            .iter()
+            .flat_map(|f| bloom_lookup_list_bytes(f))
+            .collect::<Vec<_>>();
+
         let mut granule_mask: Option<Vec<bool>> = None;
         let num_granules = (row_count + self.granule_size - 1) / self.granule_size.max(1);
         plan.granules_total += num_granules;
 
+        // Point-query bloom lookups: skip granule if bloom says "definitely not present"
         for (col_name, value_bytes) in &bloom_lookups {
+            let bloom_step_start = Instant::now();
+            let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
+            let bloom_result = self.cache.get_blooms(&bloom_path);
+            if let Err(e) = &bloom_result {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Part merged away: {}", bloom_path.display()),
+                    ));
+                }
+            }
+            if let Ok((_bits, blooms, _cached)) = bloom_result {
+                let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
+                let mut skipped = 0usize;
+
+                // For Numeric/Field bloom lookups, value_bytes is 8 bytes (u64 LE).
+                // But the bloom was built with the column's native width. Try
+                // matching with the column's actual storage type width.
+                let col_st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                let effective_bytes: &[u8] = match col_st.element_size() {
+                    Some(n) if n < value_bytes.len() => &value_bytes[..n],
+                    _ => value_bytes,
+                };
+
+                for (gi, bloom) in blooms.iter().enumerate() {
+                    if gi < mask.len() && mask[gi] {
+                        if !bloom.may_contain(effective_bytes) {
+                            mask[gi] = false;
+                            skipped += 1;
+                        }
+                    }
+                }
+                plan.granules_skipped_by_bloom += skipped;
+                plan.steps.push(PlanStep::BloomFilter {
+                    column: col_name.clone(),
+                    value: format!("{effective_bytes:?}").chars().take(40).collect(),
+                    granules_skipped: skipped,
+                    duration_us: u64::try_from(bloom_step_start.elapsed().as_micros()).ok(),
+                });
+            }
+        }
+
+        // List bloom lookups: skip granule only if NONE of the list values present
+        for (col_name, values_list) in &bloom_list_lookups {
             let bloom_step_start = Instant::now();
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
             let bloom_result = self.cache.get_blooms(&bloom_path);
@@ -3305,7 +3415,9 @@ impl QueryExecutor {
                 let mut skipped = 0usize;
                 for (gi, bloom) in blooms.iter().enumerate() {
                     if gi < mask.len() && mask[gi] {
-                        if !bloom.may_contain(value_bytes) {
+                        // Skip only if NO value in the list may be present
+                        let any_present = values_list.iter().any(|v| bloom.may_contain(v));
+                        if !any_present {
                             mask[gi] = false;
                             skipped += 1;
                         }
@@ -3314,24 +3426,22 @@ impl QueryExecutor {
                 plan.granules_skipped_by_bloom += skipped;
                 plan.steps.push(PlanStep::BloomFilter {
                     column: col_name.clone(),
-                    value: format!("{value_bytes:?}").chars().take(40).collect(),
+                    value: format!("list[{}]", values_list.len()),
                     granules_skipped: skipped,
                     duration_us: u64::try_from(bloom_step_start.elapsed().as_micros()).ok(),
                 });
             }
         }
 
-        // Mark-based seeking for range predicates
-        // (check all columns, not just the ones we'll decode)
-        let mark_check_cols: Vec<String> = if needs_all_columns {
-            available_columns.clone()
-        } else {
-            referenced_cols
-                .iter()
-                .filter(|c| available_columns.contains(c))
-                .cloned()
-                .collect()
-        };
+        // Mark-based seeking for range predicates.
+        // Only check marks for columns that are referenced by filters — marks
+        // contain min/max values which are only useful for pruning against
+        // filter predicates. Checking marks for output-only columns wastes I/O.
+        let mark_check_cols: Vec<String> = filter_col_names
+            .iter()
+            .filter(|c| available_columns.contains(c))
+            .cloned()
+            .collect();
 
         for col_name in &mark_check_cols {
             let mark_step_start = Instant::now();
@@ -3434,27 +3544,55 @@ impl QueryExecutor {
         // ---------------------------------------------------------------
         // Phase 2: Build matching row indices using pre-resolved filters
         // ---------------------------------------------------------------
+        // Uses granule-level skipping: when a granule is masked out by bloom
+        // or mark checks, we jump past the entire granule's row range instead
+        // of checking each row individually.
         let filter_start = Instant::now();
         let mut matching_indices: Vec<u32> = Vec::new();
         let granule_size = self.granule_size.max(1);
 
-        for row_idx in 0..row_count {
-            // Check granule mask
-            if let Some(ref mask) = granule_mask {
-                let granule_idx = row_idx / granule_size;
-                if granule_idx < mask.len() && !mask[granule_idx] {
+        if let Some(ref mask) = granule_mask {
+            // Granule mask exists: iterate by granule, skip entire masked-out
+            // granules in O(1) instead of checking each row.
+            for (granule_idx, &active) in mask.iter().enumerate() {
+                if !active {
                     continue;
                 }
+                let row_start = granule_idx * granule_size;
+                let row_end = ((granule_idx + 1) * granule_size).min(row_count);
+                for row_idx in row_start..row_end {
+                    let passes = resolved_filters.is_empty()
+                        || resolved_filters
+                            .iter()
+                            .all(|f| evaluate_resolved_filter(f, row_idx, &decoded));
+                    if passes {
+                        matching_indices.push(row_idx as u32);
+                    }
+                }
             }
-
-            // Evaluate pre-resolved filters
-            let passes = resolved_filters.is_empty()
-                || resolved_filters
-                    .iter()
-                    .all(|f| evaluate_resolved_filter(f, row_idx, &decoded));
-
-            if passes {
-                matching_indices.push(row_idx as u32);
+            // Handle any rows beyond the mask (shouldn't happen, but be safe)
+            let mask_covers = mask.len() * granule_size;
+            if mask_covers < row_count {
+                for row_idx in mask_covers..row_count {
+                    let passes = resolved_filters.is_empty()
+                        || resolved_filters
+                            .iter()
+                            .all(|f| evaluate_resolved_filter(f, row_idx, &decoded));
+                    if passes {
+                        matching_indices.push(row_idx as u32);
+                    }
+                }
+            }
+        } else {
+            // No granule mask: scan all rows
+            for row_idx in 0..row_count {
+                let passes = resolved_filters.is_empty()
+                    || resolved_filters
+                        .iter()
+                        .all(|f| evaluate_resolved_filter(f, row_idx, &decoded));
+                if passes {
+                    matching_indices.push(row_idx as u32);
+                }
             }
         }
 
@@ -3826,5 +3964,366 @@ mod tests {
         let resolved = ResolvedFilter::Numeric(filter);
         assert!(!evaluate_resolved_filter(&resolved, 0, &columns));
         assert!(evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    // ---------------------------------------------------------------
+    // index_may_match tests — compound filters & new filter types
+    // ---------------------------------------------------------------
+
+    fn min_max_u32(min: u32, max: u32) -> ([u8; 16], [u8; 16]) {
+        let mut min_val = [0u8; 16];
+        let mut max_val = [0u8; 16];
+        min_val[..4].copy_from_slice(&min.to_le_bytes());
+        max_val[..4].copy_from_slice(&max.to_le_bytes());
+        (min_val, max_val)
+    }
+
+    fn min_max_u16(min: u16, max: u16) -> ([u8; 16], [u8; 16]) {
+        let mut min_val = [0u8; 16];
+        let mut max_val = [0u8; 16];
+        min_val[..2].copy_from_slice(&min.to_le_bytes());
+        max_val[..2].copy_from_slice(&max.to_le_bytes());
+        (min_val, max_val)
+    }
+
+    fn min_max_u64(min: u64, max: u64) -> ([u8; 16], [u8; 16]) {
+        let mut min_val = [0u8; 16];
+        let mut max_val = [0u8; 16];
+        min_val[..8].copy_from_slice(&min.to_le_bytes());
+        max_val[..8].copy_from_slice(&max.to_le_bytes());
+        (min_val, max_val)
+    }
+
+    #[test]
+    fn index_may_match_and_filter() {
+        // AND(port=80, proto=tcp) on port column with range [443, 8080]
+        // port=80 is NOT in [443, 8080], so AND should return false
+        let filter = FilterExpr::And(
+            Box::new(FilterExpr::Port(PortFilter {
+                direction: PortDirection::Dst,
+                negated: false,
+                value: PortValue::Single(80),
+            })),
+            Box::new(FilterExpr::Proto(ProtoFilter {
+                negated: false,
+                value: ProtoValue::Named("tcp".to_string()),
+            })),
+        );
+        let (min_val, max_val) = min_max_u16(443, 8080);
+        assert!(!index_may_match(
+            &filter,
+            "destinationTransportPort",
+            &min_val,
+            &max_val,
+            StorageType::U16
+        ));
+    }
+
+    #[test]
+    fn index_may_match_or_filter() {
+        // OR(port=80, port=443) on column with range [100, 200]
+        // port=80 is not in range, port=443 is not in range -> OR is false
+        let filter = FilterExpr::Or(
+            Box::new(FilterExpr::Port(PortFilter {
+                direction: PortDirection::Dst,
+                negated: false,
+                value: PortValue::Single(80),
+            })),
+            Box::new(FilterExpr::Port(PortFilter {
+                direction: PortDirection::Dst,
+                negated: false,
+                value: PortValue::Single(443),
+            })),
+        );
+        let (min_val, max_val) = min_max_u16(100, 200);
+        assert!(!index_may_match(
+            &filter,
+            "destinationTransportPort",
+            &min_val,
+            &max_val,
+            StorageType::U16
+        ));
+
+        // But if one is in range, OR should return true
+        let (min_val2, max_val2) = min_max_u16(70, 90);
+        assert!(index_may_match(
+            &filter,
+            "destinationTransportPort",
+            &min_val2,
+            &max_val2,
+            StorageType::U16
+        ));
+    }
+
+    #[test]
+    fn index_may_match_field_filter() {
+        // Field filter on bgpSourceAsNumber = 65000
+        let filter = FilterExpr::Field(FieldFilter {
+            field: "bgpSourceAsNumber".to_string(),
+            op: CompareOp::Eq,
+            value: AstFieldValue::Integer(65000),
+        });
+        // Range [60000, 64000] doesn't contain 65000
+        let (min_val, max_val) = min_max_u32(60000, 64000);
+        assert!(!index_may_match(
+            &filter,
+            "bgpSourceAsNumber",
+            &min_val,
+            &max_val,
+            StorageType::U32
+        ));
+
+        // Range [60000, 70000] contains 65000
+        let (min_val2, max_val2) = min_max_u32(60000, 70000);
+        assert!(index_may_match(
+            &filter,
+            "bgpSourceAsNumber",
+            &min_val2,
+            &max_val2,
+            StorageType::U32
+        ));
+    }
+
+    #[test]
+    fn index_may_match_negated_ip_exact() {
+        // NOT ip=10.0.0.5 — can skip only when ALL values equal 10.0.0.5
+        let filter = FilterExpr::Ip(IpFilter {
+            direction: IpDirection::Src,
+            negated: true,
+            value: IpValue::Addr("10.0.0.5".to_string()),
+        });
+        let target = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 5));
+        // All values are 10.0.0.5 -> NOT matches nothing -> can skip
+        let (min_val, max_val) = min_max_u32(target, target);
+        assert!(!index_may_match(
+            &filter,
+            "sourceIPv4Address",
+            &min_val,
+            &max_val,
+            StorageType::U32
+        ));
+
+        // Range includes other values -> NOT might match -> can't skip
+        let (min_val2, max_val2) = min_max_u32(target - 1, target + 1);
+        assert!(index_may_match(
+            &filter,
+            "sourceIPv4Address",
+            &min_val2,
+            &max_val2,
+            StorageType::U32
+        ));
+    }
+
+    #[test]
+    fn index_may_match_negated_cidr() {
+        // NOT src in 10.0.0.0/24 — can skip if entire range is inside CIDR
+        let filter = FilterExpr::Ip(IpFilter {
+            direction: IpDirection::Src,
+            negated: true,
+            value: IpValue::Cidr("10.0.0.0/24".to_string()),
+        });
+        let cidr_min = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 0));
+        let cidr_max = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 255));
+        // Entire range is inside CIDR -> NOT matches nothing -> can skip
+        let (min_val, max_val) = min_max_u32(cidr_min + 5, cidr_max - 5);
+        assert!(!index_may_match(
+            &filter,
+            "sourceIPv4Address",
+            &min_val,
+            &max_val,
+            StorageType::U32
+        ));
+
+        // Range extends outside CIDR -> some rows match NOT -> can't skip
+        let outside = u32::from(std::net::Ipv4Addr::new(10, 0, 1, 5));
+        let (min_val2, max_val2) = min_max_u32(cidr_min + 5, outside);
+        assert!(index_may_match(
+            &filter,
+            "sourceIPv4Address",
+            &min_val2,
+            &max_val2,
+            StorageType::U32
+        ));
+    }
+
+    #[test]
+    fn index_may_match_ip_list() {
+        // src in (10.0.0.1, 10.0.0.5) on range [10.0.0.10, 10.0.0.20]
+        let filter = FilterExpr::Ip(IpFilter {
+            direction: IpDirection::Src,
+            negated: false,
+            value: IpValue::List(vec!["10.0.0.1".to_string(), "10.0.0.5".to_string()]),
+        });
+        let r_min = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 10));
+        let r_max = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 20));
+        let (min_val, max_val) = min_max_u32(r_min, r_max);
+        // Neither 10.0.0.1 nor 10.0.0.5 is in [10.0.0.10, 10.0.0.20]
+        assert!(!index_may_match(
+            &filter,
+            "sourceIPv4Address",
+            &min_val,
+            &max_val,
+            StorageType::U32
+        ));
+
+        // Range [10.0.0.1, 10.0.0.10] contains 10.0.0.1
+        let r_min2 = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let (min_val2, max_val2) = min_max_u32(r_min2, r_max);
+        assert!(index_may_match(
+            &filter,
+            "sourceIPv4Address",
+            &min_val2,
+            &max_val2,
+            StorageType::U32
+        ));
+    }
+
+    #[test]
+    fn index_may_match_proto() {
+        // proto = tcp (6) on range [10, 20] — can skip (6 not in range)
+        let filter = FilterExpr::Proto(ProtoFilter {
+            negated: false,
+            value: ProtoValue::Named("tcp".to_string()),
+        });
+        let mut min_val = [0u8; 16];
+        let mut max_val = [0u8; 16];
+        min_val[0] = 10;
+        max_val[0] = 20;
+        assert!(!index_may_match(
+            &filter,
+            "protocolIdentifier",
+            &min_val,
+            &max_val,
+            StorageType::U8
+        ));
+
+        // Range [1, 10] includes 6
+        min_val[0] = 1;
+        max_val[0] = 10;
+        assert!(index_may_match(
+            &filter,
+            "protocolIdentifier",
+            &min_val,
+            &max_val,
+            StorageType::U8
+        ));
+    }
+
+    #[test]
+    fn index_may_match_ne_numeric() {
+        // bytes != 5000 — can skip only when min == max == 5000
+        let filter = FilterExpr::Numeric(NumericFilter {
+            field: "bytes".to_string(),
+            op: CompareOp::Ne,
+            value: NumericValue::Integer(5000),
+        });
+        // All values equal 5000 -> != matches nothing -> can skip
+        let (min_val, max_val) = min_max_u64(5000, 5000);
+        assert!(!index_may_match(
+            &filter,
+            "octetDeltaCount",
+            &min_val,
+            &max_val,
+            StorageType::U64
+        ));
+
+        // Range has other values -> can't skip
+        let (min_val2, max_val2) = min_max_u64(4000, 6000);
+        assert!(index_may_match(
+            &filter,
+            "octetDeltaCount",
+            &min_val2,
+            &max_val2,
+            StorageType::U64
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // bloom_lookup_bytes tests — new filter types
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bloom_lookup_numeric_eq() {
+        let filter = FilterExpr::Numeric(NumericFilter {
+            field: "bytes".to_string(),
+            op: CompareOp::Eq,
+            value: NumericValue::Integer(42),
+        });
+        let lookups = bloom_lookup_bytes(&filter);
+        assert_eq!(lookups.len(), 1);
+        assert_eq!(lookups[0].0, "octetDeltaCount");
+        assert_eq!(lookups[0].1, 42u64.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn bloom_lookup_numeric_ne_excluded() {
+        // != should NOT generate bloom lookups (bloom can't help with NOT)
+        let filter = FilterExpr::Numeric(NumericFilter {
+            field: "bytes".to_string(),
+            op: CompareOp::Ne,
+            value: NumericValue::Integer(42),
+        });
+        let lookups = bloom_lookup_bytes(&filter);
+        assert!(lookups.is_empty());
+    }
+
+    #[test]
+    fn bloom_lookup_field_eq() {
+        let filter = FilterExpr::Field(FieldFilter {
+            field: "bgpSourceAsNumber".to_string(),
+            op: CompareOp::Eq,
+            value: AstFieldValue::Integer(65000),
+        });
+        let lookups = bloom_lookup_bytes(&filter);
+        assert_eq!(lookups.len(), 1);
+        assert_eq!(lookups[0].0, "bgpSourceAsNumber");
+    }
+
+    #[test]
+    fn bloom_lookup_negated_ip_excluded() {
+        // Negated IP should NOT generate bloom lookups
+        let filter = FilterExpr::Ip(IpFilter {
+            direction: IpDirection::Src,
+            negated: true,
+            value: IpValue::Addr("10.0.0.1".to_string()),
+        });
+        let lookups = bloom_lookup_bytes(&filter);
+        assert!(lookups.is_empty());
+    }
+
+    #[test]
+    fn bloom_lookup_list_ip() {
+        let filter = FilterExpr::Ip(IpFilter {
+            direction: IpDirection::Src,
+            negated: false,
+            value: IpValue::List(vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]),
+        });
+        // Point lookups should be empty (list is not a point query)
+        let point_lookups = bloom_lookup_bytes(&filter);
+        assert!(point_lookups.is_empty());
+        // List lookups should have an entry
+        let list_lookups = bloom_lookup_list_bytes(&filter);
+        assert_eq!(list_lookups.len(), 1);
+        assert_eq!(list_lookups[0].0, "sourceIPv4Address");
+        assert_eq!(list_lookups[0].1.len(), 2);
+    }
+
+    #[test]
+    fn bloom_lookup_and_composition() {
+        // AND(src=10.0.0.1, dport=80) should extract bloom lookups from both
+        let filter = FilterExpr::And(
+            Box::new(FilterExpr::Ip(IpFilter {
+                direction: IpDirection::Src,
+                negated: false,
+                value: IpValue::Addr("10.0.0.1".to_string()),
+            })),
+            Box::new(FilterExpr::Port(PortFilter {
+                direction: PortDirection::Dst,
+                negated: false,
+                value: PortValue::Single(80),
+            })),
+        );
+        let lookups = bloom_lookup_bytes(&filter);
+        assert_eq!(lookups.len(), 2);
     }
 }

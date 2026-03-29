@@ -55,6 +55,7 @@ pub mod metrics;
 pub mod migrate;
 pub mod part;
 pub mod pending;
+pub mod retention;
 pub mod schema;
 pub mod table;
 pub mod writer;
