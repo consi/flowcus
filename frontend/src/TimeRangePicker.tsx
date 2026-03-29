@@ -31,6 +31,37 @@ const UNITS = [
   { value: 'w', label: 'weeks' },
 ] as const;
 
+/** Convert a duration string like "1h", "30m", "7d" to milliseconds. */
+function durationToMs(dur: string): number {
+  const match = dur.match(/^(\d+)([smhdw])$/);
+  if (!match) return 3600_000;
+  const n = parseInt(match[1], 10);
+  switch (match[2]) {
+    case 's': return n * 1000;
+    case 'm': return n * 60_000;
+    case 'h': return n * 3600_000;
+    case 'd': return n * 86_400_000;
+    case 'w': return n * 604_800_000;
+    default: return n * 3600_000;
+  }
+}
+
+/** Format a Date to the datetime-local input value (YYYY-MM-DDTHH:mm:ss.sss). */
+function toLocalInputValue(d: Date): string {
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
+/** Resolve a StructuredTimeRange to absolute local datetime-local strings. */
+function resolveToAbsInputs(range: StructuredTimeRange): [string, string] {
+  if (range.type === 'absolute' && range.start && range.end) {
+    return [toLocalInputValue(new Date(range.start)), toLocalInputValue(new Date(range.end))];
+  }
+  const now = Date.now();
+  const ms = durationToMs(range.duration ?? '1h');
+  return [toLocalInputValue(new Date(now - ms)), toLocalInputValue(new Date(now))];
+}
+
 function formatTimeRange(range: StructuredTimeRange): string {
   if (range.type === 'relative') {
     return `Last ${range.duration ?? '1h'}`;
@@ -129,7 +160,15 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
     <div className="time-range-picker" ref={popoverRef}>
       <button
         className="time-range-trigger"
-        onClick={() => { setOpen(!open); setRefreshOpen(false); }}
+        onClick={() => {
+          if (!open) {
+            const [s, e] = resolveToAbsInputs(value);
+            setAbsStart(s);
+            setAbsEnd(e);
+          }
+          setOpen(!open);
+          setRefreshOpen(false);
+        }}
         title="Select time range"
       >
         <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -200,6 +239,7 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
                 Start
                 <input
                   type="datetime-local"
+                  step="0.001"
                   value={absStart}
                   onChange={(e) => setAbsStart(e.target.value)}
                   className="time-range-abs-input"
@@ -209,6 +249,7 @@ export function TimeRangePicker({ value, onChange, refreshInterval, onRefreshInt
                 End
                 <input
                   type="datetime-local"
+                  step="0.001"
                   value={absEnd}
                   onChange={(e) => setAbsEnd(e.target.value)}
                   className="time-range-abs-input"

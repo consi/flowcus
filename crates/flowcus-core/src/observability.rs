@@ -1,6 +1,6 @@
 //! Production observability: always-on health metrics for Prometheus scraping.
 //!
-//! Completely separate from dev profiling. These metrics run at zero cost
+//! These metrics run at zero cost
 //! (atomic increments only) and are always available at `/observability/metrics`.
 //!
 //! Designed for bottleneck detection:
@@ -145,6 +145,176 @@ impl Metrics {
 
             process_start_time_secs: AtomicU64::new(now),
         })
+    }
+
+    /// Read all metrics as structured key-value pairs.
+    pub fn to_json_values(&self) -> Vec<(&'static str, i64)> {
+        vec![
+            (
+                "ipfix_packets_received",
+                self.ipfix_packets_received.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ipfix_packets_parsed",
+                self.ipfix_packets_parsed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ipfix_packets_errors",
+                self.ipfix_packets_errors.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ipfix_records_decoded",
+                self.ipfix_records_decoded.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ipfix_bytes_received",
+                self.ipfix_bytes_received.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ipfix_templates_active",
+                self.ipfix_templates_active.load(Ordering::Relaxed),
+            ),
+            (
+                "ipfix_tcp_connections",
+                self.ipfix_tcp_connections.load(Ordering::Relaxed),
+            ),
+            (
+                "ipfix_unknown_ies",
+                self.ipfix_unknown_ies.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "ipfix_exporters_active",
+                self.ipfix_exporters_active.load(Ordering::Relaxed),
+            ),
+            (
+                "writer_records_ingested",
+                self.writer_records_ingested.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "writer_parts_flushed",
+                self.writer_parts_flushed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "writer_bytes_flushed",
+                self.writer_bytes_flushed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "writer_flush_errors",
+                self.writer_flush_errors.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "writer_active_buffers",
+                self.writer_active_buffers.load(Ordering::Relaxed),
+            ),
+            (
+                "writer_buffer_bytes",
+                self.writer_buffer_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "writer_channel_depth",
+                self.writer_channel_depth.load(Ordering::Relaxed),
+            ),
+            (
+                "writer_channel_drops",
+                self.writer_channel_drops.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_completed",
+                self.merge_completed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_failed",
+                self.merge_failed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_rows_processed",
+                self.merge_rows_processed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_bytes_written",
+                self.merge_bytes_written.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_parts_removed",
+                self.merge_parts_removed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "merge_active_workers",
+                self.merge_active_workers.load(Ordering::Relaxed),
+            ),
+            (
+                "merge_pending_hours",
+                self.merge_pending_hours.load(Ordering::Relaxed),
+            ),
+            (
+                "merge_throttled",
+                self.merge_throttled_count.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "storage_parts_total",
+                self.storage_parts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "storage_parts_gen0",
+                self.storage_parts_gen0.load(Ordering::Relaxed),
+            ),
+            (
+                "storage_parts_gen1_plus",
+                self.storage_parts_gen1_plus.load(Ordering::Relaxed),
+            ),
+            (
+                "storage_disk_bytes",
+                self.storage_disk_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "query_requests",
+                self.query_requests.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_errors",
+                self.query_errors.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_cache_hits",
+                self.query_cache_hits.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_cache_misses",
+                self.query_cache_misses.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_rows_scanned",
+                self.query_rows_scanned.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_rows_returned",
+                self.query_rows_returned.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_parts_scanned",
+                self.query_parts_scanned.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_parts_skipped",
+                self.query_parts_skipped.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "query_duration_us",
+                self.query_duration_us.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "retention_parts_removed",
+                self.retention_parts_removed.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "retention_passes",
+                self.retention_passes.load(Ordering::Relaxed) as i64,
+            ),
+            (
+                "process_start_time_secs",
+                self.process_start_time_secs.load(Ordering::Relaxed) as i64,
+            ),
+        ]
     }
 
     /// Format all metrics as Prometheus text exposition.

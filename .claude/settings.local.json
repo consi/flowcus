@@ -50,18 +50,5 @@
       "CRC32-C checksums protect all binary formats on disk"
     ]
   },
-  "promptSuggestionEnabled": true,
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cd /home/consi/Devel/flowcus && git add -A && git diff --cached --quiet || git commit -m \"wip: auto-commit after prompt\" --no-verify -q 2>/dev/null || true",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
+  "promptSuggestionEnabled": true
 }

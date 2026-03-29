@@ -13,9 +13,6 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Toml(#[from] toml::de::Error),
 
-    #[error("worker error: {0}")]
-    Worker(String),
-
     #[error("server error: {0}")]
     Server(String),
 
@@ -24,10 +21,6 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn worker(msg: impl Into<String>) -> Self {
-        Self::Worker(msg.into())
-    }
-
     pub fn server(msg: impl Into<String>) -> Self {
         Self::Server(msg.into())
     }

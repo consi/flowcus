@@ -98,6 +98,83 @@ const ICMP_TYPES: Record<number, string> = {
   12: 'Parameter Problem', 13: 'Timestamp', 14: 'Timestamp Reply',
 };
 
+// RFC 8158 - NAT event types
+const NAT_EVENTS: Record<number, string> = {
+  0: 'Reserved', 1: 'NAT Create', 2: 'NAT Delete', 3: 'NAT Pool Exhausted',
+  4: 'NAT Quota Exceeded', 5: 'NAT Binding Refresh',
+  6: 'NAT Port Alloc', 7: 'NAT Port Dealloc',
+  8: 'NAT Thresh Reached', 9: 'NAT Thresh Cleared',
+};
+
+// RFC 8158 - NAT types
+const NAT_TYPES: Record<number, string> = {
+  0: 'Unknown', 1: 'NAT44', 2: 'NAT64', 3: 'NAT46',
+  4: 'IPv4 no-NAT', 5: 'NAT66', 6: 'IPv6 no-NAT',
+};
+
+// RFC 5610 - Flow direction
+const FLOW_DIRECTIONS: Record<number, string> = {
+  0: 'Ingress', 1: 'Egress',
+};
+
+// RFC 5102 - IP version
+const IP_VERSIONS: Record<number, string> = {
+  4: 'IPv4', 6: 'IPv6',
+};
+
+// RFC 5655 - Firewall event types
+const FIREWALL_EVENTS: Record<number, string> = {
+  0: 'Ignored', 1: 'Flow Created', 2: 'Flow Deleted',
+  3: 'Flow Denied', 4: 'Flow Alert', 5: 'Flow Updated',
+};
+
+// RFC 5102 - Sampling algorithm
+const SAMPLING_ALGORITHMS: Record<number, string> = {
+  0: 'Unassigned', 1: 'Systematic count', 2: 'Systematic time',
+  3: 'Random n-out-of-N', 4: 'Uniform probabilistic',
+  5: 'Property match', 6: 'Hash-based', 7: 'Hash-based + deterministic',
+};
+
+// RFC 5102 - MPLS top label type
+const MPLS_LABEL_TYPES: Record<number, string> = {
+  0x00: 'Unknown', 0x01: 'TE-MIDPT', 0x02: 'Pseudowire',
+  0x03: 'VPN', 0x04: 'BGP', 0x05: 'LDP',
+};
+
+// IANA IPFIX - Observation point type
+const OBSERVATION_POINT_TYPES: Record<number, string> = {
+  0: 'Invalid', 1: 'Physical port', 2: 'Port channel',
+  3: 'VLAN',
+};
+
+// RFC 8158 - NAT address realm
+const ADDRESS_REALMS: Record<number, string> = {
+  0: 'Reserved', 1: 'Internal', 2: 'External',
+};
+
+// RFC 7011 - Value distribution method
+const VALUE_DIST_METHODS: Record<number, string> = {
+  0: 'Unspecified', 1: 'Start interval', 2: 'End interval',
+  3: 'Mid interval', 4: 'Simple uniform',
+};
+
+// IANA IPFIX - Anonymization technique
+const ANON_TECHNIQUES: Record<number, string> = {
+  0: 'Undefined', 1: 'None', 2: 'Precision Degradation/Truncation',
+  3: 'Binning', 4: 'Enumeration', 5: 'Permutation',
+  6: 'Structured Permutation', 7: 'Reverse Truncation',
+  8: 'Noise',
+};
+
+// RFC 5102 - ICMP dest unreachable codes (for verbose display)
+const ICMP_UNREACH_CODES: Record<number, string> = {
+  0: 'Net Unreachable', 1: 'Host Unreachable', 2: 'Protocol Unreachable',
+  3: 'Port Unreachable', 4: 'Frag Needed', 5: 'Source Route Failed',
+  6: 'Dst Net Unknown', 7: 'Dst Host Unknown', 9: 'Net Admin Prohib',
+  10: 'Host Admin Prohib', 11: 'Net TOS Unreach', 12: 'Host TOS Unreach',
+  13: 'Admin Prohib',
+};
+
 /** Format a protocol number to its name. */
 export function formatProtocol(value: unknown): string {
   if (value === null || value === undefined) return '\u2014';
@@ -121,7 +198,7 @@ export function formatPortVerbose(value: unknown): string {
   const num = Number(value);
   if (!Number.isFinite(num)) return '\u2014';
   const name = WELL_KNOWN_PORTS[num];
-  return name ? `${num} (${name})` : String(num);
+  return name ?? String(num);
 }
 
 /** Format TCP flags bitmask to human-readable. */
@@ -376,6 +453,42 @@ export function formatIcmpTypeCode(value: unknown): string {
   return name ? `${name} (${type}/${code})` : `${type}/${code}`;
 }
 
+/** Verbose ICMP type/code — includes dest unreachable sub-codes. */
+function formatIcmpTypeCodeVerbose(value: unknown): string {
+  if (value === null || value === undefined) return '\u2014';
+  const num = Number(value);
+  const type = (num >> 8) & 0xff;
+  const code = num & 0xff;
+  const typeName = ICMP_TYPES[type];
+  if (type === 3) {
+    const codeName = ICMP_UNREACH_CODES[code];
+    return codeName ? `${codeName} (3/${code})` : `Dest Unreachable (3/${code})`;
+  }
+  return typeName ? `${typeName} (${type}/${code})` : `${type}/${code}`;
+}
+
+/** Helper for simple enum lookup formatters. */
+function enumFormatter(table: Record<number, string>): (value: unknown) => string {
+  return (value) => {
+    if (value === null || value === undefined) return '\u2014';
+    const num = Number(value);
+    return table[num] ?? String(num);
+  };
+}
+
+
+const formatNatEvent = enumFormatter(NAT_EVENTS);
+const formatNatType = enumFormatter(NAT_TYPES);
+const formatFlowDirection = enumFormatter(FLOW_DIRECTIONS);
+const formatIpVersion = enumFormatter(IP_VERSIONS);
+const formatFirewallEvent = enumFormatter(FIREWALL_EVENTS);
+const formatSamplingAlgorithm = enumFormatter(SAMPLING_ALGORITHMS);
+const formatMplsTopLabelType = enumFormatter(MPLS_LABEL_TYPES);
+const formatObservationPointType = enumFormatter(OBSERVATION_POINT_TYPES);
+const formatAddressRealm = enumFormatter(ADDRESS_REALMS);
+const formatValueDistMethod = enumFormatter(VALUE_DIST_METHODS);
+const formatAnonTechnique = enumFormatter(ANON_TECHNIQUES);
+
 /** Format an IP address (handles both v4 and v6). */
 export function formatIp(value: unknown): string {
   if (value === null || value === undefined) return '\u2014';
@@ -551,6 +664,35 @@ const FIELD_FORMATTERS: Record<string, Formatter> = {
 
   // Forwarding status
   forwardingStatus: formatForwardingStatus,
+
+  // NAT (RFC 8158)
+  natEvent: formatNatEvent,
+  natType: formatNatType,
+  natOriginatingAddressRealm: formatAddressRealm,
+  natQuotaExceededEvent: formatNatEvent,
+  natThresholdEvent: formatNatEvent,
+
+  // Flow direction (RFC 5610)
+  flowDirection: formatFlowDirection,
+
+  // IP version
+  ipVersion: formatIpVersion,
+
+  // Firewall (RFC 5655)
+  firewallEvent: formatFirewallEvent,
+
+  // Sampling algorithm
+  samplingAlgorithm: formatSamplingAlgorithm,
+
+  // MPLS
+  mplsTopLabelType: formatMplsTopLabelType,
+
+  // Observation / metering
+  observationPointType: formatObservationPointType,
+  valueDistributionMethod: formatValueDistMethod,
+
+  // Anonymization
+  anonymizationTechnique: formatAnonTechnique,
 };
 
 // Verbose formatters for sidebar — show more detail
@@ -567,6 +709,8 @@ const SIDEBAR_FORMATTERS: Record<string, Formatter> = {
   flowEndMilliseconds: formatTimestampAbsolute,
   ingressInterface: formatInterfaceVerbose,
   egressInterface: formatInterfaceVerbose,
+  icmpTypeCodeIPv4: formatIcmpTypeCodeVerbose,
+  icmpTypeCodeIPv6: formatIcmpTypeCodeVerbose,
 };
 
 // Timestamp columns should NOT be cached (timezone changes invalidate)
@@ -683,9 +827,26 @@ const COLUMN_LABELS: Record<string, string> = {
   flowEndReason: 'End Reason',
   forwardingStatus: 'Fwd Status',
   flowDirection: 'Direction',
+  ipVersion: 'IP Version',
   templateId: 'Template',
   observationDomainId: 'Obs Domain',
   exportingProcessId: 'Export PID',
+
+  // NAT
+  natEvent: 'NAT Event',
+  natType: 'NAT Type',
+  natOriginatingAddressRealm: 'NAT Realm',
+  natQuotaExceededEvent: 'NAT Quota Event',
+  natThresholdEvent: 'NAT Threshold',
+
+  // Firewall
+  firewallEvent: 'FW Event',
+
+  // MPLS
+  mplsTopLabelType: 'MPLS Label Type',
+
+  // Observation
+  observationPointType: 'Obs Point Type',
 
   // Application
   applicationName: 'App Name',
@@ -841,26 +1002,68 @@ export function computeDerivedFields(
 
   const fields: DerivedField[] = [];
 
-  // --- Absolute flow times from systemInitTime + sysUpTime ---
+  // --- Absolute flow times ---
+  // Try native timestamps first, then sysUpTime-derived, then fall back to
+  // ingestion time (flowcusExportTime) so the user always sees *some* time
+  // reference even when the exporter sends epoch-zero timestamps.
+
+  const exportTime = get('flowcusExportTime');
+
+  const flowStartMs = get('flowStartMilliseconds');
+  const flowStartSec = get('flowStartSeconds');
+  const flowEndMs = get('flowEndMilliseconds');
+  const flowEndSec = get('flowEndSeconds');
   const sysInit = get('systemInitTimeMilliseconds');
   const startUp = get('flowStartSysUpTime');
   const endUp = get('flowEndSysUpTime');
 
-  if (sysInit !== null && startUp !== null) {
-    const absStartMs = sysInit + startUp;
+  // Resolve flow start: prefer ms > sec > sysUpTime-derived > export time
+  let resolvedStartMs: number | null = null;
+  let startSource = '';
+  if (flowStartMs !== null && flowStartMs > 0) {
+    resolvedStartMs = flowStartMs;
+    startSource = `flowStartMilliseconds(${flowStartMs})`;
+  } else if (flowStartSec !== null && flowStartSec > 0) {
+    resolvedStartMs = flowStartSec * 1000;
+    startSource = `flowStartSeconds(${flowStartSec}) * 1000`;
+  } else if (sysInit !== null && sysInit > 0 && startUp !== null) {
+    resolvedStartMs = sysInit + startUp;
+    startSource = `sysInit(${sysInit}) + startUptime(${startUp})`;
+  } else if (exportTime !== null && exportTime > 0) {
+    resolvedStartMs = exportTime;
+    startSource = `flowcusExportTime(${exportTime}) — fallback`;
+  }
+
+  if (resolvedStartMs !== null) {
     fields.push({
       label: 'Flow Start',
-      value: formatDateInTz(absStartMs, _timezone, true),
-      raw: `sysInit(${sysInit}) + startUptime(${startUp}) = ${absStartMs}ms`,
+      value: formatDateInTz(resolvedStartMs, _timezone, true),
+      raw: `${startSource} = ${resolvedStartMs}ms`,
     });
   }
 
-  if (sysInit !== null && endUp !== null) {
-    const absEndMs = sysInit + endUp;
+  // Resolve flow end: prefer ms > sec > sysUpTime-derived > export time
+  let resolvedEndMs: number | null = null;
+  let endSource = '';
+  if (flowEndMs !== null && flowEndMs > 0) {
+    resolvedEndMs = flowEndMs;
+    endSource = `flowEndMilliseconds(${flowEndMs})`;
+  } else if (flowEndSec !== null && flowEndSec > 0) {
+    resolvedEndMs = flowEndSec * 1000;
+    endSource = `flowEndSeconds(${flowEndSec}) * 1000`;
+  } else if (sysInit !== null && sysInit > 0 && endUp !== null) {
+    resolvedEndMs = sysInit + endUp;
+    endSource = `sysInit(${sysInit}) + endUptime(${endUp})`;
+  } else if (exportTime !== null && exportTime > 0) {
+    resolvedEndMs = exportTime;
+    endSource = `flowcusExportTime(${exportTime}) — fallback`;
+  }
+
+  if (resolvedEndMs !== null) {
     fields.push({
       label: 'Flow End',
-      value: formatDateInTz(absEndMs, _timezone, true),
-      raw: `sysInit(${sysInit}) + endUptime(${endUp}) = ${absEndMs}ms`,
+      value: formatDateInTz(resolvedEndMs, _timezone, true),
+      raw: `${endSource} = ${resolvedEndMs}ms`,
     });
   }
 

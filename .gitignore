@@ -29,9 +29,6 @@ Thumbs.db
 # Storage data (dev)
 /storage/
 
-# Performance profiling dumps (dev mode)
-/profiling/
-
 # Test artifacts
 /coverage/
 /test-results/

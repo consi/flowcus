@@ -43,19 +43,19 @@
 //! 5       3     reserved
 //! 8       8     row_count: u64 LE
 //! 16      4     generation: u32 LE
-//! 20      4     time_min: u32 LE (unix seconds)
-//! 24      4     time_max: u32 LE (unix seconds)
-//! 28      4     observation_domain_id: u32 LE
-//! 32      8     created_at_ms: u64 LE
-//! 40      8     disk_bytes: u64 LE
-//! 48      4     column_count: u32 LE
-//! 52      4     schema_fingerprint_lo: u32 LE
-//! 56      4     schema_fingerprint_hi: u32 LE
-//! 60      2     exporter_port: u16 LE
-//! 62      1     exporter_family: u8 (4=IPv4, 6=IPv6)
-//! 63      1     reserved
-//! 64      16    exporter_addr: IPv4 in first 4 bytes or full IPv6
-//! 80      176   reserved (for future: column index, bloom filter offsets, etc.)
+//! 20      8     time_min: u64 LE (unix milliseconds)
+//! 28      8     time_max: u64 LE (unix milliseconds)
+//! 36      4     observation_domain_id: u32 LE
+//! 40      8     created_at_ms: u64 LE
+//! 48      8     disk_bytes: u64 LE
+//! 56      4     column_count: u32 LE
+//! 60      8     schema_fingerprint: u64 LE
+//! 68      2     exporter_port: u16 LE
+//! 70      1     exporter_family: u8 (4=IPv4, 6=IPv6)
+//! 71      1     reserved
+//! 72      16    exporter_addr: IPv4 in first 4 bytes or full IPv6
+//! 88      4     CRC32-C over bytes 0..88
+//! 92      164   reserved (for future: column index, bloom filter offsets, etc.)
 //! ```
 //!
 //! # Column file layout (.col)
@@ -113,8 +113,8 @@ pub const PART_FORMAT_VERSION: u32 = 1;
 pub struct PartMetadata {
     pub row_count: u64,
     pub generation: u32,
-    pub time_min: u32,
-    pub time_max: u32,
+    pub time_min: u64,
+    pub time_max: u64,
     pub observation_domain_id: u32,
     pub created_at_ms: u64,
     pub disk_bytes: u64,
@@ -127,8 +127,11 @@ pub struct PartMetadata {
 // ---- Path construction ----
 
 /// Build the time-partitioned directory path: `{base}/{YYYY}/{MM}/{DD}/{HH}/`
-pub fn hour_partition_dir(base: &Path, unix_secs: u32) -> PathBuf {
-    let ts = unix_secs as u64;
+///
+/// `unix_ms` is a unix timestamp in milliseconds. Internally converted to
+/// seconds for YMD/hour computation.
+pub fn hour_partition_dir(base: &Path, unix_ms: u64) -> PathBuf {
+    let ts = unix_ms / 1000;
     let (year, month, day) = days_to_ymd(ts / 86400);
     let hour = (ts % 86400) / 3600;
     base.join(format!("{year:04}"))
@@ -144,37 +147,35 @@ pub fn hour_partition_dir(base: &Path, unix_secs: u32) -> PathBuf {
 /// - Time range skip by readdir (no file open needed)
 /// - Merge candidate grouping by generation
 /// - Lexicographic sort within a generation = chronological order
-pub fn part_dir_name(generation: u32, time_min: u32, time_max: u32, seq: u32) -> String {
+pub fn part_dir_name(generation: u32, time_min: u64, time_max: u64, seq: u32) -> String {
     format!("{PART_FORMAT_VERSION}_{generation:05}_{time_min}_{time_max}_{seq:06}")
 }
 
 /// Resolve full path for a part: `{base}/{YYYY}/{MM}/{DD}/{HH}/{part_name}/`
-pub fn part_path(base: &Path, time_min: u32, generation: u32, time_max: u32, seq: u32) -> PathBuf {
+pub fn part_path(base: &Path, time_min: u64, generation: u32, time_max: u64, seq: u32) -> PathBuf {
     let hour_dir = hour_partition_dir(base, time_min);
     let name = part_dir_name(generation, time_min, time_max, seq);
     hour_dir.join(name)
 }
 
-/// Parse a part directory name. Handles both versioned and legacy formats:
-/// - Versioned: `{ver}_{gen:05}_{min}_{max}_{seq:06}` → 5 segments
-/// - Legacy:    `{gen:05}_{min}_{max}_{seq:06}`        → 4 segments (version 0)
-///
-/// Returns `None` if the name doesn't match either format.
-pub fn parse_part_dir_name(name: &str) -> Option<(u32, u32, u32, u32)> {
+/// Parse with format version stripped. Returns `(generation, min_ts, max_ts, seq)`.
+/// Only used in tests — production code uses `parse_part_dir_name_versioned`.
+#[cfg(test)]
+pub fn parse_part_dir_name(name: &str) -> Option<(u32, u64, u64, u32)> {
     let (_, generation, min, max, seq) = parse_part_dir_name_versioned(name)?;
     Some((generation, min, max, seq))
 }
 
 /// Parse with format version. Returns `(format_version, generation, min_ts, max_ts, seq)`.
-pub fn parse_part_dir_name_versioned(name: &str) -> Option<(u32, u32, u32, u32, u32)> {
+pub fn parse_part_dir_name_versioned(name: &str) -> Option<(u32, u32, u64, u64, u32)> {
     let parts: Vec<&str> = name.split('_').collect();
 
     // Versioned format: {ver}_{gen}_{min}_{max}_{seq} — 5 segments
     if parts.len() == 5 {
         let version: u32 = parts[0].parse().ok()?;
         let generation = parts[1].parse().ok()?;
-        let min_ts = parts[2].parse().ok()?;
-        let max_ts = parts[3].parse().ok()?;
+        let min_ts: u64 = parts[2].parse().ok()?;
+        let max_ts: u64 = parts[3].parse().ok()?;
         let seq = parts[4].parse().ok()?;
         return Some((version, generation, min_ts, max_ts, seq));
     }
@@ -182,8 +183,8 @@ pub fn parse_part_dir_name_versioned(name: &str) -> Option<(u32, u32, u32, u32, 
     // Legacy format: {gen}_{min}_{max}_{seq} — 4 segments, version 0
     if parts.len() == 4 {
         let generation = parts[0].parse().ok()?;
-        let min_ts = parts[1].parse().ok()?;
-        let max_ts = parts[2].parse().ok()?;
+        let min_ts: u64 = parts[1].parse().ok()?;
+        let max_ts: u64 = parts[2].parse().ok()?;
         let seq = parts[3].parse().ok()?;
         return Some((0, generation, min_ts, max_ts, seq));
     }
@@ -282,36 +283,37 @@ fn write_meta_bin(path: &Path, meta: &PartMetadata) -> std::io::Result<()> {
     buf[8..16].copy_from_slice(&meta.row_count.to_le_bytes());
     // Generation (16..20)
     buf[16..20].copy_from_slice(&meta.generation.to_le_bytes());
-    // time_min (20..24)
-    buf[20..24].copy_from_slice(&meta.time_min.to_le_bytes());
-    // time_max (24..28)
-    buf[24..28].copy_from_slice(&meta.time_max.to_le_bytes());
-    // observation_domain_id (28..32)
-    buf[28..32].copy_from_slice(&meta.observation_domain_id.to_le_bytes());
-    // created_at_ms (32..40)
-    buf[32..40].copy_from_slice(&meta.created_at_ms.to_le_bytes());
-    // disk_bytes (40..48)
-    buf[40..48].copy_from_slice(&meta.disk_bytes.to_le_bytes());
-    // column_count (48..52)
-    buf[48..52].copy_from_slice(&meta.column_count.to_le_bytes());
-    // schema_fingerprint (52..60)
-    buf[52..60].copy_from_slice(&meta.schema_fingerprint.to_le_bytes());
-    // exporter_port (60..62)
-    buf[60..62].copy_from_slice(&meta.exporter.port().to_le_bytes());
-    // exporter_family (62)
+    // time_min (20..28) — unix milliseconds
+    buf[20..28].copy_from_slice(&meta.time_min.to_le_bytes());
+    // time_max (28..36) — unix milliseconds
+    buf[28..36].copy_from_slice(&meta.time_max.to_le_bytes());
+    // observation_domain_id (36..40)
+    buf[36..40].copy_from_slice(&meta.observation_domain_id.to_le_bytes());
+    // created_at_ms (40..48)
+    buf[40..48].copy_from_slice(&meta.created_at_ms.to_le_bytes());
+    // disk_bytes (48..56)
+    buf[48..56].copy_from_slice(&meta.disk_bytes.to_le_bytes());
+    // column_count (56..60)
+    buf[56..60].copy_from_slice(&meta.column_count.to_le_bytes());
+    // schema_fingerprint (60..68)
+    buf[60..68].copy_from_slice(&meta.schema_fingerprint.to_le_bytes());
+    // exporter_port (68..70)
+    buf[68..70].copy_from_slice(&meta.exporter.port().to_le_bytes());
+    // exporter_family (70)
     match meta.exporter.ip() {
-        std::net::IpAddr::V4(_) => buf[62] = 4,
-        std::net::IpAddr::V6(_) => buf[62] = 6,
+        std::net::IpAddr::V4(_) => buf[70] = 4,
+        std::net::IpAddr::V6(_) => buf[70] = 6,
     }
-    // exporter_addr (64..80)
+    // reserved (71)
+    // exporter_addr (72..88)
     match meta.exporter.ip() {
-        std::net::IpAddr::V4(v4) => buf[64..68].copy_from_slice(&v4.octets()),
-        std::net::IpAddr::V6(v6) => buf[64..80].copy_from_slice(&v6.octets()),
+        std::net::IpAddr::V4(v4) => buf[72..76].copy_from_slice(&v4.octets()),
+        std::net::IpAddr::V6(v6) => buf[72..88].copy_from_slice(&v6.octets()),
     }
 
-    // CRC32-C over bytes 0..80, written at 80..84
-    let crc = crate::crc::crc32c(&buf[..80]);
-    buf[80..84].copy_from_slice(&crc.to_le_bytes());
+    // CRC32-C over bytes 0..88, written at 88..92
+    let crc = crate::crc::crc32c(&buf[..88]);
+    buf[88..92].copy_from_slice(&crc.to_le_bytes());
 
     std::fs::write(path, buf)
 }
@@ -576,9 +578,9 @@ pub fn read_meta_bin(path: &Path) -> std::io::Result<PartMetadataHeader> {
         ));
     }
 
-    // Verify CRC32-C at bytes 80..84 over bytes 0..80
-    let stored_crc = u32::from_le_bytes(buf[80..84].try_into().unwrap());
-    if !crate::crc::verify_crc32c(&buf[..80], stored_crc) {
+    // Verify CRC32-C at bytes 88..92 over bytes 0..88
+    let stored_crc = u32::from_le_bytes(buf[88..92].try_into().unwrap());
+    if !crate::crc::verify_crc32c(&buf[..88], stored_crc) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("CRC mismatch in {}", path.display()),
@@ -588,13 +590,13 @@ pub fn read_meta_bin(path: &Path) -> std::io::Result<PartMetadataHeader> {
     Ok(PartMetadataHeader {
         row_count: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
         generation: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-        time_min: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-        time_max: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
-        observation_domain_id: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
-        created_at_ms: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
-        disk_bytes: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
-        column_count: u32::from_le_bytes(buf[48..52].try_into().unwrap()),
-        schema_fingerprint: u64::from_le_bytes(buf[52..60].try_into().unwrap()),
+        time_min: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
+        time_max: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
+        observation_domain_id: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
+        created_at_ms: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+        disk_bytes: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+        column_count: u32::from_le_bytes(buf[56..60].try_into().unwrap()),
+        schema_fingerprint: u64::from_le_bytes(buf[60..68].try_into().unwrap()),
     })
 }
 
@@ -604,8 +606,8 @@ pub fn read_meta_bin(path: &Path) -> std::io::Result<PartMetadataHeader> {
 pub struct PartMetadataHeader {
     pub row_count: u64,
     pub generation: u32,
-    pub time_min: u32,
-    pub time_max: u32,
+    pub time_min: u64,
+    pub time_max: u64,
     pub observation_domain_id: u32,
     pub created_at_ms: u64,
     pub disk_bytes: u64,
@@ -758,18 +760,6 @@ pub fn list_columns(part_dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(names)
 }
 
-/// List column names from schema.bin (avoids readdir on columns/ directory).
-///
-/// Falls back to `list_columns` (readdir) if schema.bin doesn't exist.
-pub fn list_columns_from_index(part_dir: &Path) -> std::io::Result<Vec<String>> {
-    let schema_path = part_dir.join("schema.bin");
-    if schema_path.exists() {
-        let schema = read_schema_bin(&schema_path)?;
-        return Ok(schema.columns.into_iter().map(|c| c.name).collect());
-    }
-    list_columns(part_dir)
-}
-
 /// Remove a part directory entirely. Used after successful merge.
 pub fn remove_part(part_dir: &Path) -> std::io::Result<()> {
     tracing::debug!(path = %part_dir.display(), "Removing merged source part");
@@ -846,63 +836,63 @@ mod tests {
 
     #[test]
     fn part_dir_name_format() {
-        let name = part_dir_name(0, 1_700_000_000, 1_700_003_599, 1);
+        let name = part_dir_name(0, 1_700_000_000_000, 1_700_003_599_000, 1);
         // Format: {version}_{gen:05}_{min}_{max}_{seq:06}
-        assert_eq!(name, "1_00000_1700000000_1700003599_000001");
+        assert_eq!(name, "1_00000_1700000000000_1700003599000_000001");
     }
 
     #[test]
     fn part_dir_names_sort_by_time_within_generation() {
-        let a = part_dir_name(0, 1_700_000_000, 1_700_003_599, 1);
-        let b = part_dir_name(0, 1_700_003_600, 1_700_007_199, 2);
+        let a = part_dir_name(0, 1_700_000_000_000, 1_700_003_599_000, 1);
+        let b = part_dir_name(0, 1_700_003_600_000, 1_700_007_199_000, 2);
         assert!(a < b);
     }
 
     #[test]
     fn merged_parts_sort_after_raw_parts() {
-        let raw = part_dir_name(0, 1_700_000_000, 1_700_003_599, 1);
-        let merged = part_dir_name(1, 1_700_000_000, 1_700_007_199, 42);
+        let raw = part_dir_name(0, 1_700_000_000_000, 1_700_003_599_000, 1);
+        let merged = part_dir_name(1, 1_700_000_000_000, 1_700_007_199_000, 42);
         assert!(raw < merged);
     }
 
     #[test]
     fn parse_roundtrip() {
-        let name = part_dir_name(2, 1_700_000_000, 1_700_003_599, 99);
+        let name = part_dir_name(2, 1_700_000_000_000, 1_700_003_599_000, 99);
         let (generation, min, max, seq) = parse_part_dir_name(&name).unwrap();
         assert_eq!(generation, 2);
-        assert_eq!(min, 1_700_000_000);
-        assert_eq!(max, 1_700_003_599);
+        assert_eq!(min, 1_700_000_000_000);
+        assert_eq!(max, 1_700_003_599_000);
         assert_eq!(seq, 99);
     }
 
     #[test]
     fn parse_versioned_roundtrip() {
-        let name = part_dir_name(2, 1_700_000_000, 1_700_003_599, 99);
+        let name = part_dir_name(2, 1_700_000_000_000, 1_700_003_599_000, 99);
         let (ver, generation, min, max, seq) = parse_part_dir_name_versioned(&name).unwrap();
         assert_eq!(ver, PART_FORMAT_VERSION);
         assert_eq!(generation, 2);
-        assert_eq!(min, 1_700_000_000);
-        assert_eq!(max, 1_700_003_599);
+        assert_eq!(min, 1_700_000_000_000);
+        assert_eq!(max, 1_700_003_599_000);
         assert_eq!(seq, 99);
     }
 
     #[test]
     fn parse_legacy_format() {
         // Legacy v0 format: no version prefix, 4 segments
-        let name = "00002_1700000000_1700003599_000099";
+        let name = "00002_1700000000000_1700003599000_000099";
         let (ver, generation, min, max, seq) = parse_part_dir_name_versioned(name).unwrap();
         assert_eq!(ver, 0);
         assert_eq!(generation, 2);
-        assert_eq!(min, 1_700_000_000);
-        assert_eq!(max, 1_700_003_599);
+        assert_eq!(min, 1_700_000_000_000);
+        assert_eq!(max, 1_700_003_599_000);
         assert_eq!(seq, 99);
     }
 
     #[test]
     fn hour_partition_path() {
         let base = Path::new("/data/flows");
-        // 2023-11-14T22:xx:xxZ
-        let dir = hour_partition_dir(base, 1_700_000_000);
+        // 2023-11-14T22:xx:xxZ — value is now in milliseconds
+        let dir = hour_partition_dir(base, 1_700_000_000_000);
         assert_eq!(dir.to_str().unwrap(), "/data/flows/2023/11/14/22");
     }
 
@@ -921,8 +911,8 @@ mod tests {
         let meta = PartMetadata {
             row_count: 5000,
             generation: 0,
-            time_min: 1_700_000_000,
-            time_max: 1_700_003_599,
+            time_min: 1_700_000_000_000,
+            time_max: 1_700_003_599_000,
             observation_domain_id: 42,
             created_at_ms: 1_700_000_000_000,
             disk_bytes: 123_456,
@@ -940,8 +930,8 @@ mod tests {
 
         assert_eq!(header.row_count, 5000);
         assert_eq!(header.generation, 0);
-        assert_eq!(header.time_min, 1_700_000_000);
-        assert_eq!(header.time_max, 1_700_003_599);
+        assert_eq!(header.time_min, 1_700_000_000_000);
+        assert_eq!(header.time_max, 1_700_003_599_000);
         assert_eq!(header.observation_domain_id, 42);
         assert_eq!(header.disk_bytes, 123_456);
         assert_eq!(header.column_count, 8);

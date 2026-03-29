@@ -293,14 +293,12 @@ async fn process_ipfix_packet(
     unprocessed_dir: &std::path::Path,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let _t = flowcus_core::profiling::span_timer("ipfix;process_packet");
 
     match protocol::parse_message(buf, src) {
         Ok(mut msg) => {
             metrics.ipfix_packets_parsed.fetch_add(1, Relaxed);
 
             {
-                let _t = flowcus_core::profiling::span_timer("ipfix;decode_message");
                 let mut session = session.lock().await;
                 decoder::decode_message(&mut msg, buf, &mut session);
                 metrics

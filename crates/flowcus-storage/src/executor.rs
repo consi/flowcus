@@ -17,8 +17,6 @@ use rayon::prelude::*;
 use serde::Serialize;
 use tracing::{debug, trace};
 
-use flowcus_core::profiling::span_timer;
-
 use flowcus_query::ast::{
     AggCall, AggExpr, AggFunc, CompareOp, Duration as FqlDuration, DurationUnit, FieldFilter,
     FieldValue as AstFieldValue, FilterExpr, GroupByKey, IpDirection, IpFilter, IpValue,
@@ -66,8 +64,8 @@ pub struct ExecutionPlan {
 #[serde(tag = "type")]
 pub enum PlanStep {
     TimeRangePrune {
-        start: u32,
-        end: u32,
+        start: u64,
+        end: u64,
         parts_before: usize,
         parts_after: usize,
         duration_us: Option<u64>,
@@ -129,6 +127,14 @@ pub enum PlanStep {
         parts_count: usize,
         duration_us: Option<u64>,
     },
+    /// Per-part scan timing within a ParallelScan. One emitted per part.
+    PartScan {
+        part: String,
+        rows_scanned: u64,
+        rows_matched: u64,
+        bytes_read: u64,
+        duration_us: Option<u64>,
+    },
     /// Summary of storage-level LRU cache usage for this query.
     CacheStats {
         hits: u64,
@@ -147,19 +153,19 @@ pub struct QueryResult {
     pub total_matching_rows: u64,
     /// Sum of `row_count` from all part metadata in the time range (no column scan).
     pub total_rows_in_range: u64,
-    pub time_start: u32,
-    pub time_end: u32,
+    pub time_start: u64,
+    pub time_end: u64,
 }
 
 /// Lightweight histogram built from part metadata only (no column scan).
 pub struct HistogramResult {
-    /// Time-bucketed row counts: (bucket_start_unix_seconds, row_count).
-    pub buckets: Vec<(u32, u64)>,
+    /// Time-bucketed row counts: (bucket_start_unix_ms, row_count).
+    pub buckets: Vec<(u64, u64)>,
     /// Total rows across all parts in the time range.
     pub total_rows: u64,
-    /// Resolved time range bounds.
-    pub time_start: u32,
-    pub time_end: u32,
+    /// Resolved time range bounds (unix milliseconds).
+    pub time_start: u64,
+    pub time_end: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -509,29 +515,29 @@ fn duration_to_secs(d: &FqlDuration) -> u64 {
     })
 }
 
-fn now_unix() -> u32 {
+fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as u32
+        .as_millis() as u64
 }
 
-/// Convert a `TimeRange` to (start_unix_secs, end_unix_secs).
-pub fn time_range_to_bounds(tr: &TimeRange) -> (u32, u32) {
-    let now = now_unix();
+/// Convert a `TimeRange` to (start_unix_ms, end_unix_ms).
+pub fn time_range_to_bounds(tr: &TimeRange) -> (u64, u64) {
+    let now = now_unix_ms();
     match tr {
         TimeRange::Relative { duration, offset } => {
-            let dur = duration_to_secs(duration) as u32;
-            let off = offset
+            let dur_ms = duration_to_secs(duration) * 1000;
+            let off_ms = offset
                 .as_ref()
-                .map(|o| duration_to_secs(o) as u32)
+                .map(|o| duration_to_secs(o) * 1000)
                 .unwrap_or(0);
-            let end = now.saturating_sub(off);
-            let start = end.saturating_sub(dur);
+            let end = now.saturating_sub(off_ms);
+            let start = end.saturating_sub(dur_ms);
             (start, end)
         }
         TimeRange::Absolute { start, end } => {
-            let s = parse_datetime(start).unwrap_or(now.saturating_sub(3600));
+            let s = parse_datetime(start).unwrap_or(now.saturating_sub(3_600_000));
             let e = parse_datetime(end).unwrap_or(now);
             (s, e)
         }
@@ -539,15 +545,15 @@ pub fn time_range_to_bounds(tr: &TimeRange) -> (u32, u32) {
             let t = parse_datetime(datetime).unwrap_or(now);
             match window {
                 flowcus_query::ast::PointWindow::PlusMinus(d) => {
-                    let w = duration_to_secs(d) as u32;
+                    let w = duration_to_secs(d) * 1000;
                     (t.saturating_sub(w), t.saturating_add(w))
                 }
                 flowcus_query::ast::PointWindow::Plus(d) => {
-                    let w = duration_to_secs(d) as u32;
+                    let w = duration_to_secs(d) * 1000;
                     (t, t.saturating_add(w))
                 }
                 flowcus_query::ast::PointWindow::Minus(d) => {
-                    let w = duration_to_secs(d) as u32;
+                    let w = duration_to_secs(d) * 1000;
                     (t.saturating_sub(w), t)
                 }
             }
@@ -555,10 +561,10 @@ pub fn time_range_to_bounds(tr: &TimeRange) -> (u32, u32) {
         TimeRange::Recurring { base, .. } => time_range_to_bounds(base),
         TimeRange::Combined(ranges) => {
             if ranges.is_empty() {
-                (now.saturating_sub(3600), now)
+                (now.saturating_sub(3_600_000), now)
             } else {
-                let mut min_start = u32::MAX;
-                let mut max_end = 0u32;
+                let mut min_start = u64::MAX;
+                let mut max_end = 0u64;
                 for r in ranges {
                     let (s, e) = time_range_to_bounds(r);
                     min_start = min_start.min(s);
@@ -571,8 +577,10 @@ pub fn time_range_to_bounds(tr: &TimeRange) -> (u32, u32) {
 }
 
 /// Simple datetime parser: handles ISO 8601 date/datetime strings.
-fn parse_datetime(s: &str) -> Option<u32> {
-    // Try "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS" or "YYYY-MM-DDTHH:MM"
+/// Supports: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", "YYYY-MM-DDTHH:MM:SS.sss",
+/// with optional trailing "Z". Returns unix milliseconds.
+fn parse_datetime(s: &str) -> Option<u64> {
+    let s = s.trim_end_matches('Z');
     let parts: Vec<&str> = s.split(['T', ' ']).collect();
     let date_parts: Vec<u32> = parts
         .first()?
@@ -584,21 +592,34 @@ fn parse_datetime(s: &str) -> Option<u32> {
     }
     let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
 
-    let (hour, minute, second) = if parts.len() > 1 {
-        let time_parts: Vec<u32> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
-        (
-            *time_parts.first().unwrap_or(&0),
-            *time_parts.get(1).unwrap_or(&0),
-            *time_parts.get(2).unwrap_or(&0),
-        )
+    let (hour, minute, second, millis) = if parts.len() > 1 {
+        let time_parts: Vec<&str> = parts[1].split(':').collect();
+        let h: u32 = time_parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let m: u32 = time_parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+        // Seconds may have fractional part: "SS" or "SS.sss"
+        let (sec, ms) = if let Some(sec_str) = time_parts.get(2) {
+            if let Some((whole, frac)) = sec_str.split_once('.') {
+                let s: u32 = whole.parse().unwrap_or(0);
+                let frac_padded = format!("{frac:0<3}");
+                let ms: u32 = frac_padded[..3].parse().unwrap_or(0);
+                (s, ms)
+            } else {
+                (sec_str.parse().unwrap_or(0), 0u32)
+            }
+        } else {
+            (0, 0)
+        };
+        (h, m, sec, ms)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     };
 
-    // Convert to unix timestamp (simplified, no leap seconds)
     let days = ymd_to_days(year, month, day)?;
-    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
-    Some(secs)
+    let secs = u64::from(days) * 86400
+        + u64::from(hour) * 3600
+        + u64::from(minute) * 60
+        + u64::from(second);
+    Some(secs * 1000 + u64::from(millis))
 }
 
 fn ymd_to_days(year: u32, month: u32, day: u32) -> Option<u32> {
@@ -1661,9 +1682,8 @@ impl QueryExecutor {
         query: &Query,
         offset: u64,
         limit: u64,
-        pinned_time: Option<(u32, u32)>,
+        pinned_time: Option<(u64, u64)>,
     ) -> std::io::Result<QueryResult> {
-        let _execute_timer = span_timer("query;execute");
         let mut plan = ExecutionPlan {
             steps: Vec::new(),
             parts_total: 0,
@@ -1723,8 +1743,24 @@ impl QueryExecutor {
             })
             .collect();
 
-        let resolved_filters: Vec<ResolvedFilter> =
+        let mut resolved_filters: Vec<ResolvedFilter> =
             ast_filters.iter().map(|f| resolve_filter(f)).collect();
+
+        // Inject row-level time range filter: flowcusExportTime >= start AND <= end.
+        // Part-level pruning only skips parts whose entire range is outside the
+        // query window. Within a part, rows outside the window must be filtered.
+        resolved_filters.push(ResolvedFilter::And(
+            Box::new(ResolvedFilter::Field(ResolvedFieldFilter {
+                col_name: "flowcusExportTime".into(),
+                op: CompareOp::Ge,
+                target: time_start,
+            })),
+            Box::new(ResolvedFilter::Field(ResolvedFieldFilter {
+                col_name: "flowcusExportTime".into(),
+                op: CompareOp::Le,
+                target: time_end,
+            })),
+        ));
 
         // Step 5: Deduplicate parts (skip lower-gen parts subsumed by higher-gen)
         let mut filtered_parts = filtered_parts;
@@ -1778,8 +1814,11 @@ impl QueryExecutor {
             offset.saturating_add(limit)
         };
 
-        // Determine which output columns we need
-        let filter_col_names = collect_filter_column_names(&ast_filters);
+        // Determine which output columns we need (include flowcusExportTime for time range filter)
+        let mut filter_col_names = collect_filter_column_names(&ast_filters);
+        if !filter_col_names.contains(&"flowcusExportTime".to_string()) {
+            filter_col_names.push("flowcusExportTime".to_string());
+        }
 
         // Step 7: Process parts with columnar filtering
         let mut all_rows: Vec<Vec<serde_json::Value>> = Vec::new();
@@ -1817,8 +1856,6 @@ impl QueryExecutor {
         ) {
             return result;
         }
-
-        let _parts_scan_timer = span_timer("query;parts_scan");
 
         // Helper: process one part, handling errors inline
         let process_one_part = |part_entry: &PartEntry,
@@ -1919,6 +1956,10 @@ impl QueryExecutor {
             };
         }
 
+        // Collect per-part timing steps separately so they always appear
+        // right after the ParallelScan header in the plan.
+        let mut part_scan_steps: Vec<PlanStep> = Vec::new();
+
         if is_aggregate {
             // ================================================================
             // Aggregate queries: parallel scan — must process ALL parts.
@@ -1926,24 +1967,62 @@ impl QueryExecutor {
             struct ParPartResult {
                 result: ProcessPartResult,
                 local_plan: ExecutionPlan,
+                part_path: String,
+                duration_us: Option<u64>,
             }
 
             let parallel_start = Instant::now();
 
             let par_results: Vec<ParPartResult> = filtered_parts
                 .par_iter()
-                .filter_map(|part_entry| {
+                .map(|part_entry| {
+                    let part_start = Instant::now();
                     let mut local_plan = ExecutionPlan::default();
-                    let result = process_one_part(part_entry, &mut local_plan).ok()?;
-                    Some(ParPartResult { result, local_plan })
+                    let result = process_one_part(part_entry, &mut local_plan)
+                        .unwrap_or(ProcessPartResult::SkippedMerge);
+                    let dur = u64::try_from(part_start.elapsed().as_micros()).ok();
+                    let path = part_entry
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ParPartResult {
+                        result,
+                        local_plan,
+                        part_path: path,
+                        duration_us: dur,
+                    }
                 })
                 .collect();
 
             let parallel_us = u64::try_from(parallel_start.elapsed().as_micros()).ok();
             plan.steps.push(PlanStep::ParallelScan {
-                parts_count: filtered_parts.len(),
+                parts_count: par_results.len(),
                 duration_us: parallel_us,
             });
+
+            for par in &par_results {
+                let (rows_scanned, rows_matched) = match &par.result {
+                    ProcessPartResult::Rows {
+                        rows, rows_scanned, ..
+                    } => (*rows_scanned, rows.len() as u64),
+                    ProcessPartResult::ColumnarData {
+                        matching_indices,
+                        rows_scanned,
+                        ..
+                    } => (*rows_scanned, matching_indices.len() as u64),
+                    _ => (0, 0),
+                };
+                part_scan_steps.push(PlanStep::PartScan {
+                    part: par.part_path.clone(),
+                    rows_scanned,
+                    rows_matched,
+                    bytes_read: par.local_plan.bytes_read,
+                    duration_us: par.duration_us,
+                });
+            }
+
+            plan.steps.extend(part_scan_steps);
 
             for par in par_results {
                 merge_part_result!(par.result, par.local_plan);
@@ -1954,10 +2033,39 @@ impl QueryExecutor {
             // Stops as soon as we have enough rows for offset + limit.
             // ================================================================
             let scan_start = Instant::now();
+            let mut parts_scanned_count = 0usize;
 
             for part_entry in &filtered_parts {
+                let part_start = Instant::now();
                 let mut local_plan = ExecutionPlan::default();
-                if let Ok(result) = process_one_part(part_entry, &mut local_plan) {
+                let result = process_one_part(part_entry, &mut local_plan);
+                let part_dur = u64::try_from(part_start.elapsed().as_micros()).ok();
+                let path = part_entry
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                if let Ok(result) = result {
+                    let (rows_scanned, rows_matched) = match &result {
+                        ProcessPartResult::Rows {
+                            rows, rows_scanned, ..
+                        } => (*rows_scanned, rows.len() as u64),
+                        ProcessPartResult::ColumnarData {
+                            matching_indices,
+                            rows_scanned,
+                            ..
+                        } => (*rows_scanned, matching_indices.len() as u64),
+                        _ => (0, 0),
+                    };
+                    part_scan_steps.push(PlanStep::PartScan {
+                        part: path,
+                        rows_scanned,
+                        rows_matched,
+                        bytes_read: local_plan.bytes_read,
+                        duration_us: part_dur,
+                    });
+                    parts_scanned_count += 1;
                     merge_part_result!(result, local_plan);
                 }
 
@@ -1967,11 +2075,11 @@ impl QueryExecutor {
             }
 
             let scan_us = u64::try_from(scan_start.elapsed().as_micros()).ok();
-            // Still report as a scan step so the Gantt shows it
             plan.steps.push(PlanStep::ParallelScan {
-                parts_count: filtered_parts.len(),
+                parts_count: parts_scanned_count,
                 duration_us: scan_us,
             });
+            plan.steps.extend(part_scan_steps);
         }
 
         plan.parts_skipped_by_index = parts_skipped_by_index;
@@ -1980,7 +2088,6 @@ impl QueryExecutor {
         let output_columns = self.determine_output_columns_from_schema(query, &all_schema_columns);
 
         // Step 9: Apply aggregation or finalize results
-        let _agg_timer = span_timer("query;aggregation");
         let agg_start = Instant::now();
         let (result_columns, result_rows) = if is_aggregate {
             self.apply_aggregation_columnar(
@@ -2560,15 +2667,13 @@ impl QueryExecutor {
         plan: &mut ExecutionPlan,
         _parts_total: usize,
         _parts_after_time: usize,
-        time_start: u32,
-        time_end: u32,
+        time_start: u64,
+        time_end: u64,
         total_rows_in_range: u64,
         step_start: Instant,
     ) -> Option<std::io::Result<QueryResult>> {
         // Extract TopN or Sort stage
         let (n, sort_field, bottom) = self.extract_topn_params(query)?;
-
-        let _timer = span_timer("query;topn_fast_path");
 
         debug!(
             n,
@@ -2951,141 +3056,200 @@ impl QueryExecutor {
     /// ranges and row counts. When filters are present, checks `.bloom` files
     /// to estimate which granules might match (upper-bound estimate).
     ///
-    /// Processes parts from newest to oldest. Calls `on_progress` after each
-    /// part so callers can stream partial results.
+    /// Optimized path:
+    /// - Parts are processed in parallel via rayon
+    /// - Bucket distribution uses binary search (O(log n) per granule)
+    /// - Parts fitting a single bucket skip granule-level work entirely
+    ///
+    /// Calls `on_progress` periodically with partial results.
     pub fn histogram_from_metadata(
         &self,
-        time_start: u32,
-        time_end: u32,
-        bucket_secs: u32,
+        time_start: u64,
+        time_end: u64,
+        bucket_ms: u64,
         bloom_lookups: &[(String, Vec<u8>)],
         mut on_progress: impl FnMut(&HistogramResult),
     ) -> std::io::Result<HistogramResult> {
         let table = Table::open(self.table_base.parent().unwrap_or(Path::new(".")), "flows")?;
-        let mut filtered_parts = table.list_parts(Some(time_start), Some(time_end))?;
+        let filtered_parts = { table.list_parts(Some(time_start), Some(time_end))? };
 
-        // Process large merged parts first (they cover the most time), then
-        // newest raw parts. This fills the histogram bulk on the first events.
-        filtered_parts.sort_by(|a, b| {
-            b.generation
-                .cmp(&a.generation)
-                .then(b.time_max.cmp(&a.time_max))
-        });
-
-        // Build aligned buckets
-        let aligned_start = (time_start / bucket_secs) * bucket_secs;
-        let num_buckets = time_end.saturating_sub(aligned_start).div_ceil(bucket_secs) as usize;
-        let mut buckets: Vec<(u32, u64)> = (0..num_buckets)
-            .map(|i| (aligned_start + (i as u32) * bucket_secs, 0u64))
+        // Build aligned bucket starts (just timestamps, counts computed separately).
+        let aligned_start = (time_start / bucket_ms) * bucket_ms;
+        let num_buckets = time_end.saturating_sub(aligned_start).div_ceil(bucket_ms) as usize;
+        let bucket_starts: Vec<u64> = (0..num_buckets)
+            .map(|i| aligned_start + (i as u64) * bucket_ms)
             .collect();
 
+        // Process parts in parallel — each produces a local counts vector.
+        let part_results: Vec<(Vec<u64>, u64)> = filtered_parts
+            .par_iter()
+            .filter_map(|pe| {
+                if pe.path.join(".merging").exists() {
+                    return None;
+                }
+
+                // Part-level column index pruning: skip parts where bloom
+                // filters definitively exclude the part. Check if the part
+                // has bloom files and if ALL bloom lookups miss for ALL
+                // granules in the part, the part has zero matching rows.
+                // This is done inside histogram_process_part via the bloom mask.
+
+                let (counts, rows) =
+                    self.histogram_process_part(pe, &bucket_starts, bucket_ms, bloom_lookups);
+                if rows > 0 { Some((counts, rows)) } else { None }
+            })
+            .collect();
+
+        // Merge parallel results into final buckets.
+        let mut counts = vec![0u64; num_buckets];
+        let mut last_emitted_rows: u64 = 0;
+        let mut parts_since_emit: usize = 0;
+
+        for (part_counts, _part_rows) in &part_results {
+            for (i, &c) in part_counts.iter().enumerate() {
+                counts[i] += c;
+            }
+            parts_since_emit += 1;
+
+            let running_total: u64 = counts.iter().sum();
+            if parts_since_emit >= 5
+                || running_total > last_emitted_rows + last_emitted_rows / 50 + 100
+            {
+                let result = HistogramResult {
+                    buckets: bucket_starts
+                        .iter()
+                        .zip(counts.iter())
+                        .map(|(&ts, &c)| (ts, c))
+                        .collect(),
+                    total_rows: running_total,
+                    time_start,
+                    time_end,
+                };
+                on_progress(&result);
+                last_emitted_rows = running_total;
+                parts_since_emit = 0;
+            }
+        }
+
+        let buckets: Vec<(u64, u64)> = bucket_starts
+            .iter()
+            .zip(counts.iter())
+            .map(|(&ts, &c)| (ts, c))
+            .collect();
+
+        // Use sum of bucket counts as total — these are proportionally
+        // distributed to only cover the query time range, unlike raw
+        // part row counts which may extend beyond the window.
+        let total_rows: u64 = buckets.iter().map(|(_, c)| c).sum();
+
+        Ok(HistogramResult {
+            buckets,
+            total_rows,
+            time_start,
+            time_end,
+        })
+    }
+
+    /// Filtered histogram: reads filter columns + export time, evaluates
+    /// filters row-by-row, and directly buckets matching rows.
+    ///
+    /// Much faster than a full `execute()` because:
+    /// - No output columns decoded (only filter columns + export time)
+    /// - No JSON conversion or aggregation framework
+    /// - Bloom and mark skipping applied per-granule
+    /// - Parallel part processing via rayon
+    pub fn histogram_filtered(
+        &self,
+        query: &Query,
+        time_start: u64,
+        time_end: u64,
+        bucket_ms: u64,
+        mut on_progress: impl FnMut(&HistogramResult),
+    ) -> std::io::Result<HistogramResult> {
+        let table = Table::open(self.table_base.parent().unwrap_or(Path::new(".")), "flows")?;
+        let filtered_parts = table.list_parts(Some(time_start), Some(time_end))?;
+
+        // Extract filter expressions from query stages.
+        let ast_filters: Vec<&FilterExpr> = query
+            .stages
+            .iter()
+            .filter_map(|s| {
+                if let Stage::Filter(f) = s {
+                    Some(f)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Pre-resolve filters once (avoids repeated parsing per-row).
+        let resolved_filters: Vec<ResolvedFilter> =
+            ast_filters.iter().map(|f| resolve_filter(f)).collect();
+
+        // Extract bloom and mark lookup data.
+        let bloom_lookups: Vec<(String, Vec<u8>)> = ast_filters
+            .iter()
+            .flat_map(|f| bloom_lookup_bytes(f))
+            .collect();
+        let bloom_list_lookups: Vec<(String, Vec<Vec<u8>>)> = ast_filters
+            .iter()
+            .flat_map(|f| bloom_lookup_list_bytes(f))
+            .collect();
+
+        // Filter column names.
+        let filter_col_names = collect_filter_column_names(&ast_filters);
+
+        let aligned_start = (time_start / bucket_ms) * bucket_ms;
+        let num_buckets = time_end.saturating_sub(aligned_start).div_ceil(bucket_ms) as usize;
+        let bucket_starts: Vec<u64> = (0..num_buckets)
+            .map(|i| aligned_start + (i as u64) * bucket_ms)
+            .collect();
+
+        // Process parts in parallel.
+        let part_results: Vec<(Vec<u64>, u64)> = filtered_parts
+            .par_iter()
+            .filter_map(|pe| {
+                if pe.path.join(".merging").exists() {
+                    return None;
+                }
+                let result = self.histogram_filtered_part(
+                    pe,
+                    &bucket_starts,
+                    bucket_ms,
+                    &ast_filters,
+                    &resolved_filters,
+                    &bloom_lookups,
+                    &bloom_list_lookups,
+                    &filter_col_names,
+                );
+                match result {
+                    Ok((counts, rows)) if rows > 0 => Some((counts, rows)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        // Merge.
+        let mut counts = vec![0u64; num_buckets];
         let mut total_rows: u64 = 0;
         let mut last_emitted_rows: u64 = 0;
         let mut parts_since_emit: usize = 0;
 
-        for pe in &filtered_parts {
-            if pe.path.join(".merging").exists() {
-                continue;
+        for (part_counts, part_rows) in &part_results {
+            for (i, &c) in part_counts.iter().enumerate() {
+                counts[i] += c;
             }
-
-            let mrk_path = pe.path.join("columns/flowcusExportTime.mrk");
-            let marks_result = self.cache.get_marks(&mrk_path);
-
-            match marks_result {
-                Ok((_granule_size, ref marks, _cached)) if !marks.is_empty() => {
-                    // --- Granule-level path (v1+ parts) ---
-
-                    // Build per-granule bloom mask if bloom lookups are requested.
-                    // A granule is masked out only if ALL bloom filters agree it
-                    // doesn't match (AND across columns).
-                    let bloom_mask: Option<Vec<bool>> = if bloom_lookups.is_empty() {
-                        None
-                    } else {
-                        // Start with all granules potentially matching
-                        let mut mask = vec![true; marks.len()];
-
-                        for (col_name, value_bytes) in bloom_lookups {
-                            let bloom_path = pe.path.join(format!("columns/{col_name}.bloom"));
-                            let blooms = match self.cache.get_blooms(&bloom_path) {
-                                Ok((_bits, blooms, _cached)) => blooms,
-                                Err(_) => continue, // no bloom for this column: skip
-                            };
-                            // AND semantics: mask out granules that definitely don't match
-                            for (i, masked) in mask.iter_mut().enumerate() {
-                                if *masked {
-                                    if let Some(bloom) = blooms.get(i) {
-                                        if !bloom.may_contain(value_bytes) {
-                                            *masked = false;
-                                        }
-                                    }
-                                    // If bloom index out of range, assume might match
-                                }
-                            }
-                        }
-
-                        Some(mask)
-                    };
-
-                    for (gi, mark) in marks.iter().enumerate() {
-                        // Skip granules masked out by bloom filters
-                        if let Some(ref mask) = bloom_mask {
-                            if !mask[gi] {
-                                continue;
-                            }
-                        }
-
-                        if mark.row_count == 0 {
-                            continue;
-                        }
-
-                        let g_min = u32::from_le_bytes(mark.min_value[..4].try_into().unwrap());
-                        let g_max = u32::from_le_bytes(mark.max_value[..4].try_into().unwrap());
-
-                        let row_count = u64::from(mark.row_count);
-                        total_rows += row_count;
-
-                        Self::distribute_rows_to_buckets(
-                            &mut buckets,
-                            g_min,
-                            g_max,
-                            row_count,
-                            bucket_secs,
-                        );
-                    }
-                }
-                _ => {
-                    // --- Fallback path (v0 parts or missing marks) ---
-                    let meta_path = pe.path.join("meta.bin");
-                    let meta = match self.cache.get_meta(&meta_path) {
-                        Ok((m, _)) => m,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(e) => return Err(e),
-                    };
-
-                    if meta.row_count == 0 {
-                        continue;
-                    }
-                    total_rows += meta.row_count;
-
-                    Self::distribute_rows_to_buckets(
-                        &mut buckets,
-                        meta.time_min,
-                        meta.time_max,
-                        meta.row_count,
-                        bucket_secs,
-                    );
-                }
-            }
-
-            // Only emit progress if at least 1% of total rows so far are new,
-            // or if more than 3 parts have been processed since last emit.
-            // This avoids flooding tiny progress events for small raw parts.
+            total_rows += part_rows;
             parts_since_emit += 1;
-            if parts_since_emit >= 3
+            if parts_since_emit >= 5
                 || total_rows > last_emitted_rows + last_emitted_rows / 50 + 100
             {
                 let result = HistogramResult {
-                    buckets: buckets.clone(),
+                    buckets: bucket_starts
+                        .iter()
+                        .zip(counts.iter())
+                        .map(|(&ts, &c)| (ts, c))
+                        .collect(),
                     total_rows,
                     time_start,
                     time_end,
@@ -3097,48 +3261,402 @@ impl QueryExecutor {
         }
 
         Ok(HistogramResult {
-            buckets,
+            buckets: bucket_starts
+                .iter()
+                .zip(counts.iter())
+                .map(|(&ts, &c)| (ts, c))
+                .collect(),
             total_rows,
             time_start,
             time_end,
         })
     }
 
-    /// Distribute `row_count` rows from a time range `[t_min, t_max]` into
-    /// histogram buckets proportionally by overlap.
-    fn distribute_rows_to_buckets(
-        buckets: &mut [(u32, u64)],
-        t_min: u32,
-        t_max: u32,
-        row_count: u64,
-        bucket_secs: u32,
-    ) {
-        let span = t_max.saturating_sub(t_min).max(1) as u64;
+    /// Process a single part for the filtered histogram.
+    /// Reads only filter columns + flowcusExportTime, applies filters,
+    /// and directly buckets matching rows by their export time.
+    #[allow(clippy::too_many_arguments)]
+    fn histogram_filtered_part(
+        &self,
+        pe: &PartEntry,
+        bucket_starts: &[u64],
+        bucket_ms: u64,
+        ast_filters: &[&FilterExpr],
+        resolved_filters: &[ResolvedFilter],
+        bloom_lookups: &[(String, Vec<u8>)],
+        bloom_list_lookups: &[(String, Vec<Vec<u8>>)],
+        filter_col_names: &[String],
+    ) -> std::io::Result<(Vec<u64>, u64)> {
+        let num_buckets = bucket_starts.len();
+        let mut counts = vec![0u64; num_buckets];
+        let part_dir = &pe.path;
 
-        for (bucket_start, bucket_count) in buckets.iter_mut() {
-            let b_start = *bucket_start;
-            let b_end = b_start + bucket_secs;
+        // Read metadata.
+        let meta = self
+            .cache
+            .get_meta(&part_dir.join("meta.bin"))
+            .map(|(m, _)| m)?;
+        let row_count = meta.row_count as usize;
+        if row_count == 0 {
+            return Ok((counts, 0));
+        }
 
-            if t_min == t_max {
-                // Single-timestamp: assign to the unique bucket [b_start, b_end)
-                if t_min >= b_start && t_min < b_end {
-                    *bucket_count += row_count;
+        // Read schema for column types.
+        let schema = match part::read_schema_bin(&part_dir.join("schema.bin")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(_) => crate::schema::Schema {
+                columns: Vec::new(),
+                duration_source: None,
+            },
+        };
+        let col_types: HashMap<String, StorageType> = schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.storage_type))
+            .collect();
+
+        // Column index min/max pruning.
+        let index_path = part_dir.join("column_index.bin");
+        if index_path.exists() {
+            if let Ok((col_index, _)) = self.cache.get_column_index(&index_path) {
+                for (i, idx_entry) in col_index.iter().enumerate() {
+                    if let Some(col_def) = schema.columns.get(i) {
+                        for filter in ast_filters {
+                            if !index_may_match(
+                                filter,
+                                &col_def.name,
+                                &idx_entry.min_value,
+                                &idx_entry.max_value,
+                                col_def.storage_type,
+                            ) {
+                                return Ok((counts, 0));
+                            }
+                        }
+                    }
                 }
-            } else {
-                // Overlap between [t_min, t_max] and [b_start, b_end)
-                let overlap_start = t_min.max(b_start);
-                let overlap_end = t_max.min(b_end);
-
-                if overlap_start >= overlap_end {
-                    continue;
-                }
-
-                // Proportional distribution
-                let overlap = (overlap_end - overlap_start) as u64;
-                let rows = (row_count * overlap + span / 2) / span;
-                *bucket_count += rows;
             }
         }
+
+        // Build granule mask from bloom + mark checks.
+        let granule_size = self.granule_size.max(1);
+        let mut granule_mask: Option<Vec<bool>> = None;
+
+        // Bloom filter checks.
+        for (col_name, value_bytes) in bloom_lookups {
+            let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
+            if let Ok((_bits, blooms, _)) = self.cache.get_blooms(&bloom_path) {
+                let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
+                let col_st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                let effective_bytes: &[u8] = match col_st.element_size() {
+                    Some(n) if n < value_bytes.len() => &value_bytes[..n],
+                    _ => value_bytes,
+                };
+                for (gi, bloom) in blooms.iter().enumerate() {
+                    if gi < mask.len() && mask[gi] && !bloom.may_contain(effective_bytes) {
+                        mask[gi] = false;
+                    }
+                }
+            }
+        }
+
+        // List bloom checks.
+        for (col_name, values_list) in bloom_list_lookups {
+            let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
+            if let Ok((_bits, blooms, _)) = self.cache.get_blooms(&bloom_path) {
+                let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
+                for (gi, bloom) in blooms.iter().enumerate() {
+                    if gi < mask.len() && mask[gi] {
+                        if !values_list.iter().any(|v| bloom.may_contain(v)) {
+                            mask[gi] = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mark-based range pruning on filter columns.
+        for col_name in filter_col_names {
+            let marks_path = part_dir.join("columns").join(format!("{col_name}.mrk"));
+            if let Ok((_gs, marks, _)) = self.cache.get_marks(&marks_path) {
+                let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                let mask = granule_mask.get_or_insert_with(|| vec![true; marks.len()]);
+                for (gi, mark) in marks.iter().enumerate() {
+                    if gi < mask.len() && mask[gi] {
+                        for filter in ast_filters {
+                            if !index_may_match(
+                                filter,
+                                col_name,
+                                &mark.min_value,
+                                &mark.max_value,
+                                st,
+                            ) {
+                                mask[gi] = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If all granules are masked out, skip this part entirely.
+        if let Some(ref mask) = granule_mask {
+            if mask.iter().all(|&m| !m) {
+                return Ok((counts, 0));
+            }
+        }
+
+        // Decode filter columns.
+        let available_columns = part::list_columns(part_dir)?;
+        let mut decoded: HashMap<String, ColumnBuffer> = HashMap::new();
+        for col_name in filter_col_names {
+            if available_columns.contains(col_name) {
+                let col_path = part_dir.join("columns").join(format!("{col_name}.col"));
+                if let Ok(buf) = decode::decode_column(
+                    &col_path,
+                    col_types.get(col_name).copied().unwrap_or(StorageType::U32),
+                ) {
+                    decoded.insert(col_name.clone(), buf);
+                }
+            }
+        }
+
+        // Decode flowcusExportTime column for bucketing (now U64 milliseconds).
+        let export_time_col = if !decoded.contains_key("flowcusExportTime") {
+            let col_path = part_dir.join("columns/flowcusExportTime.col");
+            if col_path.exists() {
+                decode::decode_column(&col_path, StorageType::U64).ok()
+            } else {
+                None
+            }
+        } else {
+            decoded.get("flowcusExportTime").cloned()
+        };
+
+        let time_values = match &export_time_col {
+            Some(ColumnBuffer::U64(v)) => v.as_slice(),
+            _ => {
+                // No export time column — fall back to metadata distribution.
+                let (meta_counts, meta_rows) =
+                    self.histogram_process_part(pe, bucket_starts, bucket_ms, &[]);
+                return Ok((meta_counts, meta_rows));
+            }
+        };
+
+        // Evaluate filters row-by-row, with granule skipping.
+        let mut total_matching: u64 = 0;
+        let process_row = |row_idx: usize| -> bool {
+            resolved_filters.is_empty()
+                || resolved_filters
+                    .iter()
+                    .all(|f| evaluate_resolved_filter(f, row_idx, &decoded))
+        };
+
+        if let Some(ref mask) = granule_mask {
+            for (granule_idx, &active) in mask.iter().enumerate() {
+                if !active {
+                    continue;
+                }
+                let row_start = granule_idx * granule_size;
+                let row_end = ((granule_idx + 1) * granule_size).min(row_count);
+                for row_idx in row_start..row_end {
+                    if process_row(row_idx) {
+                        if let Some(&ts) = time_values.get(row_idx) {
+                            let bi = bucket_idx(bucket_starts, bucket_ms, ts);
+                            if let Some(c) = counts.get_mut(bi) {
+                                *c += 1;
+                            }
+                            total_matching += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            for row_idx in 0..row_count {
+                if process_row(row_idx) {
+                    if let Some(&ts) = time_values.get(row_idx) {
+                        let bi = bucket_idx(bucket_starts, bucket_ms, ts);
+                        if let Some(c) = counts.get_mut(bi) {
+                            *c += 1;
+                        }
+                        total_matching += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((counts, total_matching))
+    }
+
+    /// Process a single part for the histogram. Returns (per-bucket counts, total rows).
+    fn histogram_process_part(
+        &self,
+        pe: &PartEntry,
+        bucket_starts: &[u64],
+        bucket_ms: u64,
+        bloom_lookups: &[(String, Vec<u8>)],
+    ) -> (Vec<u64>, u64) {
+        let num_buckets = bucket_starts.len();
+        let mut counts = vec![0u64; num_buckets];
+        let mut total_rows: u64 = 0;
+
+        // Fast path: if the entire part fits within a single bucket AND no
+        // bloom filters are active, skip granule-level work entirely.
+        if bucket_ms > 0 && bloom_lookups.is_empty() {
+            let part_first_bucket = bucket_idx(bucket_starts, bucket_ms, pe.time_min);
+            let part_last_bucket = bucket_idx(bucket_starts, bucket_ms, pe.time_max);
+            if part_first_bucket == part_last_bucket {
+                let meta_path = pe.path.join("meta.bin");
+                if let Ok((meta, _)) = self.cache.get_meta(&meta_path) {
+                    if meta.row_count > 0 {
+                        if let Some(c) = counts.get_mut(part_first_bucket) {
+                            *c += meta.row_count;
+                        }
+                        return (counts, meta.row_count);
+                    }
+                }
+                return (counts, 0);
+            }
+        }
+
+        let mrk_path = pe.path.join("columns/flowcusExportTime.mrk");
+        let marks_result = self.cache.get_marks(&mrk_path);
+
+        match marks_result {
+            Ok((_granule_size, ref marks, _cached)) if !marks.is_empty() => {
+                // Build per-granule bloom mask if bloom lookups are requested.
+                let bloom_mask: Option<Vec<bool>> = if bloom_lookups.is_empty() {
+                    None
+                } else {
+                    let mut mask = vec![true; marks.len()];
+                    for (col_name, value_bytes) in bloom_lookups {
+                        let bloom_path = pe.path.join(format!("columns/{col_name}.bloom"));
+                        let blooms = match self.cache.get_blooms(&bloom_path) {
+                            Ok((_bits, blooms, _cached)) => blooms,
+                            Err(_) => continue,
+                        };
+                        for (i, masked) in mask.iter_mut().enumerate() {
+                            if *masked {
+                                if let Some(bloom) = blooms.get(i) {
+                                    if !bloom.may_contain(value_bytes) {
+                                        *masked = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(mask)
+                };
+
+                for (gi, mark) in marks.iter().enumerate() {
+                    if let Some(ref mask) = bloom_mask {
+                        if !mask[gi] {
+                            continue;
+                        }
+                    }
+                    if mark.row_count == 0 {
+                        continue;
+                    }
+
+                    let g_min = u64::from_le_bytes(mark.min_value[..8].try_into().unwrap());
+                    let g_max = u64::from_le_bytes(mark.max_value[..8].try_into().unwrap());
+                    let row_count = u64::from(mark.row_count);
+                    total_rows += row_count;
+
+                    distribute_rows_to_buckets(
+                        &mut counts,
+                        bucket_starts,
+                        g_min,
+                        g_max,
+                        row_count,
+                        bucket_ms,
+                    );
+                }
+            }
+            _ => {
+                let meta_path = pe.path.join("meta.bin");
+                let meta = match self.cache.get_meta(&meta_path) {
+                    Ok((m, _)) => m,
+                    Err(_) => return (counts, 0),
+                };
+                if meta.row_count == 0 {
+                    return (counts, 0);
+                }
+                total_rows += meta.row_count;
+                distribute_rows_to_buckets(
+                    &mut counts,
+                    bucket_starts,
+                    meta.time_min,
+                    meta.time_max,
+                    meta.row_count,
+                    bucket_ms,
+                );
+            }
+        }
+
+        (counts, total_rows)
+    }
+}
+
+/// Find the bucket index for a timestamp using direct arithmetic.
+#[inline]
+fn bucket_idx(bucket_starts: &[u64], bucket_ms: u64, ts: u64) -> usize {
+    if bucket_starts.is_empty() || bucket_ms == 0 {
+        return 0;
+    }
+    // Direct arithmetic — buckets are uniformly spaced.
+    let first = bucket_starts[0];
+    if ts < first {
+        return 0;
+    }
+    let idx = ((ts - first) / bucket_ms) as usize;
+    idx.min(bucket_starts.len() - 1)
+}
+
+/// Distribute `row_count` rows from time range `[t_min, t_max]` into
+/// histogram bucket counts using O(1) bucket lookup + overlap iteration.
+fn distribute_rows_to_buckets(
+    counts: &mut [u64],
+    bucket_starts: &[u64],
+    t_min: u64,
+    t_max: u64,
+    row_count: u64,
+    bucket_ms: u64,
+) {
+    if counts.is_empty() || bucket_ms == 0 {
+        return;
+    }
+
+    if t_min == t_max {
+        // Point timestamp — direct index.
+        let idx = bucket_idx(bucket_starts, bucket_ms, t_min);
+        if let Some(c) = counts.get_mut(idx) {
+            *c += row_count;
+        }
+        return;
+    }
+
+    let span = t_max.saturating_sub(t_min).max(1);
+
+    // Find the range of buckets that overlap [t_min, t_max].
+    let first = bucket_idx(bucket_starts, bucket_ms, t_min);
+    let last = bucket_idx(bucket_starts, bucket_ms, t_max);
+
+    for i in first..=last {
+        let b_start = bucket_starts[i];
+        let b_end = b_start + bucket_ms;
+
+        let overlap_start = t_min.max(b_start);
+        let overlap_end = t_max.min(b_end);
+
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let overlap = overlap_end - overlap_start;
+        let rows = (row_count * overlap + span / 2) / span;
+        counts[i] += rows;
     }
 }
 
@@ -3714,7 +4232,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn make_part(generation: u32, time_min: u32, time_max: u32, seq: u32) -> PartEntry {
+    fn make_part(generation: u32, time_min: u64, time_max: u64, seq: u32) -> PartEntry {
         PartEntry {
             path: PathBuf::from(format!(
                 "/tmp/test/1_{generation:05}_{time_min}_{time_max}_{seq:06}"
@@ -3824,11 +4342,11 @@ mod tests {
         meta[4] = 1; // version
         meta[8..16].copy_from_slice(&100u64.to_le_bytes()); // row_count
         meta[16..20].copy_from_slice(&0u32.to_le_bytes()); // generation
-        meta[20..24].copy_from_slice(&1000u32.to_le_bytes()); // time_min
-        meta[24..28].copy_from_slice(&2000u32.to_le_bytes()); // time_max
-        // CRC32-C of bytes 0..80 stored at bytes 80..84
-        let crc = crate::crc::crc32c(&meta[..80]);
-        meta[80..84].copy_from_slice(&crc.to_le_bytes());
+        meta[20..28].copy_from_slice(&1000u64.to_le_bytes()); // time_min (ms)
+        meta[28..36].copy_from_slice(&2000u64.to_le_bytes()); // time_max (ms)
+        // CRC32-C of bytes 0..88 stored at bytes 88..92
+        let crc = crate::crc::crc32c(&meta[..88]);
+        meta[88..92].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(part_dir.join("meta.bin"), &meta).unwrap();
 
         // No column files in columns/ — part should be skipped as incomplete

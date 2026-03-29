@@ -4,7 +4,7 @@
 IPFIX collector, columnar storage, and query system for network flow analysis. Rust backend with embedded React frontend, single-binary deployment.
 
 ## Crate Structure
-- `flowcus-core` - Config (`AppConfig` with 5 sections), error types, telemetry (human/json), observability (Prometheus metrics), profiling (dev-mode snapshots + stack traces)
+- `flowcus-core` - Config (`AppConfig` with 5 sections), error types, telemetry (human/json), observability (Prometheus metrics)
 - `flowcus-ipfix` - IPFIX protocol: wire parsing, IE registry (IANA + 9 vendors), session/template management, decoder, UDP/TCP listener, trace-level pretty printer
 - `flowcus-storage` - Columnar storage engine (see below)
 - `flowcus-query` - FQL query language: hand-written lexer/parser, typed AST, semantic validation
@@ -23,11 +23,6 @@ IPFIX collector, columnar storage, and query system for network flow analysis. R
 - `table.rs` - Table-level part registry
 - `ingest.rs` - Channel from IPFIX decoder to storage writer (backpressure via bounded channel)
 - `crc.rs` - CRC32-C (Castagnoli) checksums on all binary formats
-- `metrics.rs` - Storage metric reporting for profiler
-
-## Observability vs Profiling
-- **Observability** (`observability.rs`): Always-on Prometheus metrics at `/observability/metrics`. Lock-free atomics. For production monitoring.
-- **Profiling** (`profiling.rs`): Dev-mode only. 10-second snapshots to `profiling/` directory. Stack trace collection with folded-stack format. For development performance analysis.
 
 ## CRC32 Integrity
 All binary storage formats include CRC32-C checksums: `meta.bin`, `column_index.bin`, `.col` headers, `.mrk`, `.bloom`. Verified on read. Implementation in `crc.rs` (lookup table, no external dep).

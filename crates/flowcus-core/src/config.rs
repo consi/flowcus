@@ -1,7 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-
-use tracing::{info, warn};
 
 use crate::telemetry::LogFormat;
 
@@ -124,11 +121,11 @@ fn default_storage_dir() -> String {
 }
 
 const fn default_flush_bytes() -> usize {
-    1024 * 1024 // 1 MB
+    16 * 1024 * 1024 // 16 MB
 }
 
 const fn default_flush_interval_secs() -> u64 {
-    1
+    5
 }
 
 const fn default_partition_duration_secs() -> u32 {
@@ -136,19 +133,19 @@ const fn default_partition_duration_secs() -> u32 {
 }
 
 const fn default_channel_capacity() -> usize {
-    4096
-}
-
-const fn default_initial_row_capacity() -> usize {
     8192
 }
 
+const fn default_initial_row_capacity() -> usize {
+    65536
+}
+
 const fn default_merge_workers() -> usize {
-    8
+    4
 }
 
 const fn default_merge_scan_interval_secs() -> u64 {
-    5
+    15
 }
 
 const fn default_merge_cpu_throttle() -> f64 {
@@ -286,24 +283,6 @@ impl Default for IpfixConfig {
             unprocessed_dir: default_unprocessed_dir(),
             unprocessed_ttl_secs: default_unprocessed_ttl_secs(),
             unprocessed_scan_interval_secs: default_unprocessed_scan_interval_secs(),
-        }
-    }
-}
-
-impl AppConfig {
-    /// Load config from a TOML file, falling back to defaults.
-    ///
-    /// # Errors
-    /// Returns an error if the file exists but cannot be read or parsed.
-    pub fn load(path: &Path) -> crate::Result<Self> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            let config: Self = toml::from_str(&content)?;
-            info!(path = %path.display(), "Configuration loaded from file");
-            Ok(config)
-        } else {
-            warn!(path = %path.display(), "Configuration file not found, using defaults");
-            Ok(Self::default())
         }
     }
 }

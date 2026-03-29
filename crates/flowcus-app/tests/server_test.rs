@@ -31,7 +31,7 @@ async fn spawn_server() -> u16 {
     config.server.host = "127.0.0.1".to_string();
 
     let metrics = flowcus_core::observability::Metrics::new();
-    let state = AppState::new(config.clone(), metrics);
+    let state = AppState::new(config.clone(), metrics, PathBuf::from("test.settings"));
     let server_config = config.server.clone();
     tokio::spawn(async move {
         flowcus_server::serve(&server_config, state).await.unwrap();
@@ -127,7 +127,7 @@ async fn spawn_server_with_storage(storage_dir: &Path) -> u16 {
     config.storage.dir = storage_dir.to_string_lossy().to_string();
 
     let metrics = flowcus_core::observability::Metrics::new();
-    let state = AppState::new(config.clone(), metrics);
+    let state = AppState::new(config.clone(), metrics, PathBuf::from("test.settings"));
     let server_config = config.server.clone();
     tokio::spawn(async move {
         flowcus_server::serve(&server_config, state).await.unwrap();
@@ -411,8 +411,8 @@ async fn histogram_returns_valid_sse_structure() {
         "time_range must have 'end'"
     );
     assert!(
-        final_ev.get("bucket_seconds").is_some(),
-        "response must have 'bucket_seconds'"
+        final_ev.get("bucket_ms").is_some(),
+        "response must have 'bucket_ms'"
     );
     assert!(final_ev.get("done").is_some(), "response must have 'done'");
     assert_eq!(
@@ -547,11 +547,12 @@ async fn histogram_buckets_cover_queried_range() {
     let buckets = final_ev["buckets"].as_array().unwrap();
     assert!(
         buckets.len() >= 2,
-        "must have at least 2 buckets for a 1-hour range"
+        "must have at least 2 buckets for a 1-hour range, got {}",
+        buckets.len()
     );
 
-    let bucket_secs = final_ev["bucket_seconds"].as_u64().unwrap();
-    assert!(bucket_secs > 0, "bucket_seconds must be positive");
+    let bucket_ms = final_ev["bucket_ms"].as_u64().unwrap();
+    assert!(bucket_ms > 0, "bucket_ms must be positive");
 
     let time_start = final_ev["time_range"]["start"].as_u64().unwrap();
     let time_end = final_ev["time_range"]["end"].as_u64().unwrap();
@@ -570,11 +571,11 @@ async fn histogram_buckets_cover_queried_range() {
         "last bucket ts ({last_ts}) must be < query end ({time_end})"
     );
 
-    // Last bucket end (ts + bucket_secs) must reach or exceed the query end
+    // Last bucket end (ts + bucket_ms) must reach or exceed the query end
     assert!(
-        last_ts + bucket_secs >= time_end,
+        last_ts + bucket_ms >= time_end,
         "last bucket end ({}) must >= query end ({time_end})",
-        last_ts + bucket_secs
+        last_ts + bucket_ms
     );
 
     // Buckets must be sorted and uniformly spaced
@@ -583,8 +584,8 @@ async fn histogram_buckets_cover_queried_range() {
         let t1 = pair[1]["timestamp"].as_u64().unwrap();
         assert_eq!(
             t1 - t0,
-            bucket_secs,
-            "buckets must be uniformly spaced by bucket_seconds ({bucket_secs})"
+            bucket_ms,
+            "buckets must be uniformly spaced by bucket_ms ({bucket_ms})"
         );
     }
 
@@ -729,16 +730,16 @@ async fn histogram_data_lands_in_correct_bucket() {
     let events = parse_sse_events(&text);
     let final_ev = final_event(&events);
 
-    let bucket_secs = final_ev["bucket_seconds"].as_u64().unwrap() as u32;
+    let bucket_ms = final_ev["bucket_ms"].as_u64().unwrap();
     let buckets = final_ev["buckets"].as_array().unwrap();
 
-    // Find which bucket(s) contain the export time
-    let data_ts: u64 = 1_700_000_100;
+    // Find which bucket(s) contain the export time (now in ms)
+    let data_ts: u64 = 1_700_000_100_000;
     let containing: Vec<_> = buckets
         .iter()
         .filter(|b| {
             let ts = b["timestamp"].as_u64().unwrap();
-            ts <= data_ts && data_ts < ts + bucket_secs as u64
+            ts <= data_ts && data_ts < ts + bucket_ms
         })
         .collect();
 
@@ -759,7 +760,7 @@ async fn histogram_data_lands_in_correct_bucket() {
         .iter()
         .filter(|b| {
             let ts = b["timestamp"].as_u64().unwrap();
-            !(ts <= data_ts && data_ts < ts + bucket_secs as u64)
+            !(ts <= data_ts && data_ts < ts + bucket_ms)
         })
         .map(|b| b["count"].as_u64().unwrap())
         .sum();
@@ -775,7 +776,7 @@ async fn histogram_data_lands_in_correct_bucket() {
 async fn histogram_no_double_count_at_bucket_boundary() {
     let dir = histogram_test_dir("boundary_no_double");
     // Pick a time that aligns to a common bucket boundary.
-    // With 5-minute window and 60 target buckets, bucket_secs=5.
+    // With 5-minute window and 60 target buckets, bucket_ms=5000.
     // Use t=1_700_000_100 which is divisible by 5, 10, etc.
     let boundary_ts: u32 = 1_700_000_100;
     ingest_records_at_time(&dir, boundary_ts, 40);
@@ -879,7 +880,7 @@ async fn histogram_spread_across_multiple_buckets() {
     let dir = histogram_test_dir("multi_bucket_spread");
 
     // Ingest 4 batches spread across 10 minutes so they land in different buckets.
-    // For a 10-minute window with 60 target buckets, bucket_secs=10.
+    // For a 10-minute window with 60 target buckets, bucket_ms=10000.
     ingest_records_at_time(&dir, 1_700_000_000, 10); // 22:13:20
     ingest_records_at_time(&dir, 1_700_000_120, 15); // 22:15:20
     ingest_records_at_time(&dir, 1_700_000_300, 20); // 22:18:20

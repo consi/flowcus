@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -22,12 +23,21 @@ struct AppStateInner {
     /// Shared IPFIX session store for reading metadata (interface names, etc.).
     /// `None` when no IPFIX listener is configured (e.g. in tests).
     session_store: Option<Arc<tokio::sync::Mutex<SessionStore>>>,
+    /// Path to the settings file on disk.
+    settings_path: PathBuf,
+    /// Mutex to serialize settings writes (load-modify-save must be atomic).
+    settings_lock: tokio::sync::Mutex<()>,
+    /// Sender half of the shutdown/restart signal.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Receiver half of the shutdown/restart signal.
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig, metrics: Arc<Metrics>) -> Self {
+    pub fn new(config: AppConfig, metrics: Arc<Metrics>, settings_path: PathBuf) -> Self {
         let query_entries = config.server.query_cache_entries;
         let cache_bytes = config.storage.storage_cache_bytes;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(AppStateInner {
                 config,
@@ -35,6 +45,10 @@ impl AppState {
                 query_cache: QueryCache::new(query_entries),
                 storage_cache: Arc::new(StorageCache::new(cache_bytes)),
                 session_store: None,
+                settings_path,
+                settings_lock: tokio::sync::Mutex::new(()),
+                shutdown_tx,
+                shutdown_rx,
             }),
         }
     }
@@ -44,9 +58,11 @@ impl AppState {
         config: AppConfig,
         metrics: Arc<Metrics>,
         session_store: Arc<tokio::sync::Mutex<SessionStore>>,
+        settings_path: PathBuf,
     ) -> Self {
         let query_entries = config.server.query_cache_entries;
         let cache_bytes = config.storage.storage_cache_bytes;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(AppStateInner {
                 config,
@@ -54,6 +70,10 @@ impl AppState {
                 query_cache: QueryCache::new(query_entries),
                 storage_cache: Arc::new(StorageCache::new(cache_bytes)),
                 session_store: Some(session_store),
+                settings_path,
+                settings_lock: tokio::sync::Mutex::new(()),
+                shutdown_tx,
+                shutdown_rx,
             }),
         }
     }
@@ -87,6 +107,26 @@ impl AppState {
     /// Access the IPFIX session store (if available).
     pub fn session_store(&self) -> Option<&Arc<tokio::sync::Mutex<SessionStore>>> {
         self.inner.session_store.as_ref()
+    }
+
+    /// Path to the settings file on disk.
+    pub fn settings_path(&self) -> &Path {
+        &self.inner.settings_path
+    }
+
+    /// Mutex protecting load-modify-save cycles on the settings file.
+    pub fn settings_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.settings_lock
+    }
+
+    /// Clone a receiver for the shutdown/restart signal.
+    pub fn shutdown_rx(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.shutdown_rx.clone()
+    }
+
+    /// Signal that the server should shut down and restart.
+    pub fn trigger_restart(&self) {
+        let _ = self.inner.shutdown_tx.send(true);
     }
 }
 

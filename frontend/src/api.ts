@@ -186,7 +186,7 @@ export interface HistogramResponse {
   buckets: HistogramBucket[];
   total_rows: number;
   time_range: TimeRangeBounds;
-  bucket_seconds: number;
+  bucket_ms: number;
   done: boolean;
 }
 
@@ -217,3 +217,124 @@ export async function fetchQuerySchema(): Promise<SchemaResponse> {
   if (!res.ok) throw new Error(`Fetch schema failed: ${res.status}`);
   return res.json();
 }
+
+// --- Settings API ---
+
+export interface SettingControl {
+  type: 'text' | 'number' | 'bool' | 'select' | 'slider' | 'bytes' | 'duration';
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+  options?: Array<{ value: string; label: string }>;
+  min_secs?: number;
+  max_secs?: number;
+}
+
+export interface SettingField {
+  section: string;
+  key: string;
+  label: string;
+  description: string;
+  guidance: string;
+  control: SettingControl;
+  default_value: unknown;
+  restart_required: boolean;
+}
+
+export interface SettingsSection {
+  key: string;
+  label: string;
+  description: string;
+  fields: SettingField[];
+}
+
+export interface SettingsSchema {
+  sections: SettingsSection[];
+}
+
+export interface SettingsValidation {
+  errors: Array<{ section: string; field: string; message: string }>;
+  warnings: Array<{ section: string; field: string; message: string }>;
+}
+
+export interface SettingsSaveResponse {
+  config: Record<string, Record<string, unknown>>;
+  restart_required: string[];
+  validation: SettingsValidation;
+}
+
+export async function fetchSettings(): Promise<Record<string, Record<string, unknown>>> {
+  const res = await fetch('/api/settings');
+  if (!res.ok) throw new Error(`Failed to fetch settings: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchSettingsSchema(): Promise<SettingsSchema> {
+  const res = await fetch('/api/settings/schema');
+  if (!res.ok) throw new Error(`Failed to fetch settings schema: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchSettingsDefaults(): Promise<Record<string, Record<string, unknown>>> {
+  const res = await fetch('/api/settings/defaults');
+  if (!res.ok) throw new Error(`Failed to fetch settings defaults: ${res.status}`);
+  return res.json();
+}
+
+export async function saveSettings(config: Record<string, Record<string, unknown>>): Promise<SettingsSaveResponse> {
+  const res = await fetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    throw err;
+  }
+  return res.json();
+}
+
+export async function validateSettings(config: Record<string, Record<string, unknown>>): Promise<SettingsValidation> {
+  const res = await fetch('/api/settings/validate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) throw new Error(`Validation request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function restartServer(): Promise<void> {
+  await fetch('/api/restart', { method: 'POST' });
+}
+
+// --- Health Stats API ---
+
+export interface HealthStats {
+  metrics: Record<string, number>;
+  process: {
+    rss_bytes: number;
+    threads: number;
+  };
+  cache: {
+    used_bytes: number;
+    max_bytes: number;
+    hits: number;
+    misses: number;
+    partitions: Array<{ name: string; used_bytes: number; max_bytes: number }>;
+  };
+  storage: {
+    parts_total: number;
+    parts_gen0: number;
+    parts_merged: number;
+    disk_bytes: number;
+  };
+}
+
+export async function fetchHealthStats(): Promise<HealthStats> {
+  const res = await fetch('/api/health/stats');
+  if (!res.ok) throw new Error(`Health stats failed: ${res.status}`);
+  return res.json();
+}
+

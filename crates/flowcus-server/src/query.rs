@@ -51,8 +51,8 @@ pub struct StructuredQueryRequest {
     pub offset: Option<u64>,
     pub limit: Option<u64>,
     /// Pin the time range for paginated queries.
-    pub time_start: Option<u32>,
-    pub time_end: Option<u32>,
+    pub time_start: Option<u64>,
+    pub time_end: Option<u64>,
 }
 
 /// FQL text query (the original path).
@@ -64,8 +64,8 @@ pub struct FqlQueryRequest {
     /// Pin the time range for paginated queries. When set, the executor
     /// uses these absolute bounds instead of re-resolving `last Xm` relative
     /// to `now()`. Prevents the time window from shifting during infinite scroll.
-    pub time_start: Option<u32>,
-    pub time_end: Option<u32>,
+    pub time_start: Option<u64>,
+    pub time_end: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -81,8 +81,8 @@ pub struct QueryResponse {
 
 #[derive(Serialize, Clone)]
 pub struct TimeRangeBounds {
-    pub start: u32,
-    pub end: u32,
+    pub start: u64,
+    pub end: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -203,7 +203,7 @@ struct ParsedRequest {
     cache_key: u64,
     offset: u64,
     limit: u64,
-    pinned_time: Option<(u32, u32)>,
+    pinned_time: Option<(u64, u64)>,
 }
 
 /// Parse the incoming request (FQL or structured) into a canonical AST.
@@ -1514,13 +1514,13 @@ pub struct HistogramResponse {
     pub buckets: Vec<HistogramBucket>,
     pub total_rows: u64,
     pub time_range: TimeRangeBounds,
-    pub bucket_seconds: u32,
+    pub bucket_ms: u64,
     pub done: bool,
 }
 
 #[derive(Serialize, Clone)]
 pub struct HistogramBucket {
-    pub timestamp: u32,
+    pub timestamp: u64,
     pub count: u64,
 }
 
@@ -1608,49 +1608,21 @@ async fn stats_histogram(
         vec![]
     };
 
-    // Build the full filtered query for the filtered path (group-by aggregation)
-    let filtered_query = if has_filters {
-        let bucket_dur_str = |secs: u32| -> String {
-            if secs >= 86400 && secs % 86400 == 0 {
-                format!("{}d", secs / 86400)
-            } else if secs >= 3600 && secs % 3600 == 0 {
-                format!("{}h", secs / 3600)
-            } else if secs >= 60 && secs % 60 == 0 {
-                format!("{}m", secs / 60)
-            } else {
-                format!("{secs}s")
-            }
-        };
-
-        let (time_start, time_end) =
-            flowcus_storage::executor::time_range_to_bounds(&time_query.time_range);
-        let window_secs = time_end.saturating_sub(time_start);
-        let bucket_secs = pick_bucket_duration(window_secs, target_buckets);
-
-        let sq = flowcus_query::structured::StructuredQuery {
+    // Build filter AST for the filtered histogram path.
+    let filter_query = if has_filters {
+        let filter_sq = flowcus_query::structured::StructuredQuery {
             time_range: req.time_range.clone(),
             filters: req.filters.clone(),
             logic: req.logic.clone(),
             columns: None,
-            aggregate: Some(flowcus_query::structured::StructuredAggregate::GroupBy {
-                keys: vec![flowcus_query::structured::GroupByKeyDef::TimeBucket {
-                    duration: bucket_dur_str(bucket_secs),
-                }],
-                functions: vec![flowcus_query::structured::AggCallDef {
-                    func: "count".to_string(),
-                    field: None,
-                }],
-            }),
+            aggregate: None,
             sort: None,
         };
-
-        sq.to_ast().ok().map(|q| (q, bucket_secs))
+        filter_sq.to_ast().ok()
     } else {
         None
     };
 
-    // Capacity 1: the blocking sender waits for each event to be consumed
-    // by the SSE stream before sending the next, ensuring true streaming.
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(1);
 
     tokio::task::spawn_blocking(move || {
@@ -1662,126 +1634,59 @@ async fn stats_histogram(
 
         let (time_start, time_end) =
             flowcus_storage::executor::time_range_to_bounds(&time_query.time_range);
-        let window_secs = time_end.saturating_sub(time_start);
-        let bucket_secs = pick_bucket_duration(window_secs, target_buckets);
+        let window_ms = time_end.saturating_sub(time_start);
+        let bucket_ms = pick_bucket_duration_ms(window_ms, target_buckets);
 
-        if let Some((query, bucket_secs)) = filtered_query {
-            // Filtered path: run actual query with group by time_bucket.
-            // Aggregation must complete before we have counts, so send one final event.
-            let qr = match executor.execute(&query, 0, 10_000, None) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err_json =
-                        serde_json::json!({"error": e.to_string(), "done": true}).to_string();
-                    let _ = tx.blocking_send(Ok(Event::default().event("progress").data(err_json)));
-                    return;
-                }
-            };
-
-            let mut buckets = Vec::new();
-            for row in &qr.rows {
-                if let (Some(ts), Some(count)) = (
-                    row.first().and_then(serde_json::Value::as_u64),
-                    row.get(1).and_then(serde_json::Value::as_u64),
-                ) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    buckets.push((ts as u32, count));
-                }
-            }
-            buckets.sort_by_key(|(ts, _)| *ts);
-
-            let aligned_start = (time_start / bucket_secs) * bucket_secs;
-            let existing: HashMap<u32, u64> = buckets.iter().copied().collect();
-            let mut filled = Vec::new();
-            let mut t = aligned_start;
-            while t < time_end {
-                filled.push((t, existing.get(&t).copied().unwrap_or(0)));
-                t += bucket_secs;
-            }
-
-            let total_rows: u64 = filled.iter().map(|(_, c)| c).sum();
-
+        let send_hist = |tx: &mpsc::Sender<Result<Event, Infallible>>,
+                         hist: &flowcus_storage::executor::HistogramResult,
+                         done: bool| {
             let response = HistogramResponse {
-                buckets: filled
-                    .into_iter()
-                    .map(|(ts, count)| HistogramBucket {
+                buckets: hist
+                    .buckets
+                    .iter()
+                    .map(|&(ts, count)| HistogramBucket {
                         timestamp: ts,
                         count,
                     })
                     .collect(),
-                total_rows,
+                total_rows: hist.total_rows,
                 time_range: TimeRangeBounds {
-                    start: time_start,
-                    end: time_end,
+                    start: hist.time_start,
+                    end: hist.time_end,
                 },
-                bucket_seconds: bucket_secs,
-                done: true,
+                bucket_ms,
+                done,
             };
-
             if let Ok(json) = serde_json::to_string(&response) {
                 let _ = tx.blocking_send(Ok(Event::default().event("progress").data(json)));
             }
+        };
+
+        #[allow(clippy::option_if_let_else)]
+        let result = if let Some(query) = filter_query {
+            // Filtered path: fast scan that only reads filter columns +
+            // flowcusExportTime, evaluates filters, and directly buckets
+            // matching rows. No JSON conversion or aggregation overhead.
+            executor.histogram_filtered(&query, time_start, time_end, bucket_ms, |partial| {
+                send_hist(&tx, partial, false);
+            })
         } else {
-            // Unfiltered path: fast metadata-only histogram with streaming progress.
-            let tx_progress = tx.clone();
-            let result = executor.histogram_from_metadata(
+            // Unfiltered path: metadata-only (marks + blooms, no column reads).
+            executor.histogram_from_metadata(
                 time_start,
                 time_end,
-                bucket_secs,
+                bucket_ms,
                 &bloom_lookups,
-                |partial| {
-                    let response = HistogramResponse {
-                        buckets: partial
-                            .buckets
-                            .iter()
-                            .map(|&(ts, count)| HistogramBucket {
-                                timestamp: ts,
-                                count,
-                            })
-                            .collect(),
-                        total_rows: partial.total_rows,
-                        time_range: TimeRangeBounds {
-                            start: partial.time_start,
-                            end: partial.time_end,
-                        },
-                        bucket_seconds: bucket_secs,
-                        done: false,
-                    };
-                    if let Ok(json) = serde_json::to_string(&response) {
-                        let _ = tx_progress
-                            .blocking_send(Ok(Event::default().event("progress").data(json)));
-                    }
-                },
-            );
+                |partial| send_hist(&tx, partial, false),
+            )
+        };
 
-            match result {
-                Ok(hist) => {
-                    let response = HistogramResponse {
-                        buckets: hist
-                            .buckets
-                            .into_iter()
-                            .map(|(ts, count)| HistogramBucket {
-                                timestamp: ts,
-                                count,
-                            })
-                            .collect(),
-                        total_rows: hist.total_rows,
-                        time_range: TimeRangeBounds {
-                            start: hist.time_start,
-                            end: hist.time_end,
-                        },
-                        bucket_seconds: bucket_secs,
-                        done: true,
-                    };
-                    if let Ok(json) = serde_json::to_string(&response) {
-                        let _ = tx.blocking_send(Ok(Event::default().event("progress").data(json)));
-                    }
-                }
-                Err(e) => {
-                    let err_json =
-                        serde_json::json!({"error": e.to_string(), "done": true}).to_string();
-                    let _ = tx.blocking_send(Ok(Event::default().event("progress").data(err_json)));
-                }
+        match result {
+            Ok(hist) => send_hist(&tx, &hist, true),
+            Err(e) => {
+                let err_json =
+                    serde_json::json!({"error": e.to_string(), "done": true}).to_string();
+                let _ = tx.blocking_send(Ok(Event::default().event("progress").data(err_json)));
             }
         }
     });
@@ -1789,13 +1694,14 @@ async fn stats_histogram(
     Sse::new(ReceiverStream::new(rx))
 }
 
-/// Pick a nice bucket duration targeting the given number of buckets.
-fn pick_bucket_duration(window_secs: u32, target_buckets: u32) -> u32 {
-    const NICE_DURATIONS: &[u32] = &[
-        1, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400,
+/// Pick a nice bucket duration (in milliseconds) targeting the given number of buckets.
+fn pick_bucket_duration_ms(window_ms: u64, target_buckets: u32) -> u64 {
+    const NICE_DURATIONS: &[u64] = &[
+        1000, 5000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+        3_600_000, 7_200_000, 21_600_000, 43_200_000, 86_400_000,
     ];
 
-    let target = window_secs / target_buckets.max(1);
+    let target = window_ms / u64::from(target_buckets.max(1));
     let mut best = NICE_DURATIONS[0];
     for &d in NICE_DURATIONS {
         if d >= target {

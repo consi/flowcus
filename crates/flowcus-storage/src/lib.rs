@@ -39,7 +39,8 @@
     clippy::unused_self,
     clippy::collapsible_if,
     clippy::single_match,
-    clippy::unnested_or_patterns
+    clippy::unnested_or_patterns,
+    clippy::manual_range_patterns
 )]
 
 pub mod cache;
@@ -51,7 +52,6 @@ pub mod executor;
 pub mod granule;
 pub mod ingest;
 pub mod merge;
-pub mod metrics;
 pub mod migrate;
 pub mod part;
 pub mod pending;

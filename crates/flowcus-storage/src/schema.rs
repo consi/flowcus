@@ -115,9 +115,9 @@ pub fn system_columns() -> Vec<ColumnDef> {
             name: "flowcusExportTime".into(),
             element_id: 0,
             enterprise_id: SYSTEM_ENTERPRISE_ID,
-            data_type: DataType::DateTimeSeconds,
-            storage_type: StorageType::U32,
-            wire_length: 4,
+            data_type: DataType::DateTimeMilliseconds,
+            storage_type: StorageType::U64,
+            wire_length: 8,
         },
         ColumnDef {
             name: "flowcusObservationDomainId".into(),

@@ -76,8 +76,8 @@ fn enforce_retention(
         .unwrap_or_default()
         .as_secs();
 
-    let cutoff = now_epoch.saturating_sub(retention_hours * 3600);
-    let cutoff_u32 = u32::try_from(cutoff).unwrap_or(u32::MAX);
+    let cutoff_secs = now_epoch.saturating_sub(retention_hours * 3600);
+    let cutoff_ms = cutoff_secs * 1000;
 
     let mut removed_count: u64 = 0;
     let mut skipped_merging: u64 = 0;
@@ -127,7 +127,7 @@ fn enforce_retention(
                             continue;
                         };
 
-                        if time_max >= cutoff_u32 {
+                        if time_max >= cutoff_ms {
                             continue;
                         }
 
@@ -209,11 +209,11 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn now_epoch() -> u32 {
+    fn now_epoch_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() as u32
+            .as_millis() as u64
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -241,11 +241,11 @@ mod tests {
     fn removes_expired_parts_and_keeps_recent() {
         let base = test_dir("expired");
 
-        let old_ts = now_epoch() - 3600 * 24 * 60; // 60 days ago
-        let recent_ts = now_epoch() - 3600; // 1 hour ago
+        let old_ts = now_epoch_ms() - 3600 * 24 * 60 * 1000; // 60 days ago (ms)
+        let recent_ts = now_epoch_ms() - 3600 * 1000; // 1 hour ago (ms)
 
-        let old_name = format!("1_00000_1000000_{old_ts}_000001");
-        let recent_name = format!("1_00000_1000000_{recent_ts}_000002");
+        let old_name = format!("1_00000_1000000000_{old_ts}_000001");
+        let recent_name = format!("1_00000_1000000000_{recent_ts}_000002");
 
         let old_part = create_part(&base, &old_name);
         let recent_part = create_part(&base, &recent_name);
@@ -262,8 +262,8 @@ mod tests {
     fn skips_parts_with_merging_sentinel() {
         let base = test_dir("merging");
 
-        let old_ts = now_epoch() - 3600 * 24 * 60;
-        let name = format!("1_00000_1000000_{old_ts}_000001");
+        let old_ts = now_epoch_ms() - 3600 * 24 * 60 * 1000;
+        let name = format!("1_00000_1000000000_{old_ts}_000001");
         let part = create_part(&base, &name);
 
         // Place a .merging marker.
@@ -288,8 +288,8 @@ mod tests {
     fn cleans_up_empty_ancestor_dirs() {
         let base = test_dir("cleanup");
 
-        let old_ts = now_epoch() - 3600 * 24 * 60;
-        let name = format!("1_00000_1000000_{old_ts}_000001");
+        let old_ts = now_epoch_ms() - 3600 * 24 * 60 * 1000;
+        let name = format!("1_00000_1000000000_{old_ts}_000001");
         create_part(&base, &name);
 
         enforce_retention(&base, 744, None);
@@ -306,9 +306,9 @@ mod tests {
     fn legacy_part_name_format() {
         let base = test_dir("legacy");
 
-        let old_ts = now_epoch() - 3600 * 24 * 60;
+        let old_ts = now_epoch_ms() - 3600 * 24 * 60 * 1000;
         // Legacy 4-segment format (no version prefix)
-        let name = format!("00000_1000000_{old_ts}_000001");
+        let name = format!("00000_1000000000_{old_ts}_000001");
         let part = create_part(&base, &name);
 
         enforce_retention(&base, 744, None);

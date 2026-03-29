@@ -5,6 +5,8 @@ import { TimeRangePicker } from './TimeRangePicker';
 import { SearchBar } from './SearchBar';
 import { ExplainGantt, type PlanStep } from './ExplainGantt';
 import { ThemeSwitcher } from './ThemeSwitcher';
+import { SettingsPanel } from './SettingsPanel';
+import { HealthPanel } from './HealthPanel';
 import { TimeHistogram } from './TimeHistogram';
 import {
   executeStructuredQuery,
@@ -136,6 +138,115 @@ function coerceFilterValue(
   }
 }
 
+// ---------------------------------------------------------------------------
+// URL query parameter persistence
+// ---------------------------------------------------------------------------
+
+const VALID_RELATIVE_DURATION = /^(\d+)(ms|s|m|h|d)$/;
+
+function parseTimeRangeParam(t: string): StructuredTimeRange | null {
+  // Absolute: two numeric timestamps separated by dash
+  const dashIdx = t.indexOf('-', 1); // start at 1 to skip potential negative (won't happen with ms timestamps, but safe)
+  if (dashIdx > 0) {
+    const startStr = t.slice(0, dashIdx);
+    const endStr = t.slice(dashIdx + 1);
+    if (/^\d+$/.test(startStr) && /^\d+$/.test(endStr)) {
+      const startMs = Number(startStr);
+      const endMs = Number(endStr);
+      if (startMs < endMs) {
+        return {
+          type: 'absolute',
+          start: new Date(startMs).toISOString(),
+          end: new Date(endMs).toISOString(),
+        };
+      }
+    }
+  }
+  // Relative: duration string like 5m, 1h, 7d
+  if (VALID_RELATIVE_DURATION.test(t)) {
+    return { type: 'relative', duration: t };
+  }
+  return null;
+}
+
+function parseFiltersParam(f: string): StructuredFilter[] {
+  if (!f) return [];
+  return f.split(',').map((segment) => {
+    let s = segment;
+    let negated = false;
+    if (s.startsWith('!')) {
+      negated = true;
+      s = s.slice(1);
+    }
+    // Split on dots: field.op.value (value may contain dots, e.g. IP addresses)
+    const firstDot = s.indexOf('.');
+    if (firstDot < 0) return null;
+    const secondDot = s.indexOf('.', firstDot + 1);
+    if (secondDot < 0) return null;
+    const field = s.slice(0, firstDot);
+    const op = s.slice(firstDot + 1, secondDot);
+    const value = decodeURIComponent(s.slice(secondDot + 1));
+    if (!field || !op) return null;
+    return { field, op, value, negated: negated || undefined } as StructuredFilter;
+  }).filter((f): f is StructuredFilter => f !== null);
+}
+
+function parseRefreshParam(r: string): number {
+  const n = parseInt(r, 10);
+  return isNaN(n) || n < 0 ? 0 : n;
+}
+
+function serializeTimeRange(tr: StructuredTimeRange): string {
+  if (tr.type === 'relative' && tr.duration) {
+    return tr.duration;
+  }
+  if (tr.type === 'absolute' && tr.start && tr.end) {
+    const startMs = new Date(tr.start).getTime();
+    const endMs = new Date(tr.end).getTime();
+    return `${startMs}-${endMs}`;
+  }
+  return '5m';
+}
+
+function serializeFilters(filters: StructuredFilter[]): string {
+  return filters.map((f) => {
+    const prefix = f.negated ? '!' : '';
+    const encodedValue = encodeURIComponent(String(f.value));
+    return `${prefix}${f.field}.${f.op}.${encodedValue}`;
+  }).join(',');
+}
+
+function readInitialStateFromURL(): {
+  timeRange?: StructuredTimeRange;
+  filters?: StructuredFilter[];
+  refreshInterval?: number;
+} {
+  const params = new URLSearchParams(window.location.search);
+  const result: ReturnType<typeof readInitialStateFromURL> = {};
+
+  const t = params.get('t');
+  if (t) {
+    const parsed = parseTimeRangeParam(t);
+    if (parsed) result.timeRange = parsed;
+  }
+
+  const f = params.get('f');
+  if (f) {
+    const parsed = parseFiltersParam(f);
+    if (parsed.length > 0) result.filters = parsed;
+  }
+
+  const r = params.get('r');
+  if (r) {
+    const parsed = parseRefreshParam(r);
+    if (parsed > 0) result.refreshInterval = parsed;
+  }
+
+  return result;
+}
+
+const _initialURLState = readInitialStateFromURL();
+
 function formatMicros(us: number): string {
   if (us < 1000) return `${us}\u00B5s`;
   if (us < 1_000_000) return `${(us / 1000).toFixed(1)}ms`;
@@ -161,14 +272,43 @@ export function App() {
   const [queryError, setQueryError] = useState<QueryError | null>(null);
   const [selectedRow, setSelectedRow] = useState<number | null>(null);
   const [showStats, setShowStats] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [healthOpen, setHealthOpen] = useState(false);
   const [queryGen, setQueryGen] = useState(0);
 
-  // Query state
-  const [timeRange, setTimeRange] = useState<StructuredTimeRange>({ type: 'relative', duration: '5m' });
-  const [filters, setFilters] = useState<StructuredFilter[]>([]);
+  // Query state — initialized from URL params if present
+  const [timeRange, setTimeRange] = useState<StructuredTimeRange>(
+    _initialURLState.timeRange ?? { type: 'relative', duration: '5m' },
+  );
+  const [filters, setFilters] = useState<StructuredFilter[]>(
+    _initialURLState.filters ?? [],
+  );
   const filterLogic: 'and' | 'or' = 'and';
   const [schema, setSchema] = useState<SchemaResponse | null>(null);
-  const [refreshInterval, setRefreshInterval] = useState(0);
+  const [refreshInterval, setRefreshInterval] = useState(
+    _initialURLState.refreshInterval ?? 0,
+  );
+
+  // URL sync — write state changes back to the URL bar.
+  // Uses a ref to suppress the effect on initial mount (state came FROM the URL).
+  const urlSyncMounted = useRef(false);
+  useEffect(() => {
+    if (!urlSyncMounted.current) {
+      urlSyncMounted.current = true;
+      return;
+    }
+    const params = new URLSearchParams();
+    params.set('t', serializeTimeRange(timeRange));
+    if (filters.length > 0) {
+      params.set('f', serializeFilters(filters));
+    }
+    if (refreshInterval > 0) {
+      params.set('r', String(refreshInterval));
+    }
+    const qs = params.toString();
+    const newURL = qs ? `?${qs}` : window.location.pathname;
+    window.history.replaceState(null, '', newURL);
+  }, [timeRange, filters, refreshInterval]);
 
   const setFiltersKeepLimitLast = useCallback((filtersOrUpdater: StructuredFilter[] | ((prev: StructuredFilter[]) => StructuredFilter[])) => {
     setFilters((prev) => {
@@ -188,7 +328,7 @@ export function App() {
     setFiltersKeepLimitLast((prev) => [...prev, { field, op, value: strValue }]);
   }, [filters, setFiltersKeepLimitLast]);
 
-  // Column visibility
+  // Column visibility (persisted in localStorage)
   const [visibleColumns, setVisibleColumns] = useState<string[] | null>(() => {
     try {
       const saved = localStorage.getItem('flowcus:columns');
@@ -212,6 +352,7 @@ export function App() {
     }
   }, [visibleColumns]);
 
+  // Load initial data on mount
   useEffect(() => {
     fetchInfo().then(setInfo).catch(() => {});
     fetchInterfaces().then(setInterfaceNames).catch(() => {});
@@ -383,7 +524,28 @@ export function App() {
             {info.server.dev_mode && <span className="dev-badge">DEV</span>}
           </span>
         )}
-        <ThemeSwitcher />
+        <div className="header-actions">
+          <button
+            className="settings-trigger"
+            onClick={() => setHealthOpen(true)}
+            title="System Health"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" />
+            </svg>
+          </button>
+          <button
+            className="settings-trigger"
+            onClick={() => setSettingsOpen(true)}
+            title="Settings"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+          </button>
+          <ThemeSwitcher />
+        </div>
       </header>
 
       <section className="query-section">
@@ -508,13 +670,6 @@ export function App() {
         </section>
       )}
 
-      <footer className="app-footer">
-        {info && (
-          <span>
-            {info.name} v{info.version} &mdash; {info.server.host}:{info.server.port}
-          </span>
-        )}
-      </footer>
 
       {selectedRow !== null && (
         <FlowSidebar
@@ -527,6 +682,9 @@ export function App() {
           onAddFilter={handleAddFilter}
         />
       )}
+
+      <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <HealthPanel open={healthOpen} onClose={() => setHealthOpen(false)} />
     </div>
   );
 }

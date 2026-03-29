@@ -15,6 +15,7 @@ type PlanStep =
   | { type: 'FilterApply'; expression: string; rows_before: number; rows_after: number; duration_us?: number | null }
   | { type: 'Aggregate'; function: string; groups: number; duration_us?: number | null }
   | { type: 'ParallelScan'; parts_count: number; duration_us?: number | null }
+  | { type: 'PartScan'; part: string; rows_scanned: number; rows_matched: number; bytes_read: number; duration_us?: number | null }
   | { type: 'PartSkippedMerge'; path: string }
   | { type: 'PartSkippedIncomplete'; path: string }
   | { type: 'PartSkippedMerging'; path: string }
@@ -28,13 +29,14 @@ interface GanttRow {
   durationUs: number;
   color: string;
   badge?: string;
-  parallel?: boolean;  // rendered inside the parallel block
+  indent?: boolean;  // indented under parallel header
 }
 
 const COLORS: Record<string, string> = {
   prune: '#5b7fb8', index: '#7c6ca8', bloom: '#5e9e7a', seek: '#5a8e9e',
   read: '#c49a5c', filter: '#b8a040', aggregate: '#c46b6b',
   skip: '#9494a8', shortcut: '#5e9e7a', parallel: '#5b7fb8',
+  part: '#6b8ec4',
 };
 
 function humanBytes(bytes: number): string {
@@ -74,62 +76,41 @@ function buildRows(steps: PlanStep[], totalUs: number): GanttRow[] {
   const io = 0.6, cpu = 0.3, meta = 0.1;
   const est = (weight: number) => weight * totalUs;
 
-  // Find the ParallelScan step to determine its scope
-  const parallelStep = steps.find(s => s.type === 'ParallelScan') as
-    (PlanStep & { type: 'ParallelScan' }) | undefined;
-  const parallelIdx = steps.findIndex(s => s.type === 'ParallelScan');
-
-  // Collect parallel-phase stats (steps that came from inside parts)
-  let parallelReads = 0, parallelBlooms = 0, parallelFilters = 0;
-  let parallelBytesRead = 0, parallelRowsScanned = 0, parallelRowsMatched = 0;
-  if (parallelIdx >= 0) {
-    for (let i = parallelIdx + 1; i < steps.length; i++) {
-      const s = steps[i];
-      // Stop when we hit a non-part step (like Aggregate)
-      if (s.type === 'Aggregate' || s.type === 'StatsShortcut' || s.type === 'TopNFastPath') break;
-      if (s.type === 'ColumnRead') { parallelReads++; parallelBytesRead += s.bytes; }
-      if (s.type === 'BloomFilter') parallelBlooms++;
-      if (s.type === 'FilterApply') {
-        parallelFilters++;
-        parallelRowsScanned += s.rows_before;
-        parallelRowsMatched += s.rows_after;
-      }
-    }
-  }
-
-  // Build sequential pre-parallel steps
   for (let i = 0; i < steps.length; i++) {
     const s = steps[i];
-    if (i === parallelIdx) {
-      // The parallel scan block — single row representing all parts
-      const dur = stepDur(s) ?? est(io + cpu * 0.5);
-      const parts = parallelStep?.parts_count ?? 0;
-      const summary = [
-        `${parts} parts`,
-        parallelBytesRead > 0 ? humanBytes(parallelBytesRead) + ' read' : null,
-        parallelRowsScanned > 0 ? `${parallelRowsScanned.toLocaleString()} rows scanned` : null,
-        parallelRowsMatched > 0 ? `${parallelRowsMatched.toLocaleString()} matched` : null,
-      ].filter(Boolean).join(', ');
-
-      rows.push({
-        label: `Parallel scan: ${parts} parts`,
-        durationUs: dur,
-        color: COLORS.parallel,
-        badge: summary,
-        parallel: true,
-      });
-
-      // Skip all per-part steps that follow
-      while (i + 1 < steps.length) {
-        const next = steps[i + 1];
-        if (next.type === 'Aggregate' || next.type === 'StatsShortcut' || next.type === 'TopNFastPath') break;
-        if (next.type === 'TimeRangePrune') break;  // shouldn't happen but safety
-        i++;
-      }
-      continue;
-    }
 
     switch (s.type) {
+      case 'ParallelScan': {
+        // Skip the header — per-part PartScan rows follow immediately.
+        // Also skip any ColumnRead/BloomFilter/FilterApply that belonged
+        // to per-part local_plans (now redundant with PartScan rows).
+        while (i + 1 < steps.length) {
+          const next = steps[i + 1];
+          if (next.type === 'PartScan') break;  // stop: keep these
+          if (next.type === 'Aggregate' || next.type === 'StatsShortcut' || next.type === 'TopNFastPath') break;
+          if (next.type === 'TimeRangePrune') break;
+          i++;
+        }
+        break;
+      }
+
+      case 'PartScan': {
+        const dur = stepDur(s) ?? est((io + cpu) / 10);
+        const badge = [
+          s.rows_scanned > 0 ? `${s.rows_scanned.toLocaleString()} rows` : '0 rows',
+          s.rows_matched !== s.rows_scanned ? `${s.rows_matched.toLocaleString()} matched` : null,
+          s.bytes_read > 0 ? humanBytes(s.bytes_read) : null,
+        ].filter(Boolean).join(', ');
+
+        rows.push({
+          label: `Part: ${s.part}`,
+          durationUs: dur,
+          color: COLORS.part,
+          badge,
+          indent: true,
+        });
+        break;
+      }
       case 'TimeRangePrune': {
         const pruned = s.parts_before - s.parts_after;
         rows.push({ label: 'Time range prune', durationUs: stepDur(s) ?? est(meta * 0.4), color: COLORS.prune, badge: pruned > 0 ? `${s.parts_after} parts (${pruned} pruned)` : `${s.parts_after} parts` });
@@ -202,14 +183,14 @@ export function ExplainGantt({ steps, stats }: ExplainGanttProps) {
         offset += row.durationUs;
 
         return (
-          <div key={i} className={`gantt-row ${row.parallel ? 'gantt-parallel' : ''}`} title={row.badge ?? row.label}>
+          <div key={i} className={`gantt-row ${row.indent ? 'gantt-part' : ''}`} title={row.badge ?? row.label}>
             <div className="gantt-label">
               <span className="gantt-label-text">{row.label}</span>
               <span className="gantt-est">{formatUs(row.durationUs)}</span>
             </div>
             <div className="gantt-track">
               <div
-                className={`gantt-bar ${row.parallel ? 'gantt-bar-parallel' : ''}`}
+                className="gantt-bar"
                 style={{
                   left: `${offsetPct}%`,
                   width: `${widthPct}%`,

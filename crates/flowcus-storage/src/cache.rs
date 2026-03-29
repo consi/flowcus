@@ -94,6 +94,10 @@ impl<V: Clone> LruPool<V> {
     fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
     }
+
+    fn saturation(&self) -> (usize, usize) {
+        (self.current_bytes, self.max_bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +195,29 @@ impl StorageCache {
         let (ih, im) = self.column_index.lock().unwrap().stats();
         let (eh, em) = self.meta.lock().unwrap().stats();
         (bh + mh + ih + eh, bm + mm + im + em)
+    }
+
+    /// Get aggregate cache saturation (used_bytes, max_bytes).
+    pub fn saturation(&self) -> (usize, usize) {
+        let (bu, bm) = self.blooms.lock().unwrap().saturation();
+        let (mu, mm) = self.marks.lock().unwrap().saturation();
+        let (iu, im) = self.column_index.lock().unwrap().saturation();
+        let (eu, em) = self.meta.lock().unwrap().saturation();
+        (bu + mu + iu + eu, bm + mm + im + em)
+    }
+
+    /// Per-partition cache breakdown: `[(name, used_bytes, max_bytes)]`.
+    pub fn partition_stats(&self) -> [(&'static str, usize, usize); 4] {
+        let (mu, mm) = self.marks.lock().unwrap().saturation();
+        let (bu, bm) = self.blooms.lock().unwrap().saturation();
+        let (iu, im) = self.column_index.lock().unwrap().saturation();
+        let (eu, em) = self.meta.lock().unwrap().saturation();
+        [
+            ("marks", mu, mm),
+            ("blooms", bu, bm),
+            ("column_index", iu, im),
+            ("metadata", eu, em),
+        ]
     }
 }
 

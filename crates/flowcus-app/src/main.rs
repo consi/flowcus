@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{error, info};
 
-use flowcus_core::{AppConfig, LogFormat, observability, profiling, telemetry};
+use flowcus_core::{LogFormat, observability, telemetry};
 use flowcus_ipfix::IpfixListener;
 use flowcus_server::state::AppState;
 use flowcus_storage::{MergeConfig, WriterConfig};
@@ -18,11 +18,15 @@ use flowcus_storage::{MergeConfig, WriterConfig};
     about = "Flowcus - IPFIX collector, storage and query system"
 )]
 struct Cli {
-    /// Path to configuration file
-    #[arg(short, long, default_value = "flowcus.toml")]
-    config: PathBuf,
+    /// Path to settings file (default: `{storage_dir}/flowcus.settings`)
+    #[arg(short, long)]
+    settings: Option<PathBuf>,
 
-    /// Enable development mode (human logs, frontend proxy, profiling)
+    /// Override storage directory
+    #[arg(long, env = "FLOWCUS_STORAGE")]
+    storage: Option<String>,
+
+    /// Enable development mode (human logs, frontend proxy)
     #[arg(short, long, env = "FLOWCUS_DEV")]
     dev: bool,
 
@@ -40,7 +44,23 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut config = AppConfig::load(&cli.config)?;
+    // Resolve settings path: explicit CLI flag, or {storage_dir}/flowcus.settings.
+    // We need to load config to know storage_dir, but storage_dir may be in the
+    // settings file. Break the cycle: try the explicit path first, then fall back
+    // to the default location inside the storage directory.
+    let settings_path = if let Some(ref p) = cli.settings {
+        p.clone()
+    } else {
+        // Determine storage dir: CLI override > env > default "storage"
+        let storage_dir = cli.storage.as_deref().unwrap_or("storage");
+        PathBuf::from(storage_dir).join("flowcus.settings")
+    };
+
+    let mut config = flowcus_core::settings::load_or_create(&settings_path)?;
+
+    if let Some(dir) = cli.storage.as_deref() {
+        config.storage.dir = dir.to_string();
+    }
 
     if cli.dev {
         config.server.dev_mode = true;
@@ -58,12 +78,6 @@ async fn main() -> Result<()> {
     // Production metrics — created FIRST, passed to all components
     let metrics = observability::Metrics::new();
 
-    if cli.config.exists() {
-        info!(config_file = %cli.config.display(), "Configuration loaded from file");
-    } else {
-        info!(config_file = %cli.config.display(), "Configuration file not found, using defaults");
-    }
-
     info!(
         version = env!("CARGO_PKG_VERSION"),
         log_format = %config.logging.format,
@@ -74,21 +88,6 @@ async fn main() -> Result<()> {
         merge_workers = config.storage.merge_workers,
         "Starting Flowcus"
     );
-
-    // Dev-mode profiling
-    let mut profiler = profiling::Profiler::new(Path::new("profiling"), 10);
-    let ipfix_prof_metrics = flowcus_storage::metrics::IpfixMetrics::new();
-    let writer_prof_metrics = flowcus_storage::metrics::WriterMetrics::new();
-    let merge_prof_metrics = flowcus_storage::metrics::MergeMetrics::new();
-    profiler.register(Arc::clone(&ipfix_prof_metrics) as Arc<dyn profiling::MetricReporter>);
-    profiler.register(Arc::clone(&writer_prof_metrics) as Arc<dyn profiling::MetricReporter>);
-    profiler.register(Arc::clone(&merge_prof_metrics) as Arc<dyn profiling::MetricReporter>);
-    if config.server.dev_mode {
-        profiler.enable()?;
-        profiling::enable_stack_profiling();
-    }
-    let profiler = Arc::new(std::sync::Mutex::new(profiler));
-    profiling::start(Arc::clone(&profiler));
 
     // Storage
     let writer_config = WriterConfig {
@@ -167,10 +166,24 @@ async fn main() -> Result<()> {
     );
 
     // HTTP server with observability endpoint (shares IPFIX session for metadata API)
-    let state = AppState::with_session_store(config.clone(), metrics, session_store);
-    flowcus_server::serve(&config.server, state).await?;
+    let state = AppState::with_session_store(config.clone(), metrics, session_store, settings_path);
+    flowcus_server::serve(&config.server, state.clone()).await?;
+
+    // Distinguish restart request from normal shutdown (ctrl+c / SIGTERM)
+    if *state.shutdown_rx().borrow() {
+        info!("Restart requested, re-executing...");
+        restart_process();
+    }
 
     info!("Flowcus shutting down");
 
     Ok(())
+}
+
+fn restart_process() -> ! {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().expect("failed to get current executable path");
+    let args: Vec<String> = std::env::args().collect();
+    let err = std::process::Command::new(&exe).args(&args[1..]).exec();
+    panic!("Failed to restart process: {err}");
 }

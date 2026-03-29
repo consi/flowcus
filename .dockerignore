@@ -2,7 +2,6 @@ target/
 .git/
 .claude/
 tests/
-profiling/
 storage/
 frontend/node_modules/
 *.md

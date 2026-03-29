@@ -58,10 +58,7 @@ export function FlowSidebar({
   return (
     <aside className="flow-sidebar">
       <div className="sidebar-header">
-        <div className="sidebar-title">
-          Flow #{selectedIndex + 1}
-          <span className="sidebar-total"> of {totalRows.toLocaleString()}</span>
-        </div>
+        <div className="sidebar-title">Flow details</div>
         <button className="sidebar-close" onClick={onClose} title="Close (Esc)">
           {'\u2715'}
         </button>

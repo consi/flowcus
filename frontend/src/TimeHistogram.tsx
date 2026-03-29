@@ -33,22 +33,22 @@ const TOOLTIP_PADDING = 8;
 
 // ── Time formatting ───────────────────────────────────────────
 
-function formatAxisTime(ts: number, windowSecs: number, tz: string): string {
-  const d = new Date(ts * 1000);
-  if (windowSecs > 86400 * 2) {
+function formatAxisTime(ts: number, windowMs: number, tz: string): string {
+  const d = new Date(ts);
+  if (windowMs > 86_400_000 * 2) {
     return d.toLocaleDateString(undefined, { timeZone: tz, month: 'short', day: 'numeric' });
   }
-  if (windowSecs > 86400) {
+  if (windowMs > 86_400_000) {
     return d.toLocaleString(undefined, { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
   return d.toLocaleTimeString(undefined, { timeZone: tz, hour: '2-digit', minute: '2-digit' });
 }
 
-function formatTooltipTime(ts: number, bucketSecs: number, tz: string): string {
-  const d = new Date(ts * 1000);
-  const end = new Date((ts + bucketSecs) * 1000);
+function formatTooltipTime(ts: number, bucketMs: number, tz: string): string {
+  const d = new Date(ts);
+  const end = new Date(ts + bucketMs);
   const fmt = (dt: Date) => dt.toLocaleTimeString(undefined, {
-    timeZone: tz, hour: '2-digit', minute: '2-digit', second: bucketSecs < 60 ? '2-digit' : undefined,
+    timeZone: tz, hour: '2-digit', minute: '2-digit', second: bucketMs < 60_000 ? '2-digit' : undefined,
   });
   return `${fmt(d)} - ${fmt(end)}`;
 }
@@ -109,7 +109,7 @@ export function TimeHistogram({
   const [brushEnd, setBrushEnd] = useState<number | null>(null);
   const brushingRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
-  const bucketDurationRef = useRef(60);
+  const bucketDurationRef = useRef(60_000);
   const windowBoundsRef = useRef<[number, number]>([0, 0]);
 
   // ── Fetch histogram data ──────────────────────────────────
@@ -122,8 +122,8 @@ export function TimeHistogram({
   timeRangeRef.current = timeRange;
   filtersRef.current = filters;
 
-  const applyEvent = useCallback((data: { buckets?: { timestamp: number; count: number }[]; total_rows?: number; time_range?: { start: number; end: number }; bucket_seconds?: number; done?: boolean }) => {
-    if (data.bucket_seconds) bucketDurationRef.current = data.bucket_seconds;
+  const applyEvent = useCallback((data: { buckets?: { timestamp: number; count: number }[]; total_rows?: number; time_range?: { start: number; end: number }; bucket_ms?: number; done?: boolean }) => {
+    if (data.bucket_ms) bucketDurationRef.current = data.bucket_ms;
     if (data.time_range) windowBoundsRef.current = [data.time_range.start, data.time_range.end];
     if (data.buckets) {
       setBuckets(data.buckets.map((b) => ({ timestamp: b.timestamp, count: b.count })));
@@ -363,7 +363,7 @@ export function TimeHistogram({
     }
 
     // ── X-axis labels ─────────────────────────────────────
-    const windowSecs = windowBoundsRef.current[1] - windowBoundsRef.current[0];
+    const windowMs = windowBoundsRef.current[1] - windowBoundsRef.current[0];
     ctx.fillStyle = textMuted;
     ctx.font = '10px system-ui, sans-serif';
     ctx.textAlign = 'center';
@@ -373,7 +373,7 @@ export function TimeHistogram({
     const labelSpacing = Math.max(1, Math.ceil(80 / barTotalW));
     for (let i = 0; i < buckets.length; i += labelSpacing) {
       const x = PADDING_LEFT + i * barTotalW + barW / 2;
-      const label = formatAxisTime(buckets[i].timestamp, windowSecs, tz);
+      const label = formatAxisTime(buckets[i].timestamp, windowMs, tz);
       ctx.fillText(label, x, PADDING_TOP + chartH + 4);
     }
 
@@ -536,13 +536,13 @@ export function TimeHistogram({
       const frac2 = (Math.max(startX, endX) - PADDING_LEFT) / chartW;
 
       const [winStart, winEnd] = windowBoundsRef.current;
-      const windowSecs = winEnd - winStart;
+      const windowMs = winEnd - winStart;
 
-      const t1 = winStart + frac1 * windowSecs;
-      const t2 = winStart + frac2 * windowSecs;
+      const t1 = winStart + frac1 * windowMs;
+      const t2 = winStart + frac2 * windowMs;
 
-      const newStart = new Date(Math.floor(t1) * 1000).toISOString();
-      const newEnd = new Date(Math.ceil(t2) * 1000).toISOString();
+      const newStart = new Date(Math.floor(t1)).toISOString();
+      const newEnd = new Date(Math.ceil(t2)).toISOString();
 
       onTimeRangeChange({
         type: 'absolute',
@@ -559,13 +559,13 @@ export function TimeHistogram({
       if (buckets.length === 0) return;
 
       const [winStart, winEnd] = windowBoundsRef.current;
-      const windowSecs = winEnd - winStart;
-      const halfWindow = windowSecs / 2;
+      const windowMs = winEnd - winStart;
+      const halfWindow = windowMs / 2;
 
-      const now = Math.floor(Date.now() / 1000);
+      const now = Date.now();
       const expandedEnd = Math.min(winEnd + halfWindow, now);
-      const newStart = new Date((winStart - halfWindow) * 1000).toISOString();
-      const newEnd = new Date(expandedEnd * 1000).toISOString();
+      const newStart = new Date(winStart - halfWindow).toISOString();
+      const newEnd = new Date(expandedEnd).toISOString();
 
       onTimeRangeChange({
         type: 'absolute',

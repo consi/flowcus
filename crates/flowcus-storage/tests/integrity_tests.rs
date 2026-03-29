@@ -157,7 +157,7 @@ fn test_ingested_data_survives_flush() {
     let msg = make_message(records);
     let ingested = writer.ingest(&msg);
     assert_eq!(ingested, 3);
-    let flushed = writer.flush_ready();
+    let (flushed, _) = writer.flush_ready();
     assert_eq!(flushed, 1);
 
     let part_dir = find_first_part(&dir);

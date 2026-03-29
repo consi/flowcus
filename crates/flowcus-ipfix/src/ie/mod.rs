@@ -43,7 +43,7 @@ fn build_registry() -> HashMap<IeKey, InformationElement> {
 
 /// Look up an Information Element by its ID and enterprise number.
 /// Returns `None` for unknown elements.
-pub fn lookup(element_id: u16, enterprise_id: u32) -> Option<&'static InformationElement> {
+fn lookup(element_id: u16, enterprise_id: u32) -> Option<&'static InformationElement> {
     REGISTRY.get(&(element_id, enterprise_id))
 }
 
@@ -85,7 +85,8 @@ pub fn all() -> impl Iterator<Item = &'static InformationElement> {
 }
 
 /// Total number of registered Information Elements.
-pub fn registry_size() -> usize {
+#[cfg(test)]
+fn registry_size() -> usize {
     REGISTRY.len()
 }
 

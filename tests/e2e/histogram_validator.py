@@ -24,7 +24,7 @@ class HistogramResult:
     buckets: list[dict]  # [{timestamp, count}, ...]
     total_rows: int
     time_range: dict  # {start, end}
-    bucket_seconds: int
+    bucket_ms: int
     done: bool
     all_events: list[dict]  # all SSE events (for progressive testing)
     http_status: int = 200
@@ -77,7 +77,7 @@ def execute_histogram(
             if not events:
                 return HistogramResult(
                     buckets=[], total_rows=0, time_range={},
-                    bucket_seconds=0, done=False, all_events=[],
+                    bucket_ms=0, done=False, all_events=[],
                     http_status=resp.status,
                     error="No SSE events in response",
                 )
@@ -88,7 +88,7 @@ def execute_histogram(
             if "error" in final:
                 return HistogramResult(
                     buckets=[], total_rows=0, time_range={},
-                    bucket_seconds=0, done=True, all_events=events,
+                    bucket_ms=0, done=True, all_events=events,
                     http_status=resp.status,
                     error=f"Backend error: {final['error']}",
                 )
@@ -97,7 +97,7 @@ def execute_histogram(
                 buckets=final.get("buckets", []),
                 total_rows=final.get("total_rows", 0),
                 time_range=final.get("time_range", {}),
-                bucket_seconds=final.get("bucket_seconds", 0),
+                bucket_ms=final.get("bucket_ms", 0),
                 done=final.get("done", False),
                 all_events=events,
                 http_status=resp.status,
@@ -105,14 +105,14 @@ def execute_histogram(
     except urllib.error.HTTPError as e:
         return HistogramResult(
             buckets=[], total_rows=0, time_range={},
-            bucket_seconds=0, done=False, all_events=[],
+            bucket_ms=0, done=False, all_events=[],
             http_status=e.code,
             error=str(e),
         )
     except Exception as e:
         return HistogramResult(
             buckets=[], total_rows=0, time_range={},
-            bucket_seconds=0, done=False, all_events=[],
+            bucket_ms=0, done=False, all_events=[],
             http_status=0,
             error=str(e),
         )
@@ -196,15 +196,15 @@ def build_histogram_test_cases(
     def validate_structure(result: HistogramResult) -> dict:
         has_buckets = len(result.buckets) > 0
         has_time_range = bool(result.time_range.get("start")) and bool(result.time_range.get("end"))
-        has_bucket_seconds = result.bucket_seconds > 0
+        has_bucket_ms = result.bucket_ms > 0
         is_done = result.done
         return {
             "expected_valid_structure": True,
             "actual_has_buckets": has_buckets,
             "actual_has_time_range": has_time_range,
-            "actual_has_bucket_seconds": has_bucket_seconds,
+            "actual_has_bucket_ms": has_bucket_ms,
             "actual_done": is_done,
-            "match": has_buckets and has_time_range and has_bucket_seconds and is_done,
+            "match": has_buckets and has_time_range and has_bucket_ms and is_done,
         }
 
     cases.append(("hist_valid_structure", {"time_range": tr, "filters": []}, validate_structure))
@@ -223,7 +223,7 @@ def build_histogram_test_cases(
     def validate_uniform_spacing(result: HistogramResult) -> dict:
         if len(result.buckets) < 2:
             return {"match": True, "actual_bucket_count": len(result.buckets)}
-        bs = result.bucket_seconds
+        bs = result.bucket_ms
         mismatches = []
         for i in range(1, len(result.buckets)):
             t0 = result.buckets[i - 1]["timestamp"]
@@ -246,7 +246,7 @@ def build_histogram_test_cases(
         t_end = result.time_range.get("end", 0)
         first_ts = result.buckets[0]["timestamp"]
         last_ts = result.buckets[-1]["timestamp"]
-        last_end = last_ts + result.bucket_seconds
+        last_end = last_ts + result.bucket_ms
         return {
             "expected_first_le_start": True,
             "actual_first_ts": first_ts,
@@ -278,7 +278,7 @@ def build_histogram_test_cases(
     def validate_data_placement(result: HistogramResult) -> dict:
         if not result.buckets:
             return {"match": False}
-        bs = result.bucket_seconds
+        bs = result.bucket_ms
         other_nonzero = [
             b for b in result.buckets
             if b["count"] > 0 and not (b["timestamp"] <= export_time < b["timestamp"] + bs)

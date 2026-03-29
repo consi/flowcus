@@ -187,14 +187,6 @@ export function ResultsTable({
 
       <div className="results-scroll-status">
         {loadingMore && <div className="scroll-loading">Loading more rows...</div>}
-        {pagination && (
-          <div className="scroll-info">
-            Showing {rows.length.toLocaleString()} of {pagination.total.toLocaleString()} rows
-            {pagination.has_more && !loadingMore && (
-              <span className="scroll-hint"> &mdash; scroll down for more</span>
-            )}
-          </div>
-        )}
         <div ref={sentinelRef} className="scroll-sentinel" />
       </div>
     </div>

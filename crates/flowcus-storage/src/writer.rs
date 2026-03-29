@@ -40,11 +40,11 @@ pub struct WriterConfig {
 impl Default for WriterConfig {
     fn default() -> Self {
         Self {
-            flush_bytes: 1024 * 1024, // 1 MB
-            flush_interval_secs: 1,
-            initial_row_capacity: 8192,
+            flush_bytes: 16 * 1024 * 1024, // 16 MB
+            flush_interval_secs: 5,
+            initial_row_capacity: 65536,
             partition_duration_secs: 3600, // 1 hour
-            channel_capacity: 4096,
+            channel_capacity: 8192,
         }
     }
 }
@@ -54,10 +54,10 @@ struct SchemaBuffer {
     schema: Schema,
     columns: Vec<ColumnBuffer>,
     row_count: usize,
-    first_export_time: u32,
-    last_export_time: u32,
-    /// Hour partition this buffer belongs to (export_time / partition_duration).
-    partition_hour: u32,
+    first_export_time: u64,
+    last_export_time: u64,
+    /// Hour partition this buffer belongs to (export_time_ms / partition_duration_ms).
+    partition_hour: u64,
     exporter: std::net::SocketAddr,
     observation_domain_id: u32,
     created_at: Instant,
@@ -75,7 +75,7 @@ impl SchemaBuffer {
             schema,
             columns,
             row_count: 0,
-            first_export_time: u32::MAX,
+            first_export_time: u64::MAX,
             last_export_time: 0,
             partition_hour: 0,
             exporter: ([0, 0, 0, 0], 0).into(),
@@ -89,14 +89,14 @@ impl SchemaBuffer {
         record: &DataRecord,
         exporter_ipv4: u32,
         exporter_port: u16,
-        export_time: u32,
+        export_time_ms: u64,
         observation_domain_id: u32,
     ) {
         let num_sys = self.schema.system_column_count();
         // Push system column values into the first 4 column buffers.
         self.columns[0].push_u32(exporter_ipv4);
         self.columns[1].push_u16(exporter_port);
-        self.columns[2].push_u32(export_time);
+        self.columns[2].push_u64(export_time_ms);
         self.columns[3].push_u32(observation_domain_id);
 
         // Compute and push flow duration if this schema has the column.
@@ -126,7 +126,7 @@ impl SchemaBuffer {
             col.clear();
         }
         self.row_count = 0;
-        self.first_export_time = u32::MAX;
+        self.first_export_time = u64::MAX;
         self.last_export_time = 0;
         self.partition_hour = 0;
         self.created_at = Instant::now();
@@ -138,7 +138,7 @@ pub struct StorageWriter {
     config: WriterConfig,
     table: Table,
     /// Buffers keyed by (schema_fingerprint, partition_hour).
-    buffers: HashMap<(u64, u32), SchemaBuffer>,
+    buffers: HashMap<(u64, u64), SchemaBuffer>,
     /// Sequence counter for part IDs.
     seq: AtomicU32,
     /// Shared pending-hours tracker. Marks hours dirty when parts are written.
@@ -173,11 +173,12 @@ impl StorageWriter {
     pub fn ingest(&mut self, msg: &IpfixMessage) -> usize {
         let exporter = msg.exporter;
         let domain = msg.header.observation_domain_id;
-        // Use the message's export_time, but fall back to wall clock if the
-        // exporter sends 0 (unconfigured clock) or an obviously wrong value
-        // (before 2000-01-01 = 946684800).
-        let export_time = if msg.header.export_time >= 946_684_800 {
-            msg.header.export_time
+        // Use the message's export_time (u32 seconds from IPFIX header), but
+        // fall back to wall clock if the exporter sends 0 (unconfigured clock)
+        // or an obviously wrong value (before 2000-01-01 = 946684800).
+        // Convert to u64 milliseconds for internal storage.
+        let export_time_ms: u64 = if msg.header.export_time >= 946_684_800 {
+            u64::from(msg.header.export_time) * 1000
         } else {
             tracing::warn!(
                 original = msg.header.export_time,
@@ -187,9 +188,10 @@ impl StorageWriter {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs() as u32
+                .as_millis() as u64
         };
-        let partition = export_time / self.config.partition_duration_secs;
+        let partition_duration_ms = u64::from(self.config.partition_duration_secs) * 1000;
+        let partition = export_time_ms / partition_duration_ms;
 
         // Extract exporter IPv4 address and port from the socket address.
         let exporter_ipv4: u32 = match exporter {
@@ -220,11 +222,11 @@ impl StorageWriter {
 
                 buf.exporter = exporter;
                 buf.observation_domain_id = domain;
-                if export_time < buf.first_export_time {
-                    buf.first_export_time = export_time;
+                if export_time_ms < buf.first_export_time {
+                    buf.first_export_time = export_time_ms;
                 }
-                if export_time > buf.last_export_time {
-                    buf.last_export_time = export_time;
+                if export_time_ms > buf.last_export_time {
+                    buf.last_export_time = export_time_ms;
                 }
 
                 // Record fields should match the non-system columns in the schema.
@@ -236,7 +238,7 @@ impl StorageWriter {
                             record,
                             exporter_ipv4,
                             exporter_port,
-                            export_time,
+                            export_time_ms,
                             domain,
                         );
                         total += 1;
@@ -249,11 +251,13 @@ impl StorageWriter {
     }
 
     /// Check all buffers and flush any that exceed thresholds.
-    pub fn flush_ready(&mut self) -> usize {
+    /// Flush buffers that have reached the size or time threshold.
+    /// Returns `(parts_flushed, bytes_flushed)`.
+    pub fn flush_ready(&mut self) -> (usize, u64) {
         let flush_bytes = self.config.flush_bytes;
         let flush_secs = self.config.flush_interval_secs;
 
-        let to_flush: Vec<(u64, u32)> = self
+        let to_flush: Vec<(u64, u64)> = self
             .buffers
             .iter()
             .filter(|(_, buf)| {
@@ -264,12 +268,15 @@ impl StorageWriter {
             .collect();
 
         let mut flushed = 0;
+        let mut bytes = 0u64;
         for key in to_flush {
-            if self.flush_key(&key) {
+            let b = self.flush_key(&key);
+            if b > 0 {
                 flushed += 1;
+                bytes += b;
             }
         }
-        flushed
+        (flushed, bytes)
     }
 
     /// Number of active write buffers.
@@ -283,24 +290,28 @@ impl StorageWriter {
     }
 
     /// Force-flush all non-empty buffers.
-    pub fn flush_all(&mut self) -> usize {
-        let keys: Vec<(u64, u32)> = self.buffers.keys().copied().collect();
+    /// Returns `(parts_flushed, bytes_flushed)`.
+    pub fn flush_all(&mut self) -> (usize, u64) {
+        let keys: Vec<(u64, u64)> = self.buffers.keys().copied().collect();
         let mut flushed = 0;
+        let mut bytes = 0u64;
         for key in keys {
-            if self.flush_key(&key) {
+            let b = self.flush_key(&key);
+            if b > 0 {
                 flushed += 1;
+                bytes += b;
             }
         }
-        flushed
+        (flushed, bytes)
     }
 
-    /// Flush a specific buffer by key. Returns true if a part was written.
-    fn flush_key(&mut self, key: &(u64, u32)) -> bool {
+    /// Flush a specific buffer by key. Returns bytes written (0 if nothing flushed).
+    fn flush_key(&mut self, key: &(u64, u64)) -> u64 {
         let Some(buf) = self.buffers.get(key) else {
-            return false;
+            return 0;
         };
         if buf.row_count == 0 {
-            return false;
+            return 0;
         }
 
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -320,11 +331,11 @@ impl StorageWriter {
                 if let Some(buf) = self.buffers.get_mut(key) {
                     buf.clear();
                 }
-                true
+                bytes as u64
             }
             Err(e) => {
                 warn!(error = %e, "Failed to flush part");
-                false
+                0
             }
         }
     }
@@ -394,16 +405,13 @@ const INGESTION_BLOOM_BITS: usize = 8192;
 
 /// Encode columns, compute granules, and write a part to disk.
 fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io::Result<PathBuf> {
-    let _t = flowcus_core::profiling::span_timer("storage;writer;flush");
     let mut column_data = Vec::with_capacity(buf.schema.columns.len());
     let mut disk_bytes: u64 = 0;
 
     for (def, col_buf) in buf.schema.columns.iter().zip(buf.columns.iter()) {
-        let _t_enc = flowcus_core::profiling::span_timer("storage;writer;flush;encode_column");
-        let encoded = codec::encode(col_buf);
+        let encoded = codec::encode(col_buf, def);
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
-        let _t_gran = flowcus_core::profiling::span_timer("storage;writer;flush;compute_granules");
         let (marks, blooms) = crate::granule::compute_granules(
             col_buf,
             &encoded.data,
@@ -538,7 +546,7 @@ mod tests {
         ]);
 
         assert_eq!(writer.ingest(&msg), 2);
-        assert_eq!(writer.flush_ready(), 1);
+        assert_eq!(writer.flush_ready().0, 1);
 
         // Verify part was written in time-partitioned tree
         // Path: flows/2023/11/14/22/00000_..._000001/
@@ -596,7 +604,7 @@ mod tests {
 
         writer.ingest(&msg1);
         writer.ingest(&msg2);
-        let flushed = writer.flush_all();
+        let (flushed, _) = writer.flush_all();
         assert_eq!(flushed, 2, "should produce 2 parts for 2 different hours");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -703,7 +711,7 @@ mod tests {
         }
 
         // Flush and verify part on disk
-        assert_eq!(writer.flush_all(), 1);
+        assert_eq!(writer.flush_all().0, 1);
         let table = Table::open(&dir, "flows").unwrap();
         let parts = table.list_all_parts().unwrap();
         assert_eq!(parts.len(), 1);

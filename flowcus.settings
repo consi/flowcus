@@ -1,0 +1,50 @@
+# Flowcus Settings
+# Edit via the Settings panel in the web UI, or modify this file directly.
+# Changes take effect after a server restart.
+
+# Logging
+# Log output format and verbosity.
+[logging]
+format = "human"
+filter = "info,tower_http=debug"
+
+# Server
+# HTTP server and API configuration.
+[server]
+host = "0.0.0.0"
+port = 2137
+dev_mode = false
+frontend_proxy = "http://localhost:5173"
+query_cache_entries = 500
+
+# IPFIX Collector
+# IPFIX/NetFlow collection endpoint configuration.
+[ipfix]
+host = "0.0.0.0"
+port = 4739
+udp = true
+tcp = false
+udp_recv_buffer = 65535
+template_expiry_secs = 1800
+unprocessed_dir = "unprocessed"
+unprocessed_ttl_secs = 300
+unprocessed_scan_interval_secs = 10
+
+# Storage & Merge
+# Columnar storage engine tuning and background compaction.
+[storage]
+dir = "storage"
+flush_bytes = 16777216
+flush_interval_secs = 5
+partition_duration_secs = 3600
+channel_capacity = 8192
+initial_row_capacity = 65536
+merge_workers = 4
+merge_scan_interval_secs = 15
+merge_cpu_throttle = 0.8
+merge_mem_throttle = 0.85
+granule_size = 8192
+bloom_bits_per_granule = 8192
+storage_cache_bytes = 1073741824
+retention_hours = 744
+retention_scan_interval_secs = 900

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod assets;
 pub mod query;
+pub mod settings;
 pub mod state;
 
 use std::net::SocketAddr;
@@ -17,7 +18,9 @@ use crate::state::AppState;
 /// Build the full application router.
 pub fn build_router(state: AppState) -> Router {
     let dev_mode = state.config().server.dev_mode;
-    let api_routes = api::routes().merge(query::routes());
+    let api_routes = api::routes()
+        .merge(query::routes())
+        .merge(settings::routes());
     let obs_routes = api::observability_routes();
 
     // SSE endpoints must not be compressed — compression buffers the entire
@@ -47,6 +50,9 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Start the server and listen for connections.
 ///
+/// The server shuts down gracefully when the state's shutdown signal fires
+/// (e.g. via the `/api/restart` endpoint).
+///
 /// # Errors
 /// Returns an error if the server fails to bind or encounters a runtime error.
 pub async fn serve(config: &ServerConfig, state: AppState) -> flowcus_core::Result<()> {
@@ -54,6 +60,7 @@ pub async fn serve(config: &ServerConfig, state: AppState) -> flowcus_core::Resu
         config.host.parse().unwrap_or_else(|_| [0, 0, 0, 0].into()),
         config.port,
     );
+    let mut shutdown_rx = state.shutdown_rx();
     let router = build_router(state);
 
     let listener = TcpListener::bind(addr)
@@ -63,6 +70,9 @@ pub async fn serve(config: &ServerConfig, state: AppState) -> flowcus_core::Resu
     info!(%addr, "Server listening");
 
     axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+        })
         .await
         .map_err(|e| flowcus_core::Error::server(e.to_string()))?;
 

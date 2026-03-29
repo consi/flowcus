@@ -56,9 +56,9 @@ struct MergePlan {
     sources: Vec<PartEntry>,
     /// Target generation (max source gen + 1).
     target_generation: u32,
-    /// Combined time range.
-    time_min: u32,
-    time_max: u32,
+    /// Combined time range (unix milliseconds).
+    time_min: u64,
+    time_max: u64,
     /// Schema from the first source (all must match by fingerprint).
     schema: Schema,
     /// Table base directory.
@@ -269,11 +269,12 @@ fn build_merge_plans(
     let mut plans = Vec::new();
     let active = active_merges.lock().unwrap();
 
-    let now = std::time::SystemTime::now()
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as u32;
-    let current_partition = now / partition_duration_secs;
+        .as_millis() as u64;
+    let partition_duration_ms = u64::from(partition_duration_secs) * 1000;
+    let current_partition = now_ms / partition_duration_ms;
 
     let dirty_hours = pending.get_dirty();
     if dirty_hours.is_empty() {
@@ -359,7 +360,7 @@ fn build_merge_plans(
 
         let time_min = parts.iter().map(|p| p.time_min).min().unwrap();
         let time_max = parts.iter().map(|p| p.time_max).max().unwrap();
-        let partition_of_parts = time_min / partition_duration_secs;
+        let partition_of_parts = time_min / partition_duration_ms;
         let is_past = partition_of_parts < current_partition;
 
         if is_past {
@@ -410,7 +411,7 @@ fn build_merge_plans(
 
     // Prioritize: past hours first, then lower generation first (compact base level)
     plans.sort_by_key(|p| {
-        let is_current = p.time_min / partition_duration_secs >= current_partition;
+        let is_current = p.time_min / partition_duration_ms >= current_partition;
         (is_current, p.target_generation, p.time_min)
     });
 
@@ -426,7 +427,6 @@ fn execute_merge(
     granule_size: usize,
     bloom_bits: usize,
 ) -> std::io::Result<(PathBuf, u64)> {
-    let _t = flowcus_core::profiling::span_timer("merge;execute");
     let src_count = plan.sources.len();
 
     debug!(
@@ -709,7 +709,6 @@ fn merge_column(
     sources: &[PartEntry],
     source_rows: &[u64],
 ) -> std::io::Result<(ColumnBuffer, EncodedColumn)> {
-    let _t = flowcus_core::profiling::span_timer("merge;column;total");
     let col_name = &col_def.name;
     let st = col_def.storage_type;
 
@@ -757,8 +756,9 @@ fn merge_column(
         "Column merged, re-encoding"
     );
 
-    // Re-encode with automatic codec selection (benefits from larger dataset)
-    let encoded = codec::encode(&combined);
+    // Re-encode: uses static hint for known fields, heuristic for unknown.
+    // Merged data is larger → heuristic analysis is more accurate for unknowns.
+    let encoded = codec::encode(&combined, col_def);
     Ok((combined, encoded))
 }
 
@@ -1116,13 +1116,13 @@ fn read_exporter_from_meta(part_dir: &Path) -> std::io::Result<std::net::SocketA
     if buf.len() < part::META_HEADER_SIZE {
         return Ok(([0, 0, 0, 0], 0).into());
     }
-    let port = u16::from_le_bytes(buf[60..62].try_into().unwrap());
-    let family = buf[62];
+    let port = u16::from_le_bytes(buf[68..70].try_into().unwrap());
+    let family = buf[70];
     let addr = if family == 6 {
-        let octets: [u8; 16] = buf[64..80].try_into().unwrap();
+        let octets: [u8; 16] = buf[72..88].try_into().unwrap();
         std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
     } else {
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(buf[64], buf[65], buf[66], buf[67]))
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(buf[72], buf[73], buf[74], buf[75]))
     };
     Ok(std::net::SocketAddr::new(addr, port))
 }
@@ -1288,19 +1288,19 @@ mod tests {
 
         let parts = [
             PartEntry {
-                path: hour_dir.join("1_00000_1711180000_1711183599_000001"),
+                path: hour_dir.join("1_00000_1711180000000_1711183599000_000001"),
                 format_version: 1,
                 generation: 0,
-                time_min: 1_711_180_000,
-                time_max: 1_711_183_599,
+                time_min: 1_711_180_000_000,
+                time_max: 1_711_183_599_000,
                 seq: 1,
             },
             PartEntry {
-                path: hour_dir.join("1_00001_1711180000_1711183599_000010"),
+                path: hour_dir.join("1_00001_1711180000000_1711183599000_000010"),
                 format_version: 1,
                 generation: 1,
-                time_min: 1_711_180_000,
-                time_max: 1_711_183_599,
+                time_min: 1_711_180_000_000,
+                time_max: 1_711_183_599_000,
                 seq: 10,
             },
         ];
@@ -1326,24 +1326,24 @@ mod tests {
                 path: PathBuf::from("a"),
                 format_version: 1,
                 generation: 0,
-                time_min: 100,
-                time_max: 200,
+                time_min: 100_000,
+                time_max: 200_000,
                 seq: 1,
             },
             PartEntry {
                 path: PathBuf::from("b"),
                 format_version: 1,
                 generation: 0,
-                time_min: 100,
-                time_max: 200,
+                time_min: 100_000,
+                time_max: 200_000,
                 seq: 2,
             },
             PartEntry {
                 path: PathBuf::from("c"),
                 format_version: 1,
                 generation: 1,
-                time_min: 100,
-                time_max: 200,
+                time_min: 100_000,
+                time_max: 200_000,
                 seq: 3,
             },
         ];

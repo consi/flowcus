@@ -33,8 +33,8 @@ pub struct PartEntry {
     /// Part format version (0 = legacy 4-segment dir name, 1 = current 5-segment).
     pub format_version: u32,
     pub generation: u32,
-    pub time_min: u32,
-    pub time_max: u32,
+    pub time_min: u64,
+    pub time_max: u64,
     pub seq: u32,
 }
 
@@ -65,8 +65,8 @@ impl Table {
     /// Returns parts sorted by (generation, time_min, seq).
     pub fn list_parts(
         &self,
-        time_min: Option<u32>,
-        time_max: Option<u32>,
+        time_min: Option<u64>,
+        time_max: Option<u64>,
     ) -> std::io::Result<Vec<PartEntry>> {
         let mut parts = Vec::new();
         walk_parts_recursive(&self.base_dir, 0, time_min, time_max, &mut parts)?;
@@ -88,8 +88,8 @@ impl Table {
 fn walk_parts_recursive(
     dir: &Path,
     depth: u8,
-    time_min: Option<u32>,
-    time_max: Option<u32>,
+    time_min: Option<u64>,
+    time_max: Option<u64>,
     out: &mut Vec<PartEntry>,
 ) -> std::io::Result<()> {
     if !dir.exists() {

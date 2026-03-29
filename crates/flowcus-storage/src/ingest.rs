@@ -85,10 +85,11 @@ async fn run_writer(
                         total_ingested += n as u64;
                         metrics.writer_records_ingested.fetch_add(n as u64, Relaxed);
 
-                        let flushed = writer.flush_ready();
+                        let (flushed, flush_bytes) = writer.flush_ready();
                         total_flushed += flushed as u64;
                         if flushed > 0 {
                             metrics.writer_parts_flushed.fetch_add(flushed as u64, Relaxed);
+                            metrics.writer_bytes_flushed.fetch_add(flush_bytes, Relaxed);
                             debug!(
                                 parts_flushed = flushed,
                                 total_ingested,
@@ -107,9 +108,10 @@ async fn run_writer(
                             total_flushed,
                             "Ingestion channel closed, flushing remaining data"
                         );
-                        let remaining = writer.flush_all();
+                        let (remaining, remaining_bytes) = writer.flush_all();
                         if remaining > 0 {
                             metrics.writer_parts_flushed.fetch_add(remaining as u64, Relaxed);
+                            metrics.writer_bytes_flushed.fetch_add(remaining_bytes, Relaxed);
                             info!(parts = remaining, "Final flush completed");
                         }
                         return;
@@ -117,9 +119,11 @@ async fn run_writer(
                 }
             }
             _ = flush_timer.tick() => {
-                let flushed = writer.flush_ready();
+                let (flushed, flush_bytes) = writer.flush_ready();
                 if flushed > 0 {
                     total_flushed += flushed as u64;
+                    metrics.writer_parts_flushed.fetch_add(flushed as u64, Relaxed);
+                    metrics.writer_bytes_flushed.fetch_add(flush_bytes, Relaxed);
                     debug!(
                         parts_flushed = flushed,
                         total_ingested,
