@@ -136,6 +136,25 @@ async fn main() -> Result<()> {
     );
 
     // Background merge
+    // Pre-heat storage cache with sealed hours (background, non-blocking)
+    if config.storage.cache_preheat_on_startup {
+        let cache = Arc::clone(&storage_cache);
+        let base = table_base.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let (hours, files) = flowcus_storage::cache::preheat_sealed_hours(&base, &cache);
+            let (used, max) = cache.saturation();
+            info!(
+                hours_loaded = hours,
+                files_loaded = files,
+                cache_used_mb = used / (1024 * 1024),
+                cache_max_mb = max / (1024 * 1024),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Cache pre-heat complete"
+            );
+        });
+    }
+
     let merge_config = MergeConfig {
         workers: config.storage.merge_workers,
         scan_interval: Duration::from_secs(config.storage.merge_scan_interval_secs),
@@ -147,6 +166,7 @@ async fn main() -> Result<()> {
         queue_length: config.storage.merge_queue_length,
         compression_level: config.storage.compression_level,
         min_parts: config.storage.merge_min_parts,
+        preheat_on_seal: config.storage.cache_preheat_on_seal,
     };
     let part_locks = flowcus_storage::part_locks::PartLocks::new();
     flowcus_storage::merge::start(

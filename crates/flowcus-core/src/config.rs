@@ -126,6 +126,14 @@ pub struct StorageConfig {
     /// Maximum rows matched during an aggregation query before rejection.
     #[serde(default = "default_max_aggregate_rows")]
     pub max_aggregate_rows: usize,
+    /// Pre-heat the storage cache on startup by loading blooms and marks
+    /// from sealed hours. Loads oldest-first so LRU naturally keeps recent data.
+    #[serde(default)]
+    pub cache_preheat_on_startup: bool,
+    /// Proactively load blooms and marks into cache when the merge coordinator
+    /// seals an hour.
+    #[serde(default)]
+    pub cache_preheat_on_seal: bool,
 }
 
 fn default_storage_dir() -> String {
@@ -226,6 +234,8 @@ impl Default for StorageConfig {
             compression_level: default_compression_level(),
             merge_min_parts: default_merge_min_parts(),
             max_aggregate_rows: default_max_aggregate_rows(),
+            cache_preheat_on_startup: false,
+            cache_preheat_on_seal: false,
         }
     }
 }

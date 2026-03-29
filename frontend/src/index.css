@@ -3056,6 +3056,36 @@
   box-shadow: inset -3px 0 0 var(--accent);
 }
 
+/* === Column Resize Handle === */
+.col-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 1;
+  user-select: none;
+  touch-action: none;
+}
+.col-resize-handle:hover,
+.col-resize-handle:active {
+  background: var(--accent);
+  opacity: 0.4;
+}
+.results-table.resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+.results-table.resizing .results-th {
+  cursor: col-resize;
+}
+.results-table[style*="fixed"] .results-td-content {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+
 /* === Column Config Mobile Close Button === */
 .column-config-close {
   width: 28px;

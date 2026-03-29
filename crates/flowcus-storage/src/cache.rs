@@ -292,6 +292,92 @@ impl StorageCache {
             ("metadata", eu, em),
         ]
     }
+
+    /// Pre-heat cache for a single part: load all column blooms, marks,
+    /// metadata, and column index. Errors on individual files are logged and
+    /// skipped (best-effort). Returns the number of files successfully loaded.
+    pub fn preheat_part(&self, part_dir: &Path) -> usize {
+        let schema_path = part_dir.join("schema.bin");
+        let schema = match crate::part::read_schema_bin(&schema_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, path = %schema_path.display(), "Preheat: cannot read schema");
+                return 0;
+            }
+        };
+
+        let mut loaded = 0usize;
+
+        // Metadata + column index
+        if self.get_meta(&part_dir.join("meta.bin")).is_ok() {
+            loaded += 1;
+        }
+        if self
+            .get_column_index(&part_dir.join("column_index.bin"))
+            .is_ok()
+        {
+            loaded += 1;
+        }
+
+        let cols_dir = part_dir.join("columns");
+        for col in &schema.columns {
+            let mrk_path = cols_dir.join(format!("{}.mrk", col.name));
+            if self.get_marks_for_column(&mrk_path, &col.name).is_ok() {
+                loaded += 1;
+            }
+            let bloom_path = cols_dir.join(format!("{}.bloom", col.name));
+            if self.get_blooms_for_column(&bloom_path, &col.name).is_ok() {
+                loaded += 1;
+            }
+        }
+
+        loaded
+    }
+}
+
+/// Pre-heat cache from sealed hours.
+///
+/// Walks all hour directories under `table_base`, finds sealed hours (exactly
+/// 1 part), and loads their blooms and marks. Processes oldest-first so LRU
+/// eviction naturally keeps recent data hot. Returns `(hours, files)` loaded.
+pub fn preheat_sealed_hours(table_base: &Path, cache: &StorageCache) -> (usize, usize) {
+    let mut hours = match crate::pending::walk_hour_dirs(table_base) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "Cache preheat: failed to walk hour directories");
+            return (0, 0);
+        }
+    };
+
+    // Lexicographic sort = chronological (YYYY/MM/DD/HH path structure).
+    hours.sort();
+
+    let mut hours_loaded = 0usize;
+    let mut files_loaded = 0usize;
+
+    for hour_dir in &hours {
+        // Find part subdirectories in this hour.
+        let parts: Vec<_> = match std::fs::read_dir(hour_dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
+                .collect(),
+            Err(_) => continue,
+        };
+
+        // Only preheat sealed hours (exactly 1 part).
+        if parts.len() != 1 {
+            continue;
+        }
+
+        let n = cache.preheat_part(&parts[0].path());
+        if n > 0 {
+            hours_loaded += 1;
+            files_loaded += n;
+        }
+    }
+
+    (hours_loaded, files_loaded)
 }
 
 impl Default for StorageCache {

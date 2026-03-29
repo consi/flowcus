@@ -192,7 +192,7 @@ fn load_pending(path: &Path) -> Option<BTreeSet<PathBuf>> {
 }
 
 /// Walk the time directory tree and return all hour-level directories.
-fn walk_hour_dirs(base: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn walk_hour_dirs(base: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut hours = Vec::new();
     walk_dirs_recursive(base, 0, &mut hours)?;
     Ok(hours)

@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Pagination, QueryColumn } from './api';
 import { getFormatter, getColumnLabel, selectVisibleColumns } from './formatters';
 import { ColumnConfig } from './ColumnConfig';
+
+const MIN_COL_WIDTH = 50;
+const COL_WIDTHS_KEY = 'flowcus:columnWidths';
 
 interface ResultsTableProps {
   columns: QueryColumn[];
@@ -39,6 +42,21 @@ export function ResultsTable({
   const theadRef = useRef<HTMLTableSectionElement>(null);
   const touchDragRef = useRef(false);
   const touchStartX = useRef(0);
+
+  // Column resize state
+  const [colWidths, setColWidths] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem(COL_WIDTHS_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch { /* ignore */ }
+    return {};
+  });
+  const [isResizing, setIsResizing] = useState(false);
+  const widthsInitialized = useRef(false);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const resizingCol = useRef<string | null>(null);
+  const resizeStartX = useRef(0);
+  const resizeStartWidth = useRef(0);
 
   const visibleIndices = useMemo(() => {
     if (visibleColumns && visibleColumns.length > 0) {
@@ -184,6 +202,63 @@ export function ResultsTable({
     setDragOverCol(null);
   }, [dragCol, dragOverCol, commitColReorder]);
 
+  // Measure auto-layout widths for columns without a stored width
+  useLayoutEffect(() => {
+    if (!theadRef.current) return;
+    const ths = theadRef.current.querySelectorAll<HTMLElement>('.results-th[data-visidx]');
+    let changed = false;
+    const next = { ...colWidths };
+    ths.forEach((th) => {
+      const visIdx = parseInt(th.dataset.visidx!, 10);
+      if (isNaN(visIdx)) return;
+      const name = visibleColumnNames[visIdx];
+      if (name && !(name in next)) {
+        next[name] = th.getBoundingClientRect().width;
+        changed = true;
+      }
+    });
+    if (changed) {
+      setColWidths(next);
+    }
+    widthsInitialized.current = true;
+  }, [visibleColumnNames]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist column widths
+  useEffect(() => {
+    localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(colWidths));
+  }, [colWidths]);
+
+  const handleResizeStart = useCallback((e: React.PointerEvent, colName: string) => {
+    e.stopPropagation();
+    e.preventDefault();
+    resizingCol.current = colName;
+    resizeStartX.current = e.clientX;
+    resizeStartWidth.current = colWidths[colName] || 100;
+    setIsResizing(true);
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }, [colWidths]);
+
+  const handleResizeMove = useCallback((e: React.PointerEvent) => {
+    if (!resizingCol.current) return;
+    const delta = e.clientX - resizeStartX.current;
+    const newWidth = Math.max(MIN_COL_WIDTH, resizeStartWidth.current + delta);
+    setColWidths(prev => ({ ...prev, [resizingCol.current!]: newWidth }));
+  }, []);
+
+  const handleResizeEnd = useCallback(() => {
+    resizingCol.current = null;
+    setIsResizing(false);
+  }, []);
+
+  const handleResizeReset = useCallback((colName: string) => {
+    widthsInitialized.current = false;
+    setColWidths(prev => {
+      const next = { ...prev };
+      delete next[colName];
+      return next;
+    });
+  }, []);
+
   if (columns.length === 0) {
     return <div className="results-empty">No results to display.</div>;
   }
@@ -205,7 +280,11 @@ export function ResultsTable({
 
   return (
     <div className="results-table-wrapper">
-      <table className="results-table">
+      <table
+        ref={tableRef}
+        className={`results-table${isResizing ? ' resizing' : ''}`}
+        style={widthsInitialized.current ? { tableLayout: 'fixed' } : undefined}
+      >
         <thead ref={theadRef}>
           <tr>
             {onColumnConfigChange && (
@@ -231,7 +310,7 @@ export function ResultsTable({
                   onClick={() => handleSort(ci)}
                   className={`results-th${isDragging ? ' th-dragging' : ''}${dropSide ? ` drag-over-${dropSide}` : ''}`}
                   title={`${col.name} (${col.type}) \u2014 click to sort`}
-                  draggable={!!onColumnConfigChange}
+                  draggable={!!onColumnConfigChange && !isResizing}
                   onDragStart={(e) => handleColDragStart(e, visIdx)}
                   onDragOver={(e) => handleColDragOver(e, visIdx)}
                   onDragEnd={handleColDragEnd}
@@ -239,9 +318,18 @@ export function ResultsTable({
                   onTouchStart={onColumnConfigChange ? (e) => handleThTouchStart(e, visIdx) : undefined}
                   onTouchMove={onColumnConfigChange ? handleThTouchMove : undefined}
                   onTouchEnd={onColumnConfigChange ? handleThTouchEnd : undefined}
+                  style={colWidths[col.name] ? { width: colWidths[col.name] } : undefined}
                 >
                   {getColumnLabel(col.name)}
                   <span className="sort-indicator">{sortIndicator(ci)}</span>
+                  <div
+                    className="col-resize-handle"
+                    onPointerDown={(e) => handleResizeStart(e, col.name)}
+                    onPointerMove={handleResizeMove}
+                    onPointerUp={handleResizeEnd}
+                    onLostPointerCapture={handleResizeEnd}
+                    onDoubleClick={(e) => { e.stopPropagation(); handleResizeReset(col.name); }}
+                  />
                 </th>
               );
             })}

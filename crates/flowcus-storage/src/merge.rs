@@ -58,6 +58,8 @@ pub struct MergeConfig {
     pub compression_level: i32,
     /// Minimum parts in an hour before triggering a merge.
     pub min_parts: usize,
+    /// Proactively warm cache when an hour is sealed.
+    pub preheat_on_seal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +232,14 @@ async fn run_coordinator(
             if handle.is_finished() {
                 match handle.await {
                     Ok(Some(result)) => {
-                        process_merge_result(&result, &queue, &pending, &metrics, &storage_cache);
+                        process_merge_result(
+                            &result,
+                            &queue,
+                            &pending,
+                            &metrics,
+                            &storage_cache,
+                            config.preheat_on_seal,
+                        );
                     }
                     Ok(None) => {
                         // Task was cancelled or returned None
@@ -260,6 +269,8 @@ async fn run_coordinator(
             config.partition_duration_secs,
             config.queue_length,
             config.min_parts,
+            &storage_cache,
+            config.preheat_on_seal,
         );
 
         // Update metrics
@@ -366,6 +377,7 @@ fn process_merge_result(
     pending: &crate::pending::PendingHours,
     metrics: &flowcus_core::observability::Metrics,
     storage_cache: &crate::cache::StorageCache,
+    preheat_on_seal: bool,
 ) {
     // Release from active
     let mut q = queue.lock().unwrap();
@@ -401,6 +413,13 @@ fn process_merge_result(
                 q.seal(&result.hour_dir);
                 pending.mark_clean(&result.hour_dir);
                 metrics.merge_queue_sealed.fetch_add(1, Ordering::Relaxed);
+
+                if preheat_on_seal {
+                    let loaded = storage_cache.preheat_part(new_part);
+                    if loaded > 0 {
+                        debug!(part = %new_part.display(), files = loaded, "Pre-heated cache for sealed part");
+                    }
+                }
             }
         }
         Err(e) => {
@@ -419,6 +438,7 @@ fn process_merge_result(
 // ---------------------------------------------------------------------------
 
 /// Scan pending (dirty) hours and populate/refresh the merge queue.
+#[allow(clippy::too_many_arguments)]
 fn scan_and_enqueue(
     table_base: &Path,
     queue: &std::sync::Mutex<MergeQueue>,
@@ -427,6 +447,8 @@ fn scan_and_enqueue(
     _partition_duration_secs: u32,
     queue_length: usize,
     min_parts: usize,
+    storage_cache: &crate::cache::StorageCache,
+    preheat_on_seal: bool,
 ) {
     let dirty_hours = pending.get_dirty();
     if dirty_hours.is_empty() {
@@ -469,6 +491,15 @@ fn scan_and_enqueue(
             q.seal(hour_dir);
             pending.mark_clean(hour_dir);
             metrics.merge_queue_sealed.fetch_add(1, Ordering::Relaxed);
+
+            if preheat_on_seal {
+                if let Some(part) = parts.first() {
+                    let loaded = storage_cache.preheat_part(&part.path);
+                    if loaded > 0 {
+                        debug!(part = %part.path.display(), files = loaded, "Pre-heated cache for sealed part");
+                    }
+                }
+            }
             continue;
         }
 
