@@ -1353,6 +1353,80 @@ fn test_merge_consolidates_all_parts_in_hour() {
 }
 
 // ---------------------------------------------------------------------------
+// test_merge_keeps_columns_missing_from_highest_generation_part
+// ---------------------------------------------------------------------------
+
+/// Regression: the merge used the schema of the highest-generation part, so
+/// columns present only in other parts (e.g. IPv4 columns when the newest
+/// merged part came from an IPv6-only template) were dropped from the output.
+#[test]
+fn test_merge_keeps_columns_missing_from_highest_generation_part() {
+    let dir = test_dir("merge_schema_union");
+    let base_time: u32 = 1_700_000_000;
+    let table_base = dir.join("flows");
+
+    // Two parts without a destination column, merged into a generation 1 part.
+    for i in 0..2u8 {
+        let mut writer = tiny_flush_writer(&dir);
+        let msg = make_message_with_time(
+            vec![make_record_no_dst(Ipv4Addr::new(10, 0, 0, i), 1000)],
+            base_time + u32::from(i),
+        );
+        writer.ingest(&msg);
+        writer.flush_all();
+    }
+    let table = Table::open(&dir, "flows").unwrap();
+    let hour_dir = table.list_all_parts().unwrap()[0]
+        .path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    flowcus_storage::merge::merge_hour_for_test(&table_base, &hour_dir, 8192, 8192).unwrap();
+
+    // A generation 0 part that has the destination column.
+    let mut writer = tiny_flush_writer(&dir);
+    let msg = make_message_with_time(
+        vec![make_record(
+            Ipv4Addr::new(10, 0, 0, 9),
+            Ipv4Addr::new(192, 168, 1, 9),
+            2000,
+        )],
+        base_time + 10,
+    );
+    writer.ingest(&msg);
+    writer.flush_all();
+
+    let new_part =
+        flowcus_storage::merge::merge_hour_for_test(&table_base, &hour_dir, 8192, 8192).unwrap();
+
+    let columns = part::list_columns(&new_part).unwrap();
+    assert!(
+        columns.iter().any(|c| c == "destinationIPv4Address"),
+        "merged part must keep destinationIPv4Address, got {columns:?}"
+    );
+
+    let executor = make_executor(&dir);
+    let query = make_wide_query(vec![]);
+    let result = executor.execute(&query, 0, 100, None, None, None).unwrap();
+    let dst_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "destinationIPv4Address")
+        .expect("destinationIPv4Address must be in result columns");
+    let dsts: Vec<_> = result
+        .rows
+        .iter()
+        .filter_map(|r| r[dst_idx].as_str())
+        .collect();
+    assert!(
+        dsts.contains(&"192.168.1.9"),
+        "destination value must survive merge, got {dsts:?}"
+    );
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // test_merge_independent_per_hour
 // ---------------------------------------------------------------------------
 

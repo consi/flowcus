@@ -503,12 +503,12 @@ fn scan_and_enqueue(
             continue;
         }
 
-        // Read schema from the highest-generation part
-        let best_part = parts.iter().max_by_key(|p| p.generation).unwrap();
-        let schema = match read_part_schema(&best_part.path) {
+        // Merged schema is the union of all source schemas, so columns that
+        // only some parts have (e.g. IPv4 vs IPv6 templates) are not dropped.
+        let schema = match union_part_schemas(&parts) {
             Ok(s) => s,
             Err(e) => {
-                debug!(error = %e, path = %best_part.path.display(), "Cannot read part schema, skipping");
+                debug!(error = %e, hour = %hour_dir.display(), "Cannot read part schemas, skipping");
                 continue;
             }
         };
@@ -1695,6 +1695,35 @@ fn read_part_schema(part_dir: &Path) -> std::io::Result<Schema> {
     })
 }
 
+/// Build the schema for merging `parts`: the union of all source schemas.
+///
+/// Column order and `duration_source` come from the highest-generation part.
+/// Columns found only in other parts are appended, matched by name. A merge
+/// that used a single part's schema would silently drop every other column,
+/// and sources lacking a column are already padded by `read_column_from_sources`.
+fn union_part_schemas(parts: &[PartEntry]) -> std::io::Result<Schema> {
+    let best = parts
+        .iter()
+        .max_by_key(|p| p.generation)
+        .ok_or_else(|| std::io::Error::other("no parts to read schema from"))?;
+    let mut schema = read_part_schema(&best.path)?;
+    let mut seen: std::collections::HashSet<String> =
+        schema.columns.iter().map(|c| c.name.clone()).collect();
+
+    for part in parts.iter().filter(|p| p.path != best.path) {
+        let other = read_part_schema(&part.path)?;
+        if schema.duration_source.is_none() {
+            schema.duration_source = other.duration_source;
+        }
+        for col in other.columns {
+            if seen.insert(col.name.clone()) {
+                schema.columns.push(col);
+            }
+        }
+    }
+    Ok(schema)
+}
+
 /// Read exporter address from meta.bin.
 fn read_exporter_from_meta(part_dir: &Path) -> std::io::Result<std::net::SocketAddr> {
     let buf = std::fs::read(part_dir.join("meta.bin"))?;
@@ -1850,8 +1879,7 @@ pub fn merge_hour_for_test(
         ));
     }
 
-    let best = parts.iter().max_by_key(|p| p.generation).unwrap();
-    let schema = read_part_schema(&best.path)?;
+    let schema = union_part_schemas(&parts)?;
     let max_gen = parts.iter().map(|p| p.generation).max().unwrap();
     let time_min = parts.iter().map(|p| p.time_min).min().unwrap();
     let time_max = parts.iter().map(|p| p.time_max).max().unwrap();
@@ -1978,10 +2006,10 @@ mod tests {
     #[test]
     fn kway_merge_empty_sources() {
         let order = kway_merge_rowids(&[], 0);
-        assert!(order.is_empty());
+        assert_eq!(order, Vec::<(u8, u32)>::new());
 
         let order = kway_merge_rowids(&[vec![], vec![]], 0);
-        assert!(order.is_empty());
+        assert_eq!(order, Vec::<(u8, u32)>::new());
     }
 
     // ---- Gather in order tests ----

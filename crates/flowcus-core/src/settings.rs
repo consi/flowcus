@@ -1081,7 +1081,7 @@ mod tests {
         let mut new = old.clone();
         new.storage.merge_cpu_throttle = 0.5;
         let fields = changed_restart_fields(&old, &new);
-        assert!(fields.is_empty());
+        assert_eq!(fields, Vec::<String>::new());
     }
 
     #[test]

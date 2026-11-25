@@ -3325,9 +3325,9 @@ impl QueryExecutor {
         let mut top_rows: Vec<ScoredRow> = heap.into_vec();
         // Sort in final order: descending for top, ascending for bottom
         if bottom {
-            top_rows.sort_by(|a, b| a.value.cmp(&b.value));
+            top_rows.sort_by_key(|a| a.value);
         } else {
-            top_rows.sort_by(|a, b| b.value.cmp(&a.value));
+            top_rows.sort_by_key(|a| std::cmp::Reverse(a.value));
         }
 
         plan.steps.push(PlanStep::TopNFastPath {
@@ -5306,7 +5306,7 @@ mod tests {
             value: NumericValue::Integer(42),
         });
         let lookups = bloom_lookup_bytes(&filter);
-        assert!(lookups.is_empty());
+        assert_eq!(lookups, Vec::<(String, Vec<u8>)>::new());
     }
 
     #[test]
@@ -5330,7 +5330,7 @@ mod tests {
             value: IpValue::Addr("10.0.0.1".to_string()),
         });
         let lookups = bloom_lookup_bytes(&filter);
-        assert!(lookups.is_empty());
+        assert_eq!(lookups, Vec::<(String, Vec<u8>)>::new());
     }
 
     #[test]
@@ -5342,7 +5342,7 @@ mod tests {
         });
         // Point lookups should be empty (list is not a point query)
         let point_lookups = bloom_lookup_bytes(&filter);
-        assert!(point_lookups.is_empty());
+        assert_eq!(point_lookups, Vec::<(String, Vec<u8>)>::new());
         // List lookups should have an entry
         let list_lookups = bloom_lookup_list_bytes(&filter);
         assert_eq!(list_lookups.len(), 1);
