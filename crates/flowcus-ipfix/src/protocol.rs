@@ -217,7 +217,7 @@ impl fmt::Display for FieldValue {
 // ---------------------------------------------------------------------------
 
 /// Read a `u16` from a byte slice at the given offset.
-pub(crate) fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ParseError> {
+pub(crate) const fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ParseError> {
     if offset + 2 > buf.len() {
         return Err(ParseError::BufferTooShort {
             need: offset + 2,
@@ -228,7 +228,7 @@ pub(crate) fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ParseError> {
 }
 
 /// Read a `u32` from a byte slice at the given offset.
-pub(crate) fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ParseError> {
+pub(crate) const fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ParseError> {
     if offset + 4 > buf.len() {
         return Err(ParseError::BufferTooShort {
             need: offset + 4,

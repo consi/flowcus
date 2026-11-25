@@ -2006,10 +2006,10 @@ mod tests {
     #[test]
     fn kway_merge_empty_sources() {
         let order = kway_merge_rowids(&[], 0);
-        assert!(order.is_empty());
+        assert_eq!(order, Vec::<(u8, u32)>::new());
 
         let order = kway_merge_rowids(&[vec![], vec![]], 0);
-        assert!(order.is_empty());
+        assert_eq!(order, Vec::<(u8, u32)>::new());
     }
 
     // ---- Gather in order tests ----
